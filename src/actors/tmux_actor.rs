@@ -1,33 +1,51 @@
 //! The sole owner of the tmux client + per-session smoothing state.
 //!
-//! Each `Command::ListNow` triggers a full refresh pass: list sessions,
-//! capture each pane, run the detector registry, smooth via per-session
-//! hysteresis, and send a single `SessionsRefreshed` back to the app.
+//! ## Architecture (post tmux -C rewrite)
 //!
-//! This actor also owns the lifecycle of the bosun-branded tmux status
-//! bar. Per-session status-* options are written on each change; the
-//! global prefix-1..9 jump bindings are installed when bosun first
-//! sees a managed session and removed by `GlobalsGuard::drop` when the
-//! actor's task ends.
+//! Prior to the v0.2.0 rewrite, refreshes were driven by a 1Hz
+//! `poller` task that fired `Tick` events into the main loop, which
+//! in turn generated `Command::ListNow` for this actor. That had two
+//! problems: (1) wasted work for idle sessions, and (2) during a long
+//! `perform_attach` the tick backlog could fill bounded channels and
+//! cascade into a mutual-wait deadlock between main and this actor.
 //!
-//! `Command::FocusPreview` lets the app prioritize capturing a specific
-//! session ahead of its next scheduled tick — e.g. when the user moves
-//! the selection and we want the preview to update now rather than in
-//! up to a second.
+//! Both problems went away with the move to tmux control mode. Now
+//! this actor owns a long-lived [`ControlClient`] subprocess
+//! (`tmux -C attach-session -t __bosun_monitor`) and uses
+//! `tokio::select!` to wait on **either** a command from main **or**
+//! an asynchronous notification from tmux. Session-list refreshes
+//! run on relevant notifications (session added/closed/renamed,
+//! window added/closed) instead of on a timer. Zero work on an idle
+//! server, zero tick backlog during long attaches.
+//!
+//! `Command::FocusPreview` still lets the app prioritize capturing a
+//! specific session's pane immediately — useful on selection change
+//! so the preview updates without waiting for a notification.
 //!
 //! Attach stays handled inline by the app task (needs the controlling
-//! tty). This actor only handles read-only operations and the status
-//! bar side effects.
+//! tty). This actor only handles read-only operations, command
+//! execution, and the status bar side effects.
+//!
+//! ## Fallback
+//!
+//! If the control client fails to spawn at startup (e.g. tmux not
+//! installed or a permissions issue), this actor emits a `Warn`
+//! message and continues in **commands-only** mode — refreshes still
+//! run when main sends `Command::ListNow` or any lifecycle command,
+//! but there are no push updates. It's degraded, not dead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::events::{AppMsg, ClaudeSessionMode, Command, SessionSpec, SpecOptions};
 use crate::store::Store;
+use crate::tmux::control::Notification;
+use crate::tmux::control_client::ControlClient;
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
 use crate::tmux::session::SessionView;
 use crate::tmux::status_bar::{self, BarSession};
@@ -57,8 +75,8 @@ pub fn spawn(
     socket: Option<String>,
     config: Config,
     store: Arc<Store>,
-    mut cmd_rx: mpsc::Receiver<Command>,
-    evt_tx: mpsc::Sender<AppMsg>,
+    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    evt_tx: mpsc::UnboundedSender<AppMsg>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let registry = DetectorRegistry::default_stack();
@@ -70,8 +88,67 @@ pub fn spawn(
             installed: false,
         };
 
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
+        // Start the control-mode monitor subprocess. The guard is
+        // held for the lifetime of the actor — dropping it on exit
+        // kills the subprocess. `notifs` is the receive side of a
+        // channel the reader task pushes parsed notifications onto.
+        //
+        // Fallback: if spawn fails, we log a warning and run in
+        // commands-only mode (notifs = None, the select! branch
+        // falls through to std::future::pending).
+        let (_control_guard, mut notifs) = match ControlClient::spawn(socket.as_deref()).await {
+            Ok((guard, rx)) => (Some(guard), Some(rx)),
+            Err(e) => {
+                tracing::warn!("tmux control mode unavailable: {}", e);
+                let _ = evt_tx.send(AppMsg::Warn(format!("live refresh off: {}", e)));
+                (None, None)
+            }
+        };
+
+        // Internal 1Hz refresh timer. Control-mode notifications
+        // drive session/window lifecycle updates, but tmux doesn't
+        // notify on plain pane content changes — so without a timer,
+        // the preview for the focused session would never update
+        // while the underlying pane is writing output (the exact
+        // "preview: capturing…" stuck state we hit on first v0.2.0
+        // build). `Skip` missed-tick behavior means a slow host or
+        // a long refresh doesn't produce a burst of catch-up ticks
+        // afterwards — at most one tick per wake-up.
+        //
+        // Unlike the old standalone `poller` task, this timer lives
+        // *inside* `tmux_actor` and triggers `do_refresh` directly.
+        // No tick flows through `main`'s event loop, no
+        // `cmd_tx`/`evt_tx` cross-channel handoff, so the back-
+        // pressure deadlock that killed v0.1.x can't manifest here.
+        let mut preview_tick = time::interval(Duration::from_millis(1000));
+        preview_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Skip the immediate first tick — we're about to do a
+        // refresh explicitly just below.
+        preview_tick.tick().await;
+
+        // Initial refresh so the UI populates without waiting for a
+        // notification. Otherwise a user starting bosun against an
+        // already-quiet tmux server would see an empty list until
+        // something changed.
+        let _ = do_refresh(
+            &*client,
+            &config,
+            &registry,
+            &mut smoothers,
+            focused.as_deref(),
+            socket.as_deref(),
+            &mut last_bar_state,
+            &mut globals,
+            &evt_tx,
+            None,
+        )
+        .await;
+
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break };
+                    match cmd {
                 Command::ListNow => {
                     let views = refresh_all(
                         &*client,
@@ -107,25 +184,39 @@ pub fn spawn(
                                     sessions: views,
                                     select_after: None,
                                 })
-                                .await
                                 .is_err()
                             {
                                 break;
                             }
                         }
                         Err(e) => {
-                            if evt_tx
-                                .send(AppMsg::Warn(format!("list: {}", e)))
-                                .await
-                                .is_err()
-                            {
+                            if evt_tx.send(AppMsg::Warn(format!("list: {}", e))).is_err() {
                                 break;
                             }
                         }
                     }
                 }
                 Command::FocusPreview { name } => {
+                    // Set focus, then refresh immediately so the
+                    // preview catches up to the new selection
+                    // without waiting up to 1s for the next
+                    // preview_tick. Without this the user sees a
+                    // stuck "preview: capturing…" when switching
+                    // between sessions quickly.
                     focused = Some(name);
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
                 }
                 Command::KillSession(internal) => {
                     match client.kill_session(&internal).await {
@@ -153,7 +244,7 @@ pub fn spawn(
                             .await;
                         }
                         Err(e) => {
-                            let _ = evt_tx.send(AppMsg::Warn(format!("kill: {}", e))).await;
+                            let _ = evt_tx.send(AppMsg::Warn(format!("kill: {}", e)));
                         }
                     }
                 }
@@ -171,9 +262,7 @@ pub fn spawn(
                             // hex suffix).
                             let spec = metadata_to_spec(meta);
                             if let Err(e) = client.kill_session(&internal).await {
-                                let _ = evt_tx
-                                    .send(AppMsg::Warn(format!("restart kill: {}", e)))
-                                    .await;
+                                let _ = evt_tx.send(AppMsg::Warn(format!("restart kill: {}", e)));
                                 continue;
                             }
                             if focused.as_deref() == Some(internal.as_str()) {
@@ -186,8 +275,7 @@ pub fn spawn(
                                         tracing::warn!("store upsert on restart: {}", e);
                                     }
                                     let _ = evt_tx
-                                        .send(AppMsg::Warn(format!("restarted {}", spec.name)))
-                                        .await;
+                                        .send(AppMsg::Warn(format!("restarted {}", spec.name)));
                                     let _ = do_refresh(
                                         &*client,
                                         &config,
@@ -203,23 +291,18 @@ pub fn spawn(
                                     .await;
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx
-                                        .send(AppMsg::Warn(format!("restart create: {}", e)))
-                                        .await;
+                                    let _ =
+                                        evt_tx.send(AppMsg::Warn(format!("restart create: {}", e)));
                                 }
                             }
                         }
                         Ok(None) => {
-                            let _ = evt_tx
-                                .send(AppMsg::Warn(
-                                    "cannot restart: session predates metadata support".to_string(),
-                                ))
-                                .await;
+                            let _ = evt_tx.send(AppMsg::Warn(
+                                "cannot restart: session predates metadata support".to_string(),
+                            ));
                         }
                         Err(e) => {
-                            let _ = evt_tx
-                                .send(AppMsg::Warn(format!("restart read: {}", e)))
-                                .await;
+                            let _ = evt_tx.send(AppMsg::Warn(format!("restart read: {}", e)));
                         }
                     }
                 }
@@ -243,7 +326,7 @@ pub fn spawn(
                         .await;
                     }
                     Err(e) => {
-                        let _ = evt_tx.send(AppMsg::Warn(format!("rename: {}", e))).await;
+                        let _ = evt_tx.send(AppMsg::Warn(format!("rename: {}", e)));
                     }
                 },
                 Command::CreateSession(spec) => {
@@ -253,7 +336,7 @@ pub fn spawn(
                     let spec = match resolve_collision(&*client, &config, spec).await {
                         Ok(resolved) => resolved,
                         Err(e) => {
-                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e))).await;
+                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e)));
                             continue;
                         }
                     };
@@ -267,9 +350,7 @@ pub fn spawn(
                             if let Err(e) = store.upsert_recent(&spec) {
                                 tracing::warn!("store upsert_recent: {}", e);
                             }
-                            let _ = evt_tx
-                                .send(AppMsg::Warn(format!("created {}", internal_name)))
-                                .await;
+                            let _ = evt_tx.send(AppMsg::Warn(format!("created {}", internal_name)));
                             let _ = do_refresh(
                                 &*client,
                                 &config,
@@ -285,7 +366,7 @@ pub fn spawn(
                             .await;
                         }
                         Err(e) => {
-                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e))).await;
+                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e)));
                         }
                     }
                 }
@@ -298,7 +379,90 @@ pub fn spawn(
                     // makes it here the intercept path is broken.
                     tracing::warn!("tmux_actor received SetTheme — should be intercepted by app");
                 }
-                Command::Shutdown => break,
+                        Command::Shutdown => break,
+                    }
+                }
+                maybe_notif = async {
+                    // If the control client failed at spawn or has
+                    // since closed, disable this branch by awaiting
+                    // a future that never resolves. select! will
+                    // then only poll the cmd branch.
+                    match notifs.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(notif) = maybe_notif else {
+                        // Reader task exited — monitor is gone. Fall
+                        // back to commands-only mode for the rest of
+                        // this actor's lifetime.
+                        tracing::warn!("tmux control notification stream closed");
+                        notifs = None;
+                        continue;
+                    };
+
+                    // Lifecycle notifications trigger a full refresh.
+                    // Pane `%output` and layout changes are ignored
+                    // for now — status detection still runs against
+                    // pane captures on refresh, and preview updates
+                    // come via FocusPreview commands. (A future
+                    // improvement can wire %output into the
+                    // detectors for push-based status + preview.)
+                    let should_refresh = matches!(
+                        notif,
+                        Notification::SessionsChanged
+                            | Notification::SessionChanged { .. }
+                            | Notification::SessionRenamed { .. }
+                            | Notification::SessionClosed { .. }
+                            | Notification::SessionWindowChanged { .. }
+                            | Notification::WindowAdd { .. }
+                            | Notification::WindowClose { .. }
+                            | Notification::WindowRenamed { .. }
+                    );
+
+                    if matches!(notif, Notification::Exit) {
+                        tracing::warn!(
+                            "tmux control subprocess exited — commands-only mode"
+                        );
+                        notifs = None;
+                        continue;
+                    }
+
+                    if should_refresh {
+                        let _ = do_refresh(
+                            &*client,
+                            &config,
+                            &registry,
+                            &mut smoothers,
+                            focused.as_deref(),
+                            socket.as_deref(),
+                            &mut last_bar_state,
+                            &mut globals,
+                            &evt_tx,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+                _ = preview_tick.tick() => {
+                    // Periodic refresh for preview + status
+                    // detection. See the comment on `preview_tick`
+                    // above for why this lives inside the actor
+                    // rather than in a separate task.
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -486,7 +650,7 @@ async fn do_refresh(
     socket: Option<&str>,
     last_bar_state: &mut Vec<BarSession>,
     globals: &mut GlobalsGuard,
-    evt_tx: &mpsc::Sender<AppMsg>,
+    evt_tx: &mpsc::UnboundedSender<AppMsg>,
     select_after: Option<String>,
 ) -> crate::error::Result<()> {
     let views = refresh_all(client, config, registry, smoothers, focused).await?;
@@ -505,12 +669,10 @@ async fn do_refresh(
         *last_bar_state = state;
     }
 
-    let _ = evt_tx
-        .send(AppMsg::SessionsRefreshed {
-            sessions: views,
-            select_after,
-        })
-        .await;
+    let _ = evt_tx.send(AppMsg::SessionsRefreshed {
+        sessions: views,
+        select_after,
+    });
     Ok(())
 }
 

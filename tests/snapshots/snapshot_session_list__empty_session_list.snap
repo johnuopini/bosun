@@ -2,13 +2,13 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
-                                                                                
-  no tmux sessions                                                              
-  (press r to refresh)                                                          
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
+                              │                                                 
+  no tmux sessions            │                                                 
+  (press r to refresh)        │                                                 
+                              │                                                 
+                              │                                                 
+                              │                                                 
+                              │                                                 
+                              │                                                 
+                              │                                                 
  bosun  0 sessions ↵ attach · n new · r ren · R rst · d kill · t theme · q quit

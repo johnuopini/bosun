@@ -1,5 +1,7 @@
 pub mod attach;
 pub mod client;
+pub mod control;
+pub mod control_client;
 pub mod detector;
 pub mod parse;
 pub mod session;

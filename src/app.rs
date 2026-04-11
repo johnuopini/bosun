@@ -4,14 +4,16 @@
 //! [`App::run`]. Nothing else mutates it. Everything else sends messages.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::actors::{input_actor, poller, tmux_actor};
+use crate::actors::{input_actor, tmux_actor};
 use crate::config::Config;
 use crate::error::{BosunError, Result};
 use crate::events::{AppMsg, Command};
@@ -20,6 +22,7 @@ use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
 use crate::ui;
+use crate::ui::layout;
 use crate::ui::modal::confirm::ConfirmModal;
 use crate::ui::modal::new_session::NewSessionModal;
 use crate::ui::modal::rename::RenameModal;
@@ -54,6 +57,19 @@ pub struct AppState {
     /// and pushes the modal (with store-loaded recents etc) since
     /// `AppState` doesn't hold the store itself.
     pub pending_modal: Option<ModalRequest>,
+    /// Cached terminal size, updated on every `AppMsg::Resize` and
+    /// on the initial sync in `App::run`. Used by mouse handling to
+    /// map a column click back to the current divider position
+    /// (`layout::compute` needs the area to resolve the split).
+    pub term_size: (u16, u16),
+    /// User's preferred x-column for the divider between session
+    /// list and preview. `None` means "use the default 38% split".
+    /// Updated live while the user drags the divider with the mouse.
+    pub divider_x: Option<u16>,
+    /// True while the user is mid-drag on the divider (mouse button
+    /// held down after a Down on the divider column). Render uses
+    /// this to highlight the divider glyph.
+    pub dragging_divider: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +95,6 @@ impl AppState {
     pub fn apply(&mut self, msg: AppMsg) -> Vec<Command> {
         let mut out = Vec::new();
         match msg {
-            AppMsg::Tick(_) => {
-                out.push(Command::ListNow);
-            }
             AppMsg::SessionsRefreshed {
                 sessions,
                 select_after,
@@ -134,7 +147,20 @@ impl AppState {
                 }
                 self.sync_focus(&mut out);
             }
-            AppMsg::Resize(_, _) => { /* ratatui auto-redraws next frame */ }
+            AppMsg::Mouse(m) => {
+                // Mouse events are only used by the draggable divider
+                // between the session list and preview pane. No modal
+                // dispatching — modals don't react to mouse yet.
+                self.handle_mouse(m);
+            }
+            AppMsg::Resize(w, h) => {
+                // Keep a cached terminal size for mouse handling —
+                // `handle_mouse` needs the current area to compute
+                // the divider column, and it can't ask the terminal
+                // directly from inside a pure reducer.
+                self.term_size = (w, h);
+                // ratatui auto-redraws next frame, no command to emit.
+            }
             AppMsg::Warn(w) => self.warning = Some(w),
             AppMsg::Fatal(w) => {
                 self.warning = Some(w);
@@ -261,13 +287,50 @@ impl AppState {
             _ => {}
         }
     }
+
+    /// Map a mouse event onto the draggable divider between the
+    /// session list and preview pane.
+    ///
+    /// - `Down(Left)` on the divider column starts a drag.
+    /// - `Drag(Left)` while `dragging_divider` updates `divider_x`
+    ///   to the new column; `layout::compute` clamps it to sane
+    ///   min-widths on the next render.
+    /// - `Up(Left)` clears the drag flag regardless of location —
+    ///   releasing the button anywhere ends the gesture.
+    ///
+    /// Non-left-button events and any event while `term_size` is
+    /// unset (pre-first-draw) are ignored.
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.term_size.0 == 0 {
+            return;
+        }
+        let area = Rect::new(0, 0, self.term_size.0, self.term_size.1);
+        let layouts = layout::compute(area, self.divider_x);
+
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if layout::is_divider_col(&layouts, m.column) {
+                    self.dragging_divider = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
+                // Raw column — `layout::compute` clamps it to the
+                // allowed range (MIN_LIST_WIDTH..body - MIN_PREVIEW_WIDTH - 1).
+                self.divider_x = Some(m.column);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_divider = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct App {
     pub state: AppState,
-    pub cmd_tx: mpsc::Sender<Command>,
-    pub evt_rx: mpsc::Receiver<AppMsg>,
-    pub evt_tx: mpsc::Sender<AppMsg>,
+    pub cmd_tx: mpsc::UnboundedSender<Command>,
+    pub evt_rx: mpsc::UnboundedReceiver<AppMsg>,
+    pub evt_tx: mpsc::UnboundedSender<AppMsg>,
     pub socket: Option<String>,
     pub store: Arc<Store>,
     /// Active theme. Resolved once at startup from the config's
@@ -288,8 +351,19 @@ impl App {
         config: Config,
         store: Arc<Store>,
     ) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
-        let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
+        // Unbounded channels. Rationale: every flavor of freeze we've
+        // hit has been a variant of channel-backpressure deadlock —
+        // producer parks on a full channel while consumer is blocked
+        // on something else, and the two form a circular wait. The
+        // producer rates in bosun are trivial (1Hz poller, human
+        // typing, occasional tmux refresh fan-out) and AppMsg/Command
+        // are small, so the memory pressure from "unbounded in
+        // theory" is unbounded in the same way a vec of ints is — a
+        // few MB worst case, trivially paid. Taking back-pressure
+        // out of the picture makes the runtime deadlock-free by
+        // construction.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (evt_tx, evt_rx) = mpsc::unbounded_channel::<AppMsg>();
 
         let theme = Theme::load(&config.theme, crate::config::user_themes_dir().as_deref());
 
@@ -301,7 +375,6 @@ impl App {
             cmd_rx,
             evt_tx.clone(),
         );
-        poller::spawn(evt_tx.clone(), Duration::from_millis(1000));
         let input_handle = input_actor::spawn(evt_tx.clone());
 
         Self {
@@ -320,8 +393,18 @@ impl App {
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
-        // Initial refresh kick.
-        let _ = self.cmd_tx.send(Command::ListNow).await;
+        // Initial refresh kick. Unbounded `send` is sync and can only
+        // fail if the receiver has been dropped — meaning the tmux
+        // actor has already exited, at which point there's nothing
+        // to do but let the event loop unwind naturally.
+        let _ = self.cmd_tx.send(Command::ListNow);
+
+        // Seed the cached term_size before the first draw. Mouse
+        // handling (divider drag) needs it to compute the current
+        // divider column without calling back into ratatui.
+        if let Ok(size) = terminal.size() {
+            self.state.term_size = (size.width, size.height);
+        }
 
         terminal
             .draw(|f| ui::draw(f, &self.state, &self.theme))
@@ -350,7 +433,11 @@ impl App {
                         }
                     }
                     other => {
-                        let _ = self.cmd_tx.send(other).await;
+                        // Sync send: unbounded, never blocks, never
+                        // parks a task. The only failure is "tmux
+                        // actor has exited" which we ignore — the
+                        // event loop will unwind on the next recv.
+                        let _ = self.cmd_tx.send(other);
                     }
                 }
             }
@@ -398,12 +485,24 @@ impl App {
 
                 attach_result?;
                 // After return, kick a refresh — the session may have been killed.
-                let _ = self.cmd_tx.send(Command::ListNow).await;
+                let _ = self.cmd_tx.send(Command::ListNow);
             }
 
             terminal
                 .draw(|f| ui::draw(f, &self.state, &self.theme))
                 .map_err(term_err)?;
+        }
+
+        // Shut down the input actor cleanly before returning. Its
+        // blocking task polls crossterm with a 100ms timeout between
+        // shutdown-flag checks — without this explicit shutdown, the
+        // thread keeps spinning after main exits and the tokio
+        // runtime's drop blocks waiting for it (blocking threads
+        // can't be cancelled, only cooperatively signalled). That
+        // manifests as "bosun hangs for a few seconds after pressing
+        // q before returning to the shell prompt".
+        if let Some(h) = self.input_handle.take() {
+            h.shutdown().await;
         }
 
         Ok(())
@@ -426,11 +525,13 @@ impl App {
         // 2. Install binding + run attach (blocking).
         let result = attach_with_ctrl_q_detach(self.socket.as_deref(), name);
 
-        // 3. Re-enter raw mode / alt screen regardless of attach result.
+        // 3. Re-enter raw mode / alt screen / mouse capture
+        //    regardless of attach result.
         crossterm::terminal::enable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
             crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
         )
         .map_err(BosunError::Io)?;
         terminal.clear().map_err(term_err)?;
@@ -549,10 +650,94 @@ mod tests {
         assert_eq!(s.pending_attach.as_deref(), Some("main"));
     }
 
+    fn mouse(kind: MouseEventKind, col: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A state wide enough for the split view, with a fresh term_size
+    /// set. The default 38% split at 120 cols puts the divider at
+    /// column 45.
+    fn wide_state() -> AppState {
+        AppState {
+            term_size: (120, 30),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn tick_requests_list_now() {
+    fn mouse_down_on_default_divider_starts_drag() {
+        let mut s = wide_state();
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            45, // matches 120 * 38% default
+        )));
+        assert!(s.dragging_divider);
+    }
+
+    #[test]
+    fn mouse_down_off_divider_does_nothing() {
+        let mut s = wide_state();
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            10,
+        )));
+        assert!(!s.dragging_divider);
+        assert!(s.divider_x.is_none());
+    }
+
+    #[test]
+    fn drag_updates_divider_x_while_dragging() {
+        let mut s = wide_state();
+        s.dragging_divider = true;
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            70,
+        )));
+        assert_eq!(s.divider_x, Some(70));
+    }
+
+    #[test]
+    fn drag_ignored_when_not_dragging() {
+        let mut s = wide_state();
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            70,
+        )));
+        assert!(s.divider_x.is_none());
+    }
+
+    #[test]
+    fn mouse_up_ends_drag() {
+        let mut s = wide_state();
+        s.dragging_divider = true;
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            70,
+        )));
+        assert!(!s.dragging_divider);
+    }
+
+    #[test]
+    fn resize_updates_cached_term_size() {
         let mut s = AppState::default();
-        let cmds = s.apply(AppMsg::Tick(std::time::Instant::now()));
-        assert!(matches!(cmds.as_slice(), [Command::ListNow]));
+        s.apply(AppMsg::Resize(100, 30));
+        assert_eq!(s.term_size, (100, 30));
+    }
+
+    #[test]
+    fn divider_ignored_before_first_resize() {
+        // Fresh state has term_size = (0, 0). Mouse events must
+        // no-op rather than panic or guess a divider position.
+        let mut s = AppState::default();
+        s.apply(AppMsg::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            45,
+        )));
+        assert!(!s.dragging_divider);
     }
 }

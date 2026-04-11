@@ -1,6 +1,4 @@
-use std::time::Instant;
-
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::tmux::session::SessionView;
 
@@ -117,20 +115,28 @@ pub enum Command {
 
 /// Messages flow from actors (input, tmux) back to the app task.
 /// The app task is the single writer of `AppState`.
+///
+/// There's no periodic `Tick` variant any more. As of the tmux -C
+/// rewrite, session-list refreshes are push-driven by control-mode
+/// notifications from the `tmux_actor`'s monitor subprocess, not by
+/// a 1Hz poller. Main no longer generates `ListNow` commands from a
+/// timer — it just waits for `SessionsRefreshed` to arrive.
 #[derive(Debug)]
 pub enum AppMsg {
-    /// A periodic tick from the poller.
-    Tick(Instant),
     /// A key from the terminal.
     Key(KeyEvent),
+    /// A mouse event from the terminal. Used by the draggable divider
+    /// between the session list and preview. Dropped by non-mouse
+    /// consumers.
+    Mouse(MouseEvent),
     /// Terminal was resized.
     Resize(u16, u16),
     /// Fresh session list from tmux, with smoothed status and optional
     /// preview buffer per entry. `select_after` carries an internal
     /// session name that the app should jump the selection to — set
     /// when this refresh is the result of a create (so the new session
-    /// auto-highlights). `None` for regular tick-driven refreshes,
-    /// where the app preserves its existing selection.
+    /// auto-highlights). `None` for notification-driven refreshes where
+    /// the app preserves its existing selection.
     SessionsRefreshed {
         sessions: Vec<SessionView>,
         select_after: Option<String>,
