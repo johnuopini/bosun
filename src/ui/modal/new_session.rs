@@ -862,9 +862,25 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Factory for tests that exercise Tab field-cycling. `NewSessionModal::new`
+    /// pulls the current working directory into `self.path`, and Tab on the
+    /// Path field does filesystem completion — so if the cwd happens to
+    /// contain entries matching the typed prefix, Tab commits a completion
+    /// and stays on Path instead of advancing. That's environment-dependent
+    /// and was breaking CI (Linux runner's `/home/runner/work/bosun/bosun`
+    /// has exactly one child named `bosun` → single-match commit) while
+    /// passing locally (dev box has multiple `bosun*` neighbors → LCP extends
+    /// past ambiguity). Pin the path to a guaranteed-nonexistent directory so
+    /// `read_dir` returns empty and Tab always advances the field.
+    fn modal_for_field_tests() -> NewSessionModal {
+        let mut m = NewSessionModal::new(Vec::new());
+        m.path = "/_bosun_unit_test_nonexistent_/".into();
+        m
+    }
+
     #[test]
     fn tab_cycles_fields_for_claude() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = modal_for_field_tests();
         assert_eq!(m.agent(), "claude");
         assert_eq!(m.field, Field::Name);
         m.handle(key(KeyCode::Tab));
@@ -884,7 +900,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_fields_for_codex() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = modal_for_field_tests();
         // Switch to codex (second in the list).
         m.agent_idx = 1;
         assert_eq!(m.agent(), "codex");
@@ -899,7 +915,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_fields_for_terminal() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = modal_for_field_tests();
         m.agent_idx = 2;
         assert_eq!(m.agent(), "terminal");
         m.handle(key(KeyCode::Tab)); // Name -> Path
@@ -969,7 +985,10 @@ mod tests {
 
     #[test]
     fn typing_fills_focused_field() {
-        let mut m = NewSessionModal::new(Vec::new());
+        // Pinned path so the Tab below unambiguously advances Name -> Path
+        // instead of triggering filesystem completion — see
+        // `modal_for_field_tests` for context.
+        let mut m = modal_for_field_tests();
         for c in "api".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
