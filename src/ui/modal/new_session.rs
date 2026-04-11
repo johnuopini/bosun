@@ -13,7 +13,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
-use crate::events::{Command, SessionSpec};
+use crate::events::{
+    ClaudeOptions, ClaudeSessionMode, CodexOptions, Command, SessionSpec, SpecOptions,
+};
 
 use super::{center_rect, Modal, ModalResult};
 
@@ -29,7 +31,9 @@ const ERROR: Color = Color::Rgb(255, 93, 107);
 const SHADOW: Color = Color::Rgb(5, 7, 11);
 
 const MODAL_WIDTH: u16 = 64;
-const MODAL_HEIGHT: u16 = 18;
+// Sized for the largest agent (claude with all options visible).
+// Smaller agents render with trailing blank space.
+const MODAL_HEIGHT: u16 = 26;
 
 // --- Agent dropdown --------------------------------------------------
 
@@ -43,24 +47,28 @@ enum Field {
     Path,
     Agent,
     Args,
+    // Claude-only
+    ClaudeSession,
+    ClaudeSkipPerm,
+    // Codex-only
+    CodexYolo,
 }
 
 impl Field {
-    fn next(self) -> Self {
-        match self {
-            Field::Name => Field::Path,
-            Field::Path => Field::Agent,
-            Field::Agent => Field::Args,
-            Field::Args => Field::Name,
+    /// Ordered list of fields visible for the currently-selected agent.
+    fn visible_for(agent: &str) -> Vec<Field> {
+        let mut v = vec![Field::Name, Field::Path, Field::Agent, Field::Args];
+        match agent {
+            "claude" => {
+                v.push(Field::ClaudeSession);
+                v.push(Field::ClaudeSkipPerm);
+            }
+            "codex" => {
+                v.push(Field::CodexYolo);
+            }
+            _ => {}
         }
-    }
-    fn prev(self) -> Self {
-        match self {
-            Field::Name => Field::Args,
-            Field::Path => Field::Name,
-            Field::Agent => Field::Path,
-            Field::Args => Field::Agent,
-        }
+        v
     }
 }
 
@@ -69,6 +77,8 @@ pub struct NewSessionModal {
     path: String,
     agent_idx: usize,
     args: String,
+    claude: ClaudeOptions,
+    codex: CodexOptions,
     field: Field,
     error: Option<String>,
 }
@@ -83,6 +93,8 @@ impl NewSessionModal {
             path,
             agent_idx: 0,
             args: String::new(),
+            claude: ClaudeOptions::default(),
+            codex: CodexOptions::default(),
             field: Field::Name,
             error: None,
         }
@@ -90,6 +102,31 @@ impl NewSessionModal {
 
     fn agent(&self) -> &'static str {
         AGENTS[self.agent_idx]
+    }
+
+    fn next_field(&mut self) {
+        let visible = Field::visible_for(self.agent());
+        let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
+        self.field = visible[(idx + 1) % visible.len()];
+    }
+
+    fn prev_field(&mut self) {
+        let visible = Field::visible_for(self.agent());
+        let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
+        self.field = visible[(idx + visible.len() - 1) % visible.len()];
+    }
+
+    /// When the agent changes, snap the focused field to something
+    /// that actually exists in the new agent's option set. This only
+    /// matters if the user is mid-navigation on an agent-specific
+    /// field when the agent changes, which currently can't happen
+    /// (agent can only change while on Field::Agent) — but the clamp
+    /// is cheap and keeps the invariant obvious.
+    fn clamp_field_for_agent(&mut self) {
+        let visible = Field::visible_for(self.agent());
+        if !visible.contains(&self.field) {
+            self.field = Field::Agent;
+        }
     }
 
     fn build_spec(&self) -> Result<SessionSpec, String> {
@@ -115,6 +152,10 @@ impl NewSessionModal {
             path: path.to_string(),
             agent: self.agent().to_string(),
             args: self.args.trim().to_string(),
+            options: SpecOptions {
+                claude: self.claude.clone(),
+                codex: self.codex.clone(),
+            },
         })
     }
 }
@@ -139,11 +180,11 @@ impl Modal for NewSessionModal {
         match key.code {
             KeyCode::Esc => ModalResult::Close(None),
             KeyCode::Tab => {
-                self.field = self.field.next();
+                self.next_field();
                 ModalResult::Consumed
             }
             KeyCode::BackTab => {
-                self.field = self.field.prev();
+                self.prev_field();
                 ModalResult::Consumed
             }
             KeyCode::Enter => match self.build_spec() {
@@ -154,14 +195,28 @@ impl Modal for NewSessionModal {
                 }
             },
             KeyCode::Left => {
-                if self.field == Field::Agent {
-                    self.agent_idx = (self.agent_idx + AGENTS.len() - 1) % AGENTS.len();
+                match self.field {
+                    Field::Agent => {
+                        self.agent_idx = (self.agent_idx + AGENTS.len() - 1) % AGENTS.len();
+                        self.clamp_field_for_agent();
+                    }
+                    Field::ClaudeSession => {
+                        self.claude.session_mode = self.claude.session_mode.prev();
+                    }
+                    _ => {}
                 }
                 ModalResult::Consumed
             }
             KeyCode::Right => {
-                if self.field == Field::Agent {
-                    self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
+                match self.field {
+                    Field::Agent => {
+                        self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
+                        self.clamp_field_for_agent();
+                    }
+                    Field::ClaudeSession => {
+                        self.claude.session_mode = self.claude.session_mode.next();
+                    }
+                    _ => {}
                 }
                 ModalResult::Consumed
             }
@@ -177,7 +232,33 @@ impl Modal for NewSessionModal {
                     Field::Args => {
                         self.args.pop();
                     }
-                    Field::Agent => {}
+                    _ => {}
+                }
+                ModalResult::Consumed
+            }
+            KeyCode::Char(' ') => {
+                // Space: toggle boolean option fields, cycle agent on
+                // the Agent field, or type a literal space in text
+                // fields.
+                self.error = None;
+                match self.field {
+                    Field::Name => self.name.push(' '),
+                    Field::Path => self.path.push(' '),
+                    Field::Args => self.args.push(' '),
+                    Field::Agent => {
+                        self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
+                        self.clamp_field_for_agent();
+                    }
+                    Field::ClaudeSkipPerm => {
+                        self.claude.skip_permissions = !self.claude.skip_permissions;
+                    }
+                    Field::CodexYolo => {
+                        self.codex.yolo = !self.codex.yolo;
+                    }
+                    Field::ClaudeSession => {
+                        // Space on a radio cycles forward, matching Right.
+                        self.claude.session_mode = self.claude.session_mode.next();
+                    }
                 }
                 ModalResult::Consumed
             }
@@ -187,11 +268,7 @@ impl Modal for NewSessionModal {
                     Field::Name => self.name.push(c),
                     Field::Path => self.path.push(c),
                     Field::Args => self.args.push(c),
-                    Field::Agent => {
-                        if c == ' ' {
-                            self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
-                        }
-                    }
+                    _ => {}
                 }
                 ModalResult::Consumed
             }
@@ -252,7 +329,7 @@ impl Modal for NewSessionModal {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "    tab next · shift-tab prev · esc cancel · enter create",
+                    "    tab next · esc cancel · enter create",
                     Style::default().fg(MUTED).bg(BG),
                 ),
             ]),
@@ -269,6 +346,33 @@ impl Modal for NewSessionModal {
             label_line("args (optional)", self.field == Field::Args),
             input_line(&self.args, self.field == Field::Args, inner.width),
         ];
+
+        // Agent-specific options section.
+        match self.agent() {
+            "claude" => {
+                lines.push(Line::from(""));
+                lines.push(section_header("— Claude options —"));
+                lines.push(session_radio_line(
+                    self.claude.session_mode,
+                    self.field == Field::ClaudeSession,
+                ));
+                lines.push(checkbox_line(
+                    "Skip permissions (--dangerously-skip-permissions)",
+                    self.claude.skip_permissions,
+                    self.field == Field::ClaudeSkipPerm,
+                ));
+            }
+            "codex" => {
+                lines.push(Line::from(""));
+                lines.push(section_header("— Codex options —"));
+                lines.push(checkbox_line(
+                    "YOLO mode (--yolo · bypass approvals & sandbox)",
+                    self.codex.yolo,
+                    self.field == Field::CodexYolo,
+                ));
+            }
+            _ => {}
+        }
 
         if let Some(e) = &self.error {
             lines.push(Line::from(""));
@@ -322,6 +426,100 @@ fn input_line(value: &str, focused: bool, width: u16) -> Line<'static> {
     ])
 }
 
+fn section_header(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("   ", Style::default().bg(BG)),
+        Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(MUTED)
+                .bg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
+    let marker = if focused { "▸" } else { " " };
+    let box_glyph = if checked { "[x]" } else { "[ ]" };
+    let label_style = if focused {
+        Style::default()
+            .fg(ACCENT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD)
+    } else if checked {
+        Style::default().fg(TEXT).bg(BG)
+    } else {
+        Style::default().fg(MUTED).bg(BG)
+    };
+    let box_style = if checked {
+        Style::default()
+            .fg(ACCENT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED).bg(BG)
+    };
+    Line::from(vec![
+        Span::styled(format!(" {} ", marker), label_style),
+        Span::styled(box_glyph.to_string(), box_style),
+        Span::styled(" ", Style::default().bg(BG)),
+        Span::styled(label.to_string(), label_style),
+    ])
+}
+
+fn session_radio_line(mode: ClaudeSessionMode, focused: bool) -> Line<'static> {
+    let marker = if focused { "▸" } else { " " };
+    let marker_style = if focused {
+        Style::default()
+            .fg(ACCENT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED).bg(BG)
+    };
+    let label_style = if focused {
+        Style::default()
+            .fg(ACCENT)
+            .bg(BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED).bg(BG)
+    };
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled("Session  ", label_style),
+    ];
+    for option in [
+        ClaudeSessionMode::New,
+        ClaudeSessionMode::Continue,
+        ClaudeSessionMode::Resume,
+    ] {
+        let selected = option == mode;
+        let (dot, val_style) = if selected {
+            let style = if focused {
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(TEXT)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD)
+            };
+            ("(•)", style)
+        } else {
+            ("( )", Style::default().fg(MUTED).bg(BG))
+        };
+        spans.push(Span::styled(format!(" {} ", dot), val_style));
+        spans.push(Span::styled(option.label().to_string(), val_style));
+        spans.push(Span::styled(" ", Style::default().bg(BG)));
+    }
+    Line::from(spans)
+}
+
 fn agent_line(selected: usize, focused: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled("   ", Style::default().bg(BG)));
@@ -354,8 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_fields() {
+    fn tab_cycles_fields_for_claude() {
         let mut m = NewSessionModal::new();
+        assert_eq!(m.agent(), "claude");
         assert_eq!(m.field, Field::Name);
         m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Path);
@@ -364,7 +563,97 @@ mod tests {
         m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Args);
         m.handle(key(KeyCode::Tab));
+        assert_eq!(m.field, Field::ClaudeSession);
+        m.handle(key(KeyCode::Tab));
+        assert_eq!(m.field, Field::ClaudeSkipPerm);
+        // Wraps back to Name.
+        m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Name);
+    }
+
+    #[test]
+    fn tab_cycles_fields_for_codex() {
+        let mut m = NewSessionModal::new();
+        // Switch to codex (second in the list).
+        m.agent_idx = 1;
+        assert_eq!(m.agent(), "codex");
+        m.handle(key(KeyCode::Tab)); // Name -> Path
+        m.handle(key(KeyCode::Tab)); // Path -> Agent
+        m.handle(key(KeyCode::Tab)); // Agent -> Args
+        m.handle(key(KeyCode::Tab)); // Args -> CodexYolo
+        assert_eq!(m.field, Field::CodexYolo);
+        m.handle(key(KeyCode::Tab));
+        assert_eq!(m.field, Field::Name);
+    }
+
+    #[test]
+    fn tab_cycles_fields_for_terminal() {
+        let mut m = NewSessionModal::new();
+        m.agent_idx = 2;
+        assert_eq!(m.agent(), "terminal");
+        m.handle(key(KeyCode::Tab)); // Name -> Path
+        m.handle(key(KeyCode::Tab)); // Path -> Agent
+        m.handle(key(KeyCode::Tab)); // Agent -> Args
+        assert_eq!(m.field, Field::Args);
+        m.handle(key(KeyCode::Tab));
+        assert_eq!(m.field, Field::Name);
+    }
+
+    #[test]
+    fn space_toggles_skip_permissions_when_focused() {
+        let mut m = NewSessionModal::new();
+        m.field = Field::ClaudeSkipPerm;
+        assert!(!m.claude.skip_permissions);
+        m.handle(key(KeyCode::Char(' ')));
+        assert!(m.claude.skip_permissions);
+        m.handle(key(KeyCode::Char(' ')));
+        assert!(!m.claude.skip_permissions);
+    }
+
+    #[test]
+    fn left_right_cycles_claude_session_mode() {
+        let mut m = NewSessionModal::new();
+        m.field = Field::ClaudeSession;
+        assert_eq!(m.claude.session_mode, ClaudeSessionMode::New);
+        m.handle(key(KeyCode::Right));
+        assert_eq!(m.claude.session_mode, ClaudeSessionMode::Continue);
+        m.handle(key(KeyCode::Right));
+        assert_eq!(m.claude.session_mode, ClaudeSessionMode::Resume);
+        m.handle(key(KeyCode::Right));
+        assert_eq!(m.claude.session_mode, ClaudeSessionMode::New);
+        m.handle(key(KeyCode::Left));
+        assert_eq!(m.claude.session_mode, ClaudeSessionMode::Resume);
+    }
+
+    #[test]
+    fn space_toggles_codex_yolo_when_focused() {
+        let mut m = NewSessionModal::new();
+        m.agent_idx = 1;
+        m.field = Field::CodexYolo;
+        assert!(!m.codex.yolo);
+        m.handle(key(KeyCode::Char(' ')));
+        assert!(m.codex.yolo);
+    }
+
+    #[test]
+    fn submit_spec_carries_claude_options() {
+        let mut m = NewSessionModal::new();
+        for c in "test".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        m.claude.skip_permissions = true;
+        m.claude.session_mode = ClaudeSessionMode::Continue;
+        let r = m.handle(key(KeyCode::Enter));
+        match r {
+            ModalResult::Close(Some(Command::CreateSession(spec))) => {
+                assert!(spec.options.claude.skip_permissions);
+                assert_eq!(
+                    spec.options.claude.session_mode,
+                    ClaudeSessionMode::Continue
+                );
+            }
+            _ => panic!("expected CreateSession"),
+        }
     }
 
     #[test]

@@ -26,10 +26,10 @@ use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::events::{AppMsg, Command, SessionSpec};
+use crate::events::{AppMsg, ClaudeSessionMode, Command, SessionSpec, SpecOptions};
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
 use crate::tmux::session::SessionView;
-use crate::tmux::status_bar;
+use crate::tmux::status_bar::{self, BarSession};
 use crate::tmux::{CreateSpec, TmuxClient};
 use crate::util::hysteresis::Smoother;
 
@@ -61,7 +61,7 @@ pub fn spawn(
         let registry = DetectorRegistry::default_stack();
         let mut smoothers: HashMap<String, Smoother> = HashMap::new();
         let mut focused: Option<String> = None;
-        let mut last_bar_state: Vec<(String, bool)> = Vec::new();
+        let mut last_bar_state: Vec<BarSession> = Vec::new();
         let mut globals = GlobalsGuard {
             socket: socket.clone(),
             installed: false,
@@ -83,14 +83,18 @@ pub fn spawn(
                             smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
 
                             // Only sync the status bar when the set of
-                            // (display_name, attached) pairs has actually
-                            // changed. This skips the ~N*7 set-option
+                            // (internal, display, attached) tuples has
+                            // actually changed. Skips the ~N*7 set-option
                             // calls on ticks where nothing's moved.
-                            let state: Vec<(String, bool)> = views
+                            let state: Vec<BarSession> = views
                                 .iter()
-                                .map(|v| (v.display().to_string(), v.session.attached))
+                                .map(|v| BarSession {
+                                    internal: v.name().to_string(),
+                                    display: v.display().to_string(),
+                                    attached: v.session.attached,
+                                })
                                 .collect();
-                            if state != last_bar_state {
+                            if !bar_state_equal(&state, &last_bar_state) {
                                 sync_status_bar(socket.as_deref(), &state, &mut globals);
                                 last_bar_state = state;
                             }
@@ -185,16 +189,39 @@ fn build_internal_name(prefix: &str, display: &str) -> String {
     format!("{}{}-{}", prefix, sanitized, suffix)
 }
 
-/// Map the agent + args into a shell command to run as the new
-/// session's initial process. `terminal` means "just the shell".
-fn build_agent_command(agent: &str, args: &str) -> String {
+/// Map the agent + options + extra args into a shell command to run
+/// as the new session's initial process. `terminal` means "just the
+/// shell" — options are ignored, and any `args` are run as a raw
+/// command (empty = default shell).
+fn build_agent_command(agent: &str, options: &SpecOptions, args: &str) -> String {
     let args = args.trim();
     match agent {
-        "claude" if args.is_empty() => "claude".to_string(),
-        "claude" => format!("claude {}", args),
-        "codex" if args.is_empty() => "codex".to_string(),
-        "codex" => format!("codex {}", args),
-        // "terminal" and anything else → run whatever extra args the
+        "claude" => {
+            let mut parts: Vec<String> = vec!["claude".to_string()];
+            match options.claude.session_mode {
+                ClaudeSessionMode::New => {}
+                ClaudeSessionMode::Continue => parts.push("--continue".to_string()),
+                ClaudeSessionMode::Resume => parts.push("--resume".to_string()),
+            }
+            if options.claude.skip_permissions {
+                parts.push("--dangerously-skip-permissions".to_string());
+            }
+            if !args.is_empty() {
+                parts.push(args.to_string());
+            }
+            parts.join(" ")
+        }
+        "codex" => {
+            let mut parts: Vec<String> = vec!["codex".to_string()];
+            if options.codex.yolo {
+                parts.push("--yolo".to_string());
+            }
+            if !args.is_empty() {
+                parts.push(args.to_string());
+            }
+            parts.join(" ")
+        }
+        // "terminal" and anything unknown → whatever extra args the
         // user typed, or nothing (tmux uses the default shell).
         _ => args.to_string(),
     }
@@ -206,7 +233,7 @@ async fn create_session(
     spec: SessionSpec,
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
-    let command = build_agent_command(&spec.agent, &spec.args);
+    let command = build_agent_command(&spec.agent, &spec.options, &spec.args);
     let create = CreateSpec {
         name: internal.clone(),
         display_name: Some(spec.name.clone()),
@@ -224,18 +251,22 @@ async fn do_refresh(
     smoothers: &mut HashMap<String, Smoother>,
     focused: Option<&str>,
     socket: Option<&str>,
-    last_bar_state: &mut Vec<(String, bool)>,
+    last_bar_state: &mut Vec<BarSession>,
     globals: &mut GlobalsGuard,
     evt_tx: &mpsc::Sender<AppMsg>,
 ) -> crate::error::Result<()> {
     let views = refresh_all(client, config, registry, smoothers, focused).await?;
     smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
 
-    let state: Vec<(String, bool)> = views
+    let state: Vec<BarSession> = views
         .iter()
-        .map(|v| (v.display().to_string(), v.session.attached))
+        .map(|v| BarSession {
+            internal: v.name().to_string(),
+            display: v.display().to_string(),
+            attached: v.session.attached,
+        })
         .collect();
-    if state != *last_bar_state {
+    if !bar_state_equal(&state, last_bar_state) {
         sync_status_bar(socket, &state, globals);
         *last_bar_state = state;
     }
@@ -244,7 +275,16 @@ async fn do_refresh(
     Ok(())
 }
 
-fn sync_status_bar(socket: Option<&str>, sessions: &[(String, bool)], globals: &mut GlobalsGuard) {
+fn bar_state_equal(a: &[BarSession], b: &[BarSession]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.internal == y.internal && x.display == y.display && x.attached == y.attached
+    })
+}
+
+fn sync_status_bar(socket: Option<&str>, sessions: &[BarSession], globals: &mut GlobalsGuard) {
     // Install the global prefix-1..9 bindings on first non-empty state.
     if !globals.installed && !sessions.is_empty() {
         if let Err(e) = status_bar::install_globals(socket, sessions) {
@@ -261,9 +301,13 @@ fn sync_status_bar(socket: Option<&str>, sessions: &[(String, bool)], globals: &
 
     // Apply per-session status-* options. Bosun only touches sessions
     // it manages; everything else keeps whatever bar it had.
-    for (name, _) in sessions {
-        if let Err(e) = status_bar::configure_session(socket, name, sessions) {
-            tracing::warn!("status bar: configure_session {} failed: {}", name, e);
+    for entry in sessions {
+        if let Err(e) = status_bar::configure_session(socket, &entry.internal, sessions) {
+            tracing::warn!(
+                "status bar: configure_session {} failed: {}",
+                entry.internal,
+                e
+            );
         }
     }
 }
@@ -331,4 +375,81 @@ async fn refresh_all(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod build_cmd_tests {
+    use super::*;
+    use crate::events::{ClaudeOptions, CodexOptions};
+
+    fn opts() -> SpecOptions {
+        SpecOptions::default()
+    }
+
+    #[test]
+    fn claude_with_no_options_is_bare() {
+        assert_eq!(build_agent_command("claude", &opts(), ""), "claude");
+    }
+
+    #[test]
+    fn claude_continue_adds_flag() {
+        let mut o = opts();
+        o.claude.session_mode = ClaudeSessionMode::Continue;
+        assert_eq!(build_agent_command("claude", &o, ""), "claude --continue");
+    }
+
+    #[test]
+    fn claude_resume_skip_permissions_combines() {
+        let o = SpecOptions {
+            claude: ClaudeOptions {
+                session_mode: ClaudeSessionMode::Resume,
+                skip_permissions: true,
+            },
+            codex: CodexOptions::default(),
+        };
+        assert_eq!(
+            build_agent_command("claude", &o, ""),
+            "claude --resume --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn claude_with_extra_args_appends() {
+        let o = SpecOptions {
+            claude: ClaudeOptions {
+                skip_permissions: true,
+                ..Default::default()
+            },
+            codex: CodexOptions::default(),
+        };
+        assert_eq!(
+            build_agent_command("claude", &o, "--model=opus"),
+            "claude --dangerously-skip-permissions --model=opus"
+        );
+    }
+
+    #[test]
+    fn codex_yolo() {
+        let o = SpecOptions {
+            codex: CodexOptions { yolo: true },
+            ..Default::default()
+        };
+        assert_eq!(build_agent_command("codex", &o, ""), "codex --yolo");
+    }
+
+    #[test]
+    fn terminal_ignores_options_runs_args() {
+        let o = SpecOptions {
+            claude: ClaudeOptions {
+                skip_permissions: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            build_agent_command("terminal", &o, "vim .zshrc"),
+            "vim .zshrc"
+        );
+        assert_eq!(build_agent_command("terminal", &opts(), ""), "");
+    }
 }

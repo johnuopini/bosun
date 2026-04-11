@@ -173,21 +173,27 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn create_session(&self, spec: &CreateSpec) -> Result<String> {
+        // Create the session with NO initial command. This starts the
+        // user's default login shell, which sources their rc files
+        // (zshrc / bashrc) and sets up the environment the way manual
+        // `tmux new` + typing the command would. Running the command
+        // directly via `new-session -d -s name command` would skip
+        // shell init entirely, and agents like Claude rely on that
+        // init for things like PATH and (historically) env vars.
+        //
+        // We deliberately do NOT pass `-e KEY=VALUE` env passthrough
+        // here — it inflates the command to dozens of args and didn't
+        // resolve the Claude auth issue in testing. Claude reads its
+        // credentials from a file or the macOS Keychain, not from env.
         let mut cmd = self.cmd();
         cmd.arg("new-session").arg("-d").arg("-s").arg(&spec.name);
         if !spec.path.is_empty() {
             cmd.arg("-c").arg(&spec.path);
         }
-        if !spec.command.is_empty() {
-            // Last positional is the shell command to run as pane 0.
-            cmd.arg(&spec.command);
-        }
-
         let output = cmd.output().await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BosunError::TmuxNotInstalled,
             _ => BosunError::Io(e),
         })?;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(BosunError::Tmux(format!(
@@ -197,9 +203,9 @@ impl TmuxClient for TokioTmuxClient {
             )));
         }
 
-        // Set the pretty display name on the freshly-created session
-        // via a per-session user option. Best-effort — if this fails,
-        // the UI will fall back to showing the internal name.
+        // Step 2: set the pretty display name on the freshly-created
+        // session via a per-session user option. Best-effort — if
+        // this fails, the UI falls back to the internal name.
         if let Some(display) = &spec.display_name {
             let mut set = self.cmd();
             set.arg("set-option")
@@ -209,6 +215,29 @@ impl TmuxClient for TokioTmuxClient {
                 .arg(display);
             if let Err(e) = set.output().await {
                 tracing::warn!("set @bosun_display on {}: {}", spec.name, e);
+            }
+        }
+
+        // Step 3: type the agent command via send-keys so it runs
+        // inside the user's shell with their full environment set up.
+        // send-keys queues keystrokes — the shell reads them when it's
+        // ready, so we don't need to synchronize on shell startup.
+        if !spec.command.is_empty() {
+            let mut sk = self.cmd();
+            sk.arg("send-keys")
+                .arg("-t")
+                .arg(&spec.name)
+                .arg(&spec.command)
+                .arg("Enter");
+            match sk.output().await {
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!("send-keys to {}: {}", spec.name, stderr.trim());
+                }
+                Err(e) => {
+                    tracing::warn!("send-keys to {}: {}", spec.name, e);
+                }
+                _ => {}
             }
         }
 

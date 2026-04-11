@@ -32,6 +32,21 @@
 use crate::error::{BosunError, Result};
 use crate::tmux::client::sync_tmux;
 
+/// One row in the status bar's session list. Carries both the
+/// internal tmux session name (for `switch-client -t`) and the
+/// pretty display name (for the chip label). Passing just a
+/// display name confuses tmux because bosun sessions are stored
+/// as `bosun-<display>-<hex>` internally.
+#[derive(Debug, Clone)]
+pub struct BarSession {
+    /// The actual tmux session name — what `tmux list-sessions` gives you.
+    pub internal: String,
+    /// The pretty name the user sees in the bosun UI and in the chip.
+    pub display: String,
+    /// True if any client is currently attached to this session.
+    pub attached: bool,
+}
+
 // --- Visual constants -------------------------------------------------
 
 const BRAND: &str = "#[bg=#7c5cff,fg=#0b0d12,bold] ⚓ bosun #[default] ";
@@ -44,7 +59,7 @@ const STATUS_STYLE: &str = "bg=default,fg=#e6e9ef";
 /// Install the global parts of the status bar: prefix-1..9 jump
 /// bindings. The per-session status-* options are written by
 /// `configure_session`. Idempotent — safe to call every tick.
-pub fn install_globals(socket: Option<&str>, sessions: &[(String, bool)]) -> Result<()> {
+pub fn install_globals(socket: Option<&str>, sessions: &[BarSession]) -> Result<()> {
     bind_jump_keys(socket, sessions)
 }
 
@@ -61,7 +76,7 @@ pub fn uninstall_globals(socket: Option<&str>) {
 pub fn configure_session(
     socket: Option<&str>,
     session: &str,
-    sessions: &[(String, bool)],
+    sessions: &[BarSession],
 ) -> Result<()> {
     let hint = build_hint(socket);
     let status_right = build_status_right(sessions, &hint);
@@ -102,12 +117,15 @@ pub fn emergency_uninstall(socket: Option<&str>) {
 
 // --- Internal: bindings ---------------------------------------------
 
-fn bind_jump_keys(socket: Option<&str>, sessions: &[(String, bool)]) -> Result<()> {
+fn bind_jump_keys(socket: Option<&str>, sessions: &[BarSession]) -> Result<()> {
     for i in 0..9 {
         let key = digit_key(i + 1);
         match sessions.get(i) {
-            Some((name, _)) => {
-                let target = tmux_quote(name);
+            Some(entry) => {
+                // Target must be the INTERNAL tmux name, not the
+                // display name — tmux wouldn't find `ytunnel` when
+                // the actual session is `bosun-ytunnel-3b0529e8`.
+                let target = tmux_quote(&entry.internal);
                 let cmd = format!("switch-client -t {}", target);
                 run(socket, &["bind-key", "-T", "prefix", &key, &cmd])?;
             }
@@ -132,12 +150,12 @@ fn digit_key(n: usize) -> String {
 
 // --- Internal: string building --------------------------------------
 
-fn build_status_right(sessions: &[(String, bool)], hint: &str) -> String {
+fn build_status_right(sessions: &[BarSession], hint: &str) -> String {
     let list: String = sessions
         .iter()
         .enumerate()
         .take(9)
-        .map(|(i, (name, attached))| format_chip(i + 1, name, *attached))
+        .map(|(i, entry)| format_chip(i + 1, &entry.display, entry.attached))
         .collect::<Vec<_>>()
         .join(" ");
     if list.is_empty() {
@@ -244,9 +262,19 @@ mod tests {
         assert_eq!(tmux_quote("has\"quote"), "\"has\\\"quote\"");
     }
 
+    fn bar_session(display: &str, attached: bool) -> BarSession {
+        BarSession {
+            internal: format!("bosun-{}-dead", display),
+            display: display.to_string(),
+            attached,
+        }
+    }
+
     #[test]
     fn build_status_right_caps_at_nine() {
-        let sessions: Vec<(String, bool)> = (1..=12).map(|i| (format!("s{}", i), i == 3)).collect();
+        let sessions: Vec<BarSession> = (1..=12)
+            .map(|i| bar_session(&format!("s{}", i), i == 3))
+            .collect();
         let out = build_status_right(&sessions, TEST_HINT);
         assert!(out.contains("9:s9"));
         assert!(!out.contains("10:s10"));
@@ -261,7 +289,7 @@ mod tests {
 
     #[test]
     fn build_status_right_escapes_hash_in_names() {
-        let sessions = vec![("pre#post".to_string(), false)];
+        let sessions = vec![bar_session("pre#post", false)];
         let out = build_status_right(&sessions, TEST_HINT);
         assert!(out.contains("1:pre##post"));
     }

@@ -11,32 +11,61 @@ use std::env;
 /// to see every session on the server.
 pub const DEFAULT_SESSION_PREFIX: &str = "bosun-";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Only sessions whose name starts with this prefix are shown in
     /// bosun's UI and get the bosun status bar applied. Empty string
     /// means "show everything".
     pub session_prefix: String,
+    /// Name of the tmux session bosun is currently running inside,
+    /// if any. `None` if bosun was launched outside tmux. We exclude
+    /// this session from bosun's own list so the preview doesn't
+    /// capture bosun itself (which would create a visual feedback
+    /// loop: bosun renders a preview of itself, which shows bosun
+    /// rendering a preview of itself, etc).
+    pub self_session: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         let session_prefix =
             env::var("BOSUN_PREFIX").unwrap_or_else(|_| DEFAULT_SESSION_PREFIX.to_string());
-        Self { session_prefix }
+        let self_session = detect_self_session();
+        Self {
+            session_prefix,
+            self_session,
+        }
     }
 
     /// Does `name` pass the managed-session filter?
     pub fn manages(&self, name: &str) -> bool {
+        // Never manage the session bosun is running in — that causes
+        // the recursive preview feedback loop.
+        if self.self_session.as_deref() == Some(name) {
+            return false;
+        }
         self.session_prefix.is_empty() || name.starts_with(&self.session_prefix)
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            session_prefix: DEFAULT_SESSION_PREFIX.to_string(),
-        }
+/// If `$TMUX` is set, ask tmux for the current session name. Used to
+/// exclude bosun's own session from its list.
+fn detect_self_session() -> Option<String> {
+    if env::var("TMUX").is_err() {
+        return None;
+    }
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -44,30 +73,43 @@ impl Default for Config {
 mod tests {
     use super::*;
 
+    fn cfg(prefix: &str) -> Config {
+        Config {
+            session_prefix: prefix.to_string(),
+            self_session: None,
+        }
+    }
+
     #[test]
     fn default_prefix_matches_bosun_sessions() {
-        let cfg = Config::default();
-        assert!(cfg.manages("bosun-work"));
-        assert!(cfg.manages("bosun-"));
-        assert!(!cfg.manages("agentdeck-work"));
-        assert!(!cfg.manages("main"));
+        let c = cfg(DEFAULT_SESSION_PREFIX);
+        assert!(c.manages("bosun-work"));
+        assert!(c.manages("bosun-"));
+        assert!(!c.manages("agentdeck-work"));
+        assert!(!c.manages("main"));
     }
 
     #[test]
     fn empty_prefix_matches_everything() {
-        let cfg = Config {
-            session_prefix: String::new(),
-        };
-        assert!(cfg.manages("anything"));
-        assert!(cfg.manages(""));
+        let c = cfg("");
+        assert!(c.manages("anything"));
+        assert!(c.manages(""));
     }
 
     #[test]
     fn custom_prefix_matches_its_namespace() {
-        let cfg = Config {
-            session_prefix: "work-".to_string(),
+        let c = cfg("work-");
+        assert!(c.manages("work-api"));
+        assert!(!c.manages("bosun-api"));
+    }
+
+    #[test]
+    fn self_session_is_excluded_even_when_prefix_matches() {
+        let c = Config {
+            session_prefix: DEFAULT_SESSION_PREFIX.to_string(),
+            self_session: Some("bosun-mine-abc".to_string()),
         };
-        assert!(cfg.manages("work-api"));
-        assert!(!cfg.manages("bosun-api"));
+        assert!(!c.manages("bosun-mine-abc"));
+        assert!(c.manages("bosun-other-xyz"));
     }
 }

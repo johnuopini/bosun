@@ -13,6 +13,60 @@ pub struct SessionSpec {
     pub path: String,
     pub agent: String,
     pub args: String,
+    pub options: SpecOptions,
+}
+
+/// Agent-specific flags the user toggled in the new-session modal.
+/// The actor's `build_agent_command` reads these and produces the
+/// right CLI flags when spawning the agent.
+#[derive(Debug, Clone, Default)]
+pub struct SpecOptions {
+    pub claude: ClaudeOptions,
+    pub codex: CodexOptions,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeOptions {
+    pub session_mode: ClaudeSessionMode,
+    pub skip_permissions: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClaudeSessionMode {
+    #[default]
+    New,
+    Continue,
+    Resume,
+}
+
+impl ClaudeSessionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::New => "New",
+            Self::Continue => "Continue",
+            Self::Resume => "Resume",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::New => Self::Continue,
+            Self::Continue => Self::Resume,
+            Self::Resume => Self::New,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::New => Self::Resume,
+            Self::Continue => Self::New,
+            Self::Resume => Self::Continue,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexOptions {
+    /// Codex `--yolo` — bypass approvals and sandbox. Dangerous.
+    pub yolo: bool,
 }
 
 /// Commands flow from the UI/app task into the tmux actor.

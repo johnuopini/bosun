@@ -11,7 +11,7 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bosun::tmux::status_bar::{configure_session, install_globals, uninstall_globals};
+use bosun::tmux::status_bar::{configure_session, install_globals, uninstall_globals, BarSession};
 
 fn unique_socket(tag: &str) -> String {
     let nanos = SystemTime::now()
@@ -60,7 +60,11 @@ fn configure_session_writes_per_session_options_only() {
     let global_before = show_global(&sock, "status-left");
     let legacy_before = show_session(&sock, "legacy", "status-left");
 
-    let sessions = vec![("bosun-main".to_string(), true)];
+    let sessions = vec![BarSession {
+        internal: "bosun-main".to_string(),
+        display: "main".to_string(),
+        attached: true,
+    }];
     configure_session(Some(&sock), "bosun-main", &sessions).expect("configure ok");
 
     // bosun-main should now show the brand in its per-session option.
@@ -102,8 +106,16 @@ fn install_and_uninstall_globals_bind_prefix_digits() {
     tmux(&sock, &["new-session", "-d", "-s", "bosun-two"]);
 
     let sessions = vec![
-        ("bosun-one".to_string(), true),
-        ("bosun-two".to_string(), false),
+        BarSession {
+            internal: "bosun-one".to_string(),
+            display: "one".to_string(),
+            attached: true,
+        },
+        BarSession {
+            internal: "bosun-two".to_string(),
+            display: "two".to_string(),
+            attached: false,
+        },
     ];
     install_globals(Some(&sock), &sessions).expect("install globals ok");
 
@@ -118,6 +130,22 @@ fn install_and_uninstall_globals_bind_prefix_digits() {
         keys.lines()
             .any(|l| l.contains("prefix") && l.contains(" 2 ") && l.contains("switch-client")),
         "expected a prefix-2 switch-client binding, got:\n{}",
+        keys
+    );
+
+    // The bindings should target the INTERNAL names (bosun-one,
+    // bosun-two), not display names. This is the whole point of
+    // BarSession vs the old (display, attached) tuple.
+    // tmux list-keys may rendertargets with or without quotes, so
+    // match flexibly.
+    assert!(
+        keys.contains("bosun-one") && !keys.contains("switch-client -t \"one\""),
+        "expected binding to target internal name bosun-one, got:\n{}",
+        keys
+    );
+    assert!(
+        keys.contains("bosun-two") && !keys.contains("switch-client -t \"two\""),
+        "expected binding to target internal name bosun-two, got:\n{}",
         keys
     );
 
