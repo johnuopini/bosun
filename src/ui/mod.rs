@@ -3,10 +3,12 @@ pub mod modal;
 pub mod preview;
 pub mod session_list;
 pub mod statusbar;
+pub mod theme;
 
 use ratatui::Frame;
 
 use crate::app::AppState;
+pub use theme::Theme;
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();

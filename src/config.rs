@@ -1,9 +1,22 @@
-//! Runtime configuration. Phase 1-2 uses env vars for all knobs — a
-//! proper TOML config file lands in Phase 4. Everything is read once
-//! at startup and passed around by value, so the rest of the code
-//! never touches `std::env`.
+//! Runtime configuration. Values are read once at startup and passed
+//! around by value, so the rest of the code never touches `std::env`
+//! or the config file on disk.
+//!
+//! Sources, in order of precedence (lowest to highest):
+//!   1. Built-in defaults.
+//!   2. `$XDG_CONFIG_HOME/bosun/config.toml` (`~/Library/Application
+//!      Support/dev.yetidevworks.bosun/config.toml` on macOS).
+//!   3. Environment variables (`BOSUN_PREFIX`, `BOSUN_TMUX_SOCKET`,
+//!      `BOSUN_THEME`).
+//!
+//! Env vars always win. A missing or malformed config file is
+//! non-fatal — we log a warning and fall through to defaults.
 
 use std::env;
+use std::path::PathBuf;
+
+use directories::ProjectDirs;
+use serde::Deserialize;
 
 /// The default prefix that bosun considers "managed". Only tmux
 /// sessions whose name starts with this prefix appear in bosun's UI
@@ -24,7 +37,10 @@ pub const DEFAULT_SESSION_PREFIX: &str = "bosun-";
 /// other tmux session on the machine).
 pub const DEFAULT_TMUX_SOCKET: &str = "bosun";
 
-#[derive(Debug, Clone, Default)]
+/// Default theme name — must match a built-in in `ui::theme`.
+pub const DEFAULT_THEME: &str = "opencode";
+
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Only sessions whose name starts with this prefix are shown in
     /// bosun's UI and get the bosun status bar applied. Empty string
@@ -40,17 +56,60 @@ pub struct Config {
     /// loop: bosun renders a preview of itself, which shows bosun
     /// rendering a preview of itself, etc).
     pub self_session: Option<String>,
+    /// Theme name. Resolved against user themes first, then
+    /// built-ins (`opencode`, `tokyonight`), then a hard-fallback.
+    pub theme: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            session_prefix: DEFAULT_SESSION_PREFIX.to_string(),
+            tmux_socket: Some(DEFAULT_TMUX_SOCKET.to_string()),
+            self_session: None,
+            theme: DEFAULT_THEME.to_string(),
+        }
+    }
+}
+
+/// Shape of `config.toml` on disk. All fields are optional and
+/// defaulted independently so a half-written file still loads.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    session_prefix: Option<String>,
+    #[serde(default)]
+    tmux_socket: Option<String>,
+    #[serde(default)]
+    theme: Option<String>,
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        let session_prefix =
-            env::var("BOSUN_PREFIX").unwrap_or_else(|_| DEFAULT_SESSION_PREFIX.to_string());
+    /// Full load path: defaults → config.toml → env vars. See the
+    /// module-level doc comment for the precedence order.
+    pub fn load() -> Self {
+        let file = read_config_file().unwrap_or_default();
+
+        let session_prefix = env::var("BOSUN_PREFIX")
+            .ok()
+            .or(file.session_prefix)
+            .unwrap_or_else(|| DEFAULT_SESSION_PREFIX.to_string());
+
         let tmux_socket = match env::var("BOSUN_TMUX_SOCKET") {
             Ok(s) if s.is_empty() || s == "default" => None,
             Ok(s) => Some(s),
-            Err(_) => Some(DEFAULT_TMUX_SOCKET.to_string()),
+            Err(_) => match file.tmux_socket.as_deref() {
+                Some("") | Some("default") => None,
+                Some(s) => Some(s.to_string()),
+                None => Some(DEFAULT_TMUX_SOCKET.to_string()),
+            },
         };
+
+        let theme = env::var("BOSUN_THEME")
+            .ok()
+            .or(file.theme)
+            .unwrap_or_else(|| DEFAULT_THEME.to_string());
+
         // Only detect self-session if we're on the same socket as
         // the caller's tmux. If bosun uses a dedicated socket, the
         // parent tmux (if any) is on a different server and bosun
@@ -60,11 +119,20 @@ impl Config {
         } else {
             None
         };
+
         Self {
             session_prefix,
             tmux_socket,
             self_session,
+            theme,
         }
+    }
+
+    /// Back-compat shim for callers that only want env-driven config.
+    /// Retained so tests and a few internal paths don't need to
+    /// touch the filesystem.
+    pub fn from_env() -> Self {
+        Self::load()
     }
 
     /// Does `name` pass the managed-session filter?
@@ -75,6 +143,31 @@ impl Config {
             return false;
         }
         self.session_prefix.is_empty() || name.starts_with(&self.session_prefix)
+    }
+}
+
+/// Location of bosun's config directory. Same `ProjectDirs` entry
+/// the SQLite store uses, so `config.toml` lives alongside
+/// `bosun.db` on macOS.
+pub fn config_dir() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "yetidevworks", "bosun").map(|d| d.config_dir().to_path_buf())
+}
+
+/// Where user-defined themes live — one `.toml` per theme, file name
+/// without extension is the theme name.
+pub fn user_themes_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("themes"))
+}
+
+fn read_config_file() -> Option<ConfigFile> {
+    let path = config_dir()?.join("config.toml");
+    let s = std::fs::read_to_string(&path).ok()?;
+    match toml::from_str::<ConfigFile>(&s) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("failed to parse {:?}: {}", path, e);
+            None
+        }
     }
 }
 
@@ -108,6 +201,7 @@ mod tests {
             session_prefix: prefix.to_string(),
             tmux_socket: Some(DEFAULT_TMUX_SOCKET.to_string()),
             self_session: None,
+            theme: DEFAULT_THEME.to_string(),
         }
     }
 
@@ -140,8 +234,30 @@ mod tests {
             session_prefix: DEFAULT_SESSION_PREFIX.to_string(),
             tmux_socket: None,
             self_session: Some("bosun-mine-abc".to_string()),
+            theme: DEFAULT_THEME.to_string(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
+    }
+
+    #[test]
+    fn config_file_fields_parse() {
+        let src = r#"
+            session_prefix = "work-"
+            tmux_socket = "scratch"
+            theme = "tokyonight"
+        "#;
+        let parsed: ConfigFile = toml::from_str(src).unwrap();
+        assert_eq!(parsed.session_prefix.as_deref(), Some("work-"));
+        assert_eq!(parsed.tmux_socket.as_deref(), Some("scratch"));
+        assert_eq!(parsed.theme.as_deref(), Some("tokyonight"));
+    }
+
+    #[test]
+    fn empty_config_file_is_all_defaults() {
+        let parsed: ConfigFile = toml::from_str("").unwrap();
+        assert!(parsed.session_prefix.is_none());
+        assert!(parsed.tmux_socket.is_none());
+        assert!(parsed.theme.is_none());
     }
 }

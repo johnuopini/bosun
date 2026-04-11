@@ -20,6 +20,8 @@ async-trait = "0.1"
 ansi-to-tui = "8"
 rusqlite = { version = "0.39", features = ["bundled"] }
 directories = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.4"
