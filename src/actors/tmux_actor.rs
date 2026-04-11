@@ -31,7 +31,7 @@ use crate::store::Store;
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
 use crate::tmux::session::SessionView;
 use crate::tmux::status_bar::{self, BarSession};
-use crate::tmux::{CreateSpec, TmuxClient};
+use crate::tmux::{CreateSpec, SessionMetadata, TmuxClient};
 use crate::util::collision::resolve_name_collision;
 use crate::util::hysteresis::Smoother;
 
@@ -154,6 +154,72 @@ pub fn spawn(
                         }
                         Err(e) => {
                             let _ = evt_tx.send(AppMsg::Warn(format!("kill: {}", e))).await;
+                        }
+                    }
+                }
+                Command::DeleteRecent(id) => {
+                    if let Err(e) = store.delete_recent(id) {
+                        tracing::warn!("delete_recent({}): {}", id, e);
+                    }
+                }
+                Command::RestartSession(internal) => {
+                    match client.get_session_metadata(&internal).await {
+                        Ok(Some(meta)) => {
+                            // Rebuild the spec, kill the old session,
+                            // then create a new one with the same
+                            // display name + options (new internal
+                            // hex suffix).
+                            let spec = metadata_to_spec(meta);
+                            if let Err(e) = client.kill_session(&internal).await {
+                                let _ = evt_tx
+                                    .send(AppMsg::Warn(format!("restart kill: {}", e)))
+                                    .await;
+                                continue;
+                            }
+                            if focused.as_deref() == Some(internal.as_str()) {
+                                focused = None;
+                            }
+                            match create_session(&*client, &config, spec.clone()).await {
+                                Ok(new_internal) => {
+                                    focused = Some(new_internal.clone());
+                                    if let Err(e) = store.upsert_recent(&spec) {
+                                        tracing::warn!("store upsert on restart: {}", e);
+                                    }
+                                    let _ = evt_tx
+                                        .send(AppMsg::Warn(format!("restarted {}", spec.name)))
+                                        .await;
+                                    let _ = do_refresh(
+                                        &*client,
+                                        &config,
+                                        &registry,
+                                        &mut smoothers,
+                                        focused.as_deref(),
+                                        socket.as_deref(),
+                                        &mut last_bar_state,
+                                        &mut globals,
+                                        &evt_tx,
+                                        Some(new_internal),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    let _ = evt_tx
+                                        .send(AppMsg::Warn(format!("restart create: {}", e)))
+                                        .await;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = evt_tx
+                                .send(AppMsg::Warn(
+                                    "cannot restart: session predates metadata support".to_string(),
+                                ))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(AppMsg::Warn(format!("restart read: {}", e)))
+                                .await;
                         }
                     }
                 }
@@ -333,13 +399,57 @@ async fn create_session(
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
     let command = build_agent_command(&spec.agent, &spec.options, &spec.args);
+    let metadata = Some(spec_to_metadata(&spec));
     let create = CreateSpec {
         name: internal.clone(),
         display_name: Some(spec.name.clone()),
         path: spec.path.clone(),
         command,
+        metadata,
     };
     client.create_session(&create).await.map(|_| internal)
+}
+
+/// Project a `SessionSpec` into the persisted tmux-options shape.
+fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
+    SessionMetadata {
+        display_name: spec.name.clone(),
+        path: spec.path.clone(),
+        agent: spec.agent.clone(),
+        args: spec.args.clone(),
+        claude_session_mode: match spec.options.claude.session_mode {
+            ClaudeSessionMode::New => "New".to_string(),
+            ClaudeSessionMode::Continue => "Continue".to_string(),
+            ClaudeSessionMode::Resume => "Resume".to_string(),
+        },
+        claude_skip_permissions: spec.options.claude.skip_permissions,
+        codex_yolo: spec.options.codex.yolo,
+    }
+}
+
+/// Inverse of `spec_to_metadata` — rebuild a SessionSpec from the
+/// metadata we read off a live tmux session during restart.
+fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
+    use crate::events::{ClaudeOptions, CodexOptions};
+    SessionSpec {
+        name: meta.display_name,
+        path: meta.path,
+        agent: meta.agent,
+        args: meta.args,
+        options: SpecOptions {
+            claude: ClaudeOptions {
+                session_mode: match meta.claude_session_mode.as_str() {
+                    "Continue" => ClaudeSessionMode::Continue,
+                    "Resume" => ClaudeSessionMode::Resume,
+                    _ => ClaudeSessionMode::New,
+                },
+                skip_permissions: meta.claude_skip_permissions,
+            },
+            codex: CodexOptions {
+                yolo: meta.codex_yolo,
+            },
+        },
+    }
 }
 
 /// Query the live session list, extract display names, and rename

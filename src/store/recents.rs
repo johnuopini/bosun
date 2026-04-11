@@ -133,6 +133,15 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete a recent row by its primary key. Used by the `d` key
+    /// in the RecentsModal to remove stale entries.
+    pub fn delete_recent(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute("DELETE FROM recents WHERE id = ?1", params![id])
+            .map_err(map_sql_err)?;
+        Ok(())
+    }
+
     /// Return `DISTINCT path`s sorted by most-recently-used, up to
     /// `limit`. Used by path tab-completion in the modal (Phase 3c
     /// polish).
@@ -273,6 +282,30 @@ mod tests {
         s.upsert_recent(&sp).unwrap();
         let got = &s.list_recents(1).unwrap()[0];
         assert!(got.codex.yolo);
+    }
+
+    #[test]
+    fn delete_recent_removes_row() {
+        let s = Store::in_memory().unwrap();
+        s.upsert_recent(&spec("keep", "/tmp", "claude")).unwrap();
+        s.upsert_recent(&spec("drop", "/tmp", "claude")).unwrap();
+        let before = s.list_recents(10).unwrap();
+        assert_eq!(before.len(), 2);
+        let drop_id = before.iter().find(|r| r.name == "drop").unwrap().id;
+        s.delete_recent(drop_id).unwrap();
+        let after = s.list_recents(10).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name, "keep");
+    }
+
+    #[test]
+    fn delete_nonexistent_recent_is_noop() {
+        let s = Store::in_memory().unwrap();
+        s.upsert_recent(&spec("keep", "/tmp", "claude")).unwrap();
+        // Delete an id that doesn't exist — should silently succeed.
+        s.delete_recent(99999).unwrap();
+        let after = s.list_recents(10).unwrap();
+        assert_eq!(after.len(), 1);
     }
 
     #[test]

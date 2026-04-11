@@ -40,6 +40,7 @@ async fn create_session_sets_display_name_and_appears_in_list() {
         display_name: Some("rasterfox".to_string()),
         path: "/tmp".to_string(),
         command: String::new(), // default shell
+        metadata: None,
     };
 
     let created = client.create_session(&spec).await.expect("create ok");
@@ -81,6 +82,7 @@ async fn create_session_without_display_name_does_not_set_option() {
         display_name: None,
         path: "/tmp".to_string(),
         command: String::new(),
+        metadata: None,
     };
     client.create_session(&spec).await.expect("create ok");
 

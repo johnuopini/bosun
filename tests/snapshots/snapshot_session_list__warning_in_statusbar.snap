@@ -8,4 +8,4 @@ expression: frame
                                                                                 
                                                                                 
                                                                                 
- bosun  list: tmux not running↑↓ nav · ↵ attach · n new · r rename · d kill · q
+ bosun  list: tmux not running↵ attach · n new · r ren · R restart · d kill · q

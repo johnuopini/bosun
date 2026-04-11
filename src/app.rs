@@ -120,6 +120,7 @@ impl AppState {
                                 out.push(c);
                             }
                         }
+                        StackDispatch::Emit(cmd) => out.push(cmd),
                     }
                 } else {
                     self.handle_key(k, &mut out);
@@ -212,6 +213,25 @@ impl AppState {
                     self.modals.push(Box::new(
                         ConfirmModal::new(title, msg, Command::KillSession(internal)).destructive(),
                     ));
+                }
+            }
+            (KeyCode::Char('R'), _) => {
+                // Shift-R restarts: kill + recreate the selected
+                // session using the metadata persisted to @bosun_*
+                // tmux options at create time.
+                if let Some(sel) = self.sessions.get(self.selected) {
+                    let internal = sel.name().to_string();
+                    let display = sel.display().to_string();
+                    let title = "Restart session?";
+                    let msg = format!(
+                        "This kills and recreates '{}' with the same config.",
+                        display
+                    );
+                    self.modals.push(Box::new(ConfirmModal::new(
+                        title,
+                        msg,
+                        Command::RestartSession(internal),
+                    )));
                 }
             }
             (KeyCode::Char('n'), KeyModifiers::NONE) => {

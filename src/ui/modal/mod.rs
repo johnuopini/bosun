@@ -56,6 +56,11 @@ pub enum ModalResult {
     /// opens another, e.g. the new-session modal opens the recents
     /// picker on Ctrl+R.
     Push(Box<dyn Modal>),
+    /// Emit a command to the tmux actor but keep the modal open.
+    /// Used by the RecentsModal's `d`-to-delete handler: the delete
+    /// fires, the modal refreshes its local view, and the user stays
+    /// in the picker to continue browsing.
+    EmitCommand(Command),
 }
 
 pub trait Modal: Send {
@@ -128,9 +133,9 @@ impl ModalStack {
 
     /// Dispatch a key to the top modal and apply the result to the
     /// stack in-place. Returns an optional Command that the caller
-    /// should forward to the tmux actor (from `Close(Some(cmd))`),
-    /// plus a `PassThrough` signal so the caller knows whether to
-    /// route the key to the main list instead.
+    /// should forward to the tmux actor (from `Close(Some(cmd))` or
+    /// `EmitCommand(cmd)`), plus a `PassThrough` signal so the caller
+    /// knows whether to route the key to the main list instead.
     pub fn dispatch(&mut self, key: KeyEvent) -> StackDispatch {
         if self.stack.is_empty() {
             return StackDispatch::PassThrough;
@@ -154,6 +159,7 @@ impl ModalStack {
                 self.stack.push(child);
                 StackDispatch::Consumed
             }
+            ModalResult::EmitCommand(cmd) => StackDispatch::Emit(cmd),
         }
     }
 }
@@ -168,6 +174,8 @@ pub enum StackDispatch {
     /// A modal just closed; forward its optional command to the
     /// tmux actor.
     Closed(Option<Command>),
+    /// A modal fired a command but stayed open (e.g. delete-recent).
+    Emit(Command),
 }
 
 fn dim_background(frame: &mut Frame<'_>, area: Rect) {

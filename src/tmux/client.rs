@@ -15,7 +15,7 @@ use crate::tmux::session::TmuxSession;
 /// already be shell-safe (no unescaped quotes, no interior control
 /// characters); the actor is responsible for building this from the
 /// form modal's output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateSpec {
     /// Full tmux session name, including any prefix like `bosun-` and
     /// a uniqueness suffix. This is the name tmux actually uses.
@@ -30,6 +30,25 @@ pub struct CreateSpec {
     /// Shell command to run as the initial process. Empty means use
     /// the user's default shell.
     pub command: String,
+    /// Full session spec (agent, args, options) to persist as
+    /// per-session `@bosun_*` tmux user options. Used by restart to
+    /// recover the original spec. `None` skips persistence (useful
+    /// for tests and for callers that don't care about restart).
+    pub metadata: Option<SessionMetadata>,
+}
+
+/// The subset of `SessionSpec` that bosun persists as tmux user
+/// options on each managed session so that `RestartSession` can
+/// rebuild the spec without an external store.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMetadata {
+    pub display_name: String,
+    pub path: String,
+    pub agent: String,
+    pub args: String,
+    pub claude_session_mode: String,
+    pub claude_skip_permissions: bool,
+    pub codex_yolo: bool,
 }
 
 /// Abstraction over the tmux CLI. Real impl shells out; mocks record calls.
@@ -58,6 +77,12 @@ pub trait TmuxClient: Send + Sync {
     /// picks up a new pretty label on the next refresh. Does not
     /// change the internal tmux session name.
     async fn set_display_name(&self, session: &str, display: &str) -> Result<()>;
+
+    /// Read bosun's persisted `@bosun_*` metadata off a session, or
+    /// `Ok(None)` if the session has no agent set (pre-dates the
+    /// feature or wasn't created by bosun). Used by restart to
+    /// rebuild the original spec.
+    async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -227,6 +252,24 @@ impl TmuxClient for TokioTmuxClient {
             }
         }
 
+        // Step 2b: persist the full session metadata as @bosun_*
+        // user options so RestartSession can recover the spec later.
+        // Best-effort; failures just mean restart won't work for
+        // this session.
+        if let Some(meta) = &spec.metadata {
+            for (key, value) in metadata_options(meta) {
+                let mut set = self.cmd();
+                set.arg("set-option")
+                    .arg("-t")
+                    .arg(&spec.name)
+                    .arg(key)
+                    .arg(&value);
+                if let Err(e) = set.output().await {
+                    tracing::warn!("set {} on {}: {}", key, spec.name, e);
+                }
+            }
+        }
+
         // Step 3: type the agent command via send-keys so it runs
         // inside the user's shell with their full environment set up.
         //
@@ -305,6 +348,75 @@ impl TmuxClient for TokioTmuxClient {
             stderr.trim()
         )))
     }
+
+    async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>> {
+        // Single display-message call returns all 7 fields separated
+        // by ASCII unit separators. Empty fields become empty strings.
+        const SEP: &str = "\x1f";
+        let fmt = format!(
+            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}",
+            SEP = SEP
+        );
+        let mut cmd = self.cmd();
+        cmd.arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(session)
+            .arg(&fmt);
+        let output = cmd.output().await.map_err(BosunError::Io)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BosunError::Tmux(format!(
+                "display-message on {}: {}",
+                session,
+                stderr.trim()
+            )));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let line = raw.trim_end_matches('\n');
+        let parts: Vec<&str> = line.split(SEP).collect();
+        if parts.len() != 7 {
+            return Ok(None);
+        }
+        // Agent is the required anchor — if it's empty, this session
+        // wasn't created by a metadata-aware bosun.
+        if parts[2].is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(SessionMetadata {
+            display_name: parts[0].to_string(),
+            path: parts[1].to_string(),
+            agent: parts[2].to_string(),
+            args: parts[3].to_string(),
+            claude_session_mode: if parts[4].is_empty() {
+                "New".to_string()
+            } else {
+                parts[4].to_string()
+            },
+            claude_skip_permissions: parts[5] == "1",
+            codex_yolo: parts[6] == "1",
+        }))
+    }
+}
+
+/// Map a `SessionMetadata` into the `(key, value)` pairs that should
+/// be written via `set-option -t <session>`.
+fn metadata_options(m: &SessionMetadata) -> Vec<(&'static str, String)> {
+    vec![
+        ("@bosun_path", m.path.clone()),
+        ("@bosun_agent", m.agent.clone()),
+        ("@bosun_args", m.args.clone()),
+        ("@bosun_claude_session_mode", m.claude_session_mode.clone()),
+        (
+            "@bosun_claude_skip_permissions",
+            if m.claude_skip_permissions { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "@bosun_codex_yolo",
+            if m.codex_yolo { "1" } else { "0" }.to_string(),
+        ),
+    ]
 }
 
 /// Build a synchronous `std::process::Command` for tmux with the given args.

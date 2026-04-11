@@ -93,6 +93,15 @@ pub enum Command {
         internal: String,
         new_display: String,
     },
+    /// Kill and recreate a session using the metadata we persisted
+    /// as `@bosun_*` tmux user options when it was first created.
+    /// The new session gets a fresh internal name (new hex suffix)
+    /// but keeps the same display name, path, agent and options.
+    RestartSession(String),
+    /// Delete a single recent entry from the SQLite store by its
+    /// primary key. The RecentsModal emits this when the user hits
+    /// `d` on a highlighted row.
+    DeleteRecent(i64),
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

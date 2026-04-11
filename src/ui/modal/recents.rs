@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
+use crate::events::Command;
 use crate::store::Recent;
 
 use super::{center_rect, Modal, ModalData, ModalResult};
@@ -89,6 +90,19 @@ impl RecentsModal {
             self.selected += 1;
         }
     }
+
+    /// Drop the highlighted row from the local view and emit a
+    /// `DeleteRecent(id)` command so the store is updated too.
+    /// The modal stays open so the user can continue pruning.
+    fn delete_highlighted(&mut self) -> ModalResult {
+        let indices = self.filtered_indices();
+        let Some(&recents_idx) = indices.get(self.selected) else {
+            return ModalResult::Consumed;
+        };
+        let removed = self.recents.remove(recents_idx);
+        self.clamp_selection();
+        ModalResult::EmitCommand(Command::DeleteRecent(removed.id))
+    }
 }
 
 impl Modal for RecentsModal {
@@ -120,6 +134,11 @@ impl Modal for RecentsModal {
                 self.filter.pop();
                 self.clamp_selection();
                 ModalResult::Consumed
+            }
+            // Ctrl-D deletes the highlighted recent. Not plain 'd'
+            // because that'd collide with typing 'd' into the filter.
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_highlighted()
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -186,7 +205,7 @@ impl Modal for RecentsModal {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "        esc cancel · ↑↓ select · ↵ pick",
+                "   esc · ↑↓ select · ↵ pick · ^d delete",
                 Style::default().fg(MUTED).bg(BG),
             ),
         ]));

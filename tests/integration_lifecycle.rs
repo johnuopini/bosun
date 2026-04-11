@@ -8,7 +8,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bosun::tmux::{CreateSpec, TmuxClient, TokioTmuxClient};
+use bosun::tmux::{CreateSpec, SessionMetadata, TmuxClient, TokioTmuxClient};
 
 fn unique_socket(tag: &str) -> String {
     let nanos = SystemTime::now()
@@ -42,6 +42,7 @@ async fn kill_session_removes_from_list() {
             display_name: Some("zap".into()),
             path: "/tmp".into(),
             command: String::new(),
+            metadata: None,
         })
         .await
         .expect("create ok");
@@ -73,6 +74,7 @@ async fn kill_session_missing_is_noop() {
             display_name: Some("keep".into()),
             path: "/tmp".into(),
             command: String::new(),
+            metadata: None,
         })
         .await
         .expect("seed ok");
@@ -97,6 +99,7 @@ async fn set_display_name_updates_option_and_list() {
             display_name: Some("Old Name".into()),
             path: "/tmp".into(),
             command: String::new(),
+            metadata: None,
         })
         .await
         .expect("create ok");
@@ -122,6 +125,73 @@ async fn set_display_name_updates_option_and_list() {
     assert_eq!(s.display_name.as_deref(), Some("Fresh Name"));
     // Internal name unchanged.
     assert_eq!(s.name, "bosun-abc-1234");
+
+    kill_server(&sock);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_round_trips_through_tmux_options() {
+    let sock = unique_socket("meta");
+    let client = TokioTmuxClient::with_socket(sock.clone());
+
+    let meta = SessionMetadata {
+        display_name: "My Session".into(),
+        path: "/tmp/my".into(),
+        agent: "claude".into(),
+        args: "--model=opus".into(),
+        claude_session_mode: "Resume".into(),
+        claude_skip_permissions: true,
+        codex_yolo: false,
+    };
+    client
+        .create_session(&CreateSpec {
+            name: "bosun-meta-round".into(),
+            display_name: Some("My Session".into()),
+            path: "/tmp".into(),
+            command: String::new(),
+            metadata: Some(meta.clone()),
+        })
+        .await
+        .expect("create with metadata ok");
+
+    let got = client
+        .get_session_metadata("bosun-meta-round")
+        .await
+        .expect("get_session_metadata ok")
+        .expect("metadata should exist after create");
+    assert_eq!(got.display_name, "My Session");
+    assert_eq!(got.path, "/tmp/my");
+    assert_eq!(got.agent, "claude");
+    assert_eq!(got.args, "--model=opus");
+    assert_eq!(got.claude_session_mode, "Resume");
+    assert!(got.claude_skip_permissions);
+    assert!(!got.codex_yolo);
+
+    kill_server(&sock);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_returns_none_when_agent_option_missing() {
+    let sock = unique_socket("nometa");
+    let client = TokioTmuxClient::with_socket(sock.clone());
+
+    // Create a bare session with no @bosun_agent option set.
+    client
+        .create_session(&CreateSpec {
+            name: "bosun-bare-meta".into(),
+            display_name: Some("bare".into()),
+            path: "/tmp".into(),
+            command: String::new(),
+            metadata: None,
+        })
+        .await
+        .expect("bare create ok");
+
+    let got = client
+        .get_session_metadata("bosun-bare-meta")
+        .await
+        .expect("get_session_metadata ok");
+    assert!(got.is_none(), "expected None when @bosun_agent is unset");
 
     kill_server(&sock);
 }
