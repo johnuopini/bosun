@@ -84,9 +84,7 @@ fn render_primary_line(
     } else {
         Style::default().fg(theme.text).bg(bg)
     };
-    let status_style = Style::default()
-        .fg(status_color(view.status, theme))
-        .bg(bg);
+    let status_style = Style::default().fg(status_color(view.status, theme)).bg(bg);
 
     let glyph = view.status.glyph().to_string();
     let name = view.display().to_string();

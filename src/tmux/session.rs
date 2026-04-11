@@ -45,9 +45,7 @@ impl TmuxSession {
     /// if the session is bosun-managed, otherwise the shell's current
     /// working directory. `None` if neither is known.
     pub fn best_path(&self) -> Option<&str> {
-        self.spec_path
-            .as_deref()
-            .or(self.current_path.as_deref())
+        self.spec_path.as_deref().or(self.current_path.as_deref())
     }
 }
 

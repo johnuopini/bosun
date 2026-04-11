@@ -180,8 +180,8 @@ fn read_config_file() -> Option<ConfigFile> {
 /// picker) surface this as a warning in the status bar but still
 /// apply the change to the live UI.
 pub fn write_theme(name: &str) -> std::io::Result<()> {
-    let dir = config_dir()
-        .ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("config.toml");
 

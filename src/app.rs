@@ -341,14 +341,11 @@ impl App {
                 // it survives restart.
                 match c {
                     Command::SetTheme { name, persist } => {
-                        self.theme = Theme::load(
-                            &name,
-                            crate::config::user_themes_dir().as_deref(),
-                        );
+                        self.theme =
+                            Theme::load(&name, crate::config::user_themes_dir().as_deref());
                         if persist {
                             if let Err(e) = crate::config::write_theme(&name) {
-                                self.state.warning =
-                                    Some(format!("theme: failed to save: {e}"));
+                                self.state.warning = Some(format!("theme: failed to save: {e}"));
                             }
                         }
                     }
@@ -370,8 +367,7 @@ impl App {
                             .push(Box::new(NewSessionModal::new(recents)));
                     }
                     ModalRequest::Theme => {
-                        let names =
-                            Theme::available(crate::config::user_themes_dir().as_deref());
+                        let names = Theme::available(crate::config::user_themes_dir().as_deref());
                         let original = self.theme.name.clone();
                         self.state
                             .modals

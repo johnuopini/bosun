@@ -705,7 +705,11 @@ fn longest_common_prefix(strs: &[&str]) -> String {
 }
 
 fn input_line(value: &str, focused: bool, width: u16, theme: &Theme) -> Line<'static> {
-    let bg = if focused { theme.selection_bg } else { theme.bg };
+    let bg = if focused {
+        theme.selection_bg
+    } else {
+        theme.bg
+    };
     let fg = if value.is_empty() {
         theme.text_muted
     } else {

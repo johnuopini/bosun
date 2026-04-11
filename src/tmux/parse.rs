@@ -196,7 +196,8 @@ mod tests {
 
     #[test]
     fn bosun_user_options_parse_when_present() {
-        let line = "bosun-foo\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1ffoo\x1fclaude\x1f~/proj";
+        let line =
+            "bosun-foo\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1ffoo\x1fclaude\x1f~/proj";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions[0].display_name.as_deref(), Some("foo"));
         assert_eq!(sessions[0].agent.as_deref(), Some("claude"));

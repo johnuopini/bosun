@@ -133,7 +133,10 @@ impl Theme {
     /// with the same name as a built-in override the built-in, so we
     /// dedupe by name with user entries winning.
     pub fn available(user_dir: Option<&Path>) -> Vec<String> {
-        let mut names: Vec<String> = Self::builtin_names().iter().map(|s| s.to_string()).collect();
+        let mut names: Vec<String> = Self::builtin_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         if let Some(dir) = user_dir {
             if let Ok(read) = std::fs::read_dir(dir) {
                 for entry in read.flatten() {
@@ -207,8 +210,8 @@ mod tests {
     #[test]
     fn every_builtin_listed_also_parses() {
         for name in Theme::builtin_names() {
-            let t = Theme::builtin(name)
-                .unwrap_or_else(|| panic!("built-in theme {name} must parse"));
+            let t =
+                Theme::builtin(name).unwrap_or_else(|| panic!("built-in theme {name} must parse"));
             assert_eq!(
                 t.name, *name,
                 "theme file {name}.toml has name = {:?}, expected {:?}",
