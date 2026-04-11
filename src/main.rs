@@ -10,7 +10,10 @@ use ratatui::Terminal;
 
 use bosun::app::App;
 use bosun::error::{BosunError, Result};
-use bosun::tmux::{attach::emergency_unbind, TokioTmuxClient};
+use bosun::tmux::{
+    attach::emergency_unbind, status_bar::emergency_uninstall as emergency_status_bar,
+    TokioTmuxClient,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,13 +22,15 @@ async fn main() -> Result<()> {
     let client = Arc::new(TokioTmuxClient::new());
     let socket: Option<String> = None;
 
-    // Panic hook: restore terminal + clean up C-q binding before we die.
+    // Panic hook: restore terminal + clean up C-q binding + restore
+    // the user's tmux status bar before we die.
     let socket_for_hook = socket.clone();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         emergency_unbind(socket_for_hook.as_deref());
+        emergency_status_bar(socket_for_hook.as_deref());
         default_hook(info);
     }));
 

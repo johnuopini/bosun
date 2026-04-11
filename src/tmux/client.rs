@@ -18,11 +18,11 @@ pub trait TmuxClient: Send + Sync {
     /// server (exit code 1, "no server running") returns `Ok(vec![])`.
     async fn list_sessions(&self) -> Result<Vec<TmuxSession>>;
 
-    /// Capture the most recent `lines` of the session's active pane,
-    /// preserving ANSI escape sequences so we can render them with
-    /// `ansi-to-tui` and pass them to detectors. Dead sessions return
-    /// `Ok(vec![])`.
-    async fn capture_pane(&self, session: &str, lines: u16) -> Result<Vec<u8>>;
+    /// Capture the current visible pane (what the user actually sees
+    /// right now — no scrollback history), preserving ANSI escape
+    /// sequences so we can render them with `ansi-to-tui` and pass
+    /// them to detectors. Dead sessions return `Ok(vec![])`.
+    async fn capture_pane(&self, session: &str) -> Result<Vec<u8>>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -107,22 +107,22 @@ impl TmuxClient for TokioTmuxClient {
         )))
     }
 
-    async fn capture_pane(&self, session: &str, lines: u16) -> Result<Vec<u8>> {
+    async fn capture_pane(&self, session: &str) -> Result<Vec<u8>> {
         let mut cmd = self.cmd();
         // -p : stdout
         // -e : include escape sequences
         // -J : join wrapped lines (so we don't split in the middle of an
         //      ANSI sequence)
-        // -S -<lines> : start `lines` from the bottom of the visible pane
-        let start = format!("-{}", lines);
+        // No -S/-E flags: we want just the currently visible pane — no
+        // scrollback history. Scrollback would pick up whatever the user
+        // typed earlier (e.g. literal `printf '\033[32m...'` source),
+        // which looks like escape code garbage in the preview.
         cmd.arg("capture-pane")
             .arg("-p")
             .arg("-e")
             .arg("-J")
             .arg("-t")
-            .arg(session)
-            .arg("-S")
-            .arg(&start);
+            .arg(session);
 
         let output = cmd.output().await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BosunError::TmuxNotInstalled,

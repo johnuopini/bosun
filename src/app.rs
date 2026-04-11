@@ -171,7 +171,7 @@ impl App {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
 
-        tmux_actor::spawn(client.clone(), cmd_rx, evt_tx.clone());
+        tmux_actor::spawn(client.clone(), socket.clone(), cmd_rx, evt_tx.clone());
         poller::spawn(evt_tx.clone(), Duration::from_millis(1000));
         let input_handle = input_actor::spawn(evt_tx.clone());
 
