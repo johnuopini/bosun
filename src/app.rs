@@ -12,6 +12,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::actors::{input_actor, poller, tmux_actor};
+use crate::config::Config;
 use crate::error::{BosunError, Result};
 use crate::events::{AppMsg, Command};
 use crate::tmux::attach::attach_with_ctrl_q_detach;
@@ -167,11 +168,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Arc<dyn TmuxClient>, socket: Option<String>) -> Self {
+    pub fn new(client: Arc<dyn TmuxClient>, socket: Option<String>, config: Config) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
 
-        tmux_actor::spawn(client.clone(), socket.clone(), cmd_rx, evt_tx.clone());
+        tmux_actor::spawn(
+            client.clone(),
+            socket.clone(),
+            config.clone(),
+            cmd_rx,
+            evt_tx.clone(),
+        );
         poller::spawn(evt_tx.clone(), Duration::from_millis(1000));
         let input_handle = input_actor::spawn(evt_tx.clone());
 

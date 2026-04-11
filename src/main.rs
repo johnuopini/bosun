@@ -9,6 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use bosun::app::App;
+use bosun::config::Config;
 use bosun::error::{BosunError, Result};
 use bosun::tmux::{
     attach::emergency_unbind, status_bar::emergency_uninstall as emergency_status_bar,
@@ -19,6 +20,7 @@ use bosun::tmux::{
 async fn main() -> Result<()> {
     init_tracing();
 
+    let config = Config::from_env();
     let client = Arc::new(TokioTmuxClient::new());
     let socket: Option<String> = None;
 
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(client, socket);
+    let mut app = App::new(client, socket, config);
     let run_result = app.run(&mut terminal).await;
     restore_terminal(&mut terminal)?;
     run_result

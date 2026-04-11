@@ -1,17 +1,17 @@
-//! Integration test for the tmux status bar install/sync/uninstall cycle.
+//! Integration test for the per-session tmux status bar API.
 //!
-//! Spawns an isolated tmux server on a unique `-L socket`, asserts that
-//! install overwrites status-left with the bosun brand, that sync_sessions
-//! pushes a session list into status-right, that prefix-1 gets bound to
-//! the first session, and that uninstall restores the original options
-//! and removes the bindings.
+//! Spawns an isolated tmux server on a unique `-L socket`, asserts
+//! that `configure_session` writes per-session status-* options, that
+//! `install_globals` binds prefix-1..9, and that `uninstall_globals`
+//! removes those bindings. Also verifies that configuring one session
+//! does NOT touch the global status-left (agent-deck isolation).
 
 #![cfg(feature = "tmux-it")]
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bosun::tmux::status_bar::{install, sync_sessions};
+use bosun::tmux::status_bar::{configure_session, install_globals, uninstall_globals};
 
 fn unique_socket(tag: &str) -> String {
     let nanos = SystemTime::now()
@@ -30,8 +30,13 @@ fn tmux(socket: &str, args: &[&str]) -> std::process::Output {
         .expect("spawn tmux")
 }
 
-fn show_opt(socket: &str, opt: &str) -> String {
+fn show_global(socket: &str, opt: &str) -> String {
     let out = tmux(socket, &["show-options", "-gqv", opt]);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn show_session(socket: &str, session: &str, opt: &str) -> String {
+    let out = tmux(socket, &["show-options", "-qv", "-t", session, opt]);
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -45,112 +50,89 @@ fn kill_server(socket: &str) {
 }
 
 #[test]
-fn install_overwrites_status_left_and_uninstall_restores() {
-    let sock = unique_socket("cycle");
-    tmux(&sock, &["new-session", "-d", "-s", "main"]);
+fn configure_session_writes_per_session_options_only() {
+    let sock = unique_socket("persession");
+    tmux(&sock, &["new-session", "-d", "-s", "bosun-main"]);
+    tmux(&sock, &["new-session", "-d", "-s", "legacy"]);
 
-    // Baseline: tmux default status-left is "[#S] " on 3.6a — we don't
-    // assert on the exact value, just capture it for comparison later.
-    let before_left = show_opt(&sock, "status-left");
+    // Capture the global status-left baseline (should be tmux default)
+    // and the legacy session's status-left (which inherits it).
+    let global_before = show_global(&sock, "status-left");
+    let legacy_before = show_session(&sock, "legacy", "status-left");
 
-    let guard = install(Some(&sock)).expect("install ok");
+    let sessions = vec![("bosun-main".to_string(), true)];
+    configure_session(Some(&sock), "bosun-main", &sessions).expect("configure ok");
 
-    // After install, status-left should contain our brand and refcount=1.
-    let after_left = show_opt(&sock, "status-left");
+    // bosun-main should now show the brand in its per-session option.
+    let bosun_left = show_session(&sock, "bosun-main", "status-left");
     assert!(
-        after_left.contains("bosun"),
-        "status-left should contain 'bosun', got: {}",
-        after_left
-    );
-    assert_eq!(show_opt(&sock, "@bosun_sb_refcount"), "1");
-
-    // Saved options should hold the original values.
-    assert_eq!(show_opt(&sock, "@bosun_saved_status_left"), before_left);
-
-    // sync_sessions: push a two-session list and assert bindings land.
-    sync_sessions(
-        Some(&sock),
-        &[("main".to_string(), true), ("other".to_string(), false)],
-    )
-    .expect("sync ok");
-
-    let status_right = show_opt(&sock, "status-right");
-    assert!(
-        status_right.contains("1:main"),
-        "status-right missing '1:main', got: {}",
-        status_right
-    );
-    assert!(
-        status_right.contains("2:other"),
-        "status-right missing '2:other', got: {}",
-        status_right
+        bosun_left.contains("bosun"),
+        "bosun-main status-left should contain 'bosun', got: {}",
+        bosun_left
     );
 
-    let keys = list_prefix_keys(&sock);
-    assert!(
-        keys.contains("bind-key -T prefix 1")
-            || keys
-                .lines()
-                .any(|l| l.contains("prefix") && l.contains(" 1 ")),
-        "expected prefix-1 binding, list-keys output:\n{}",
-        keys
-    );
-
-    // Release the guard — should decrement refcount to 0 and restore.
-    guard.release().expect("release ok");
-
+    // Global status-left should be UNCHANGED. This is the core of the
+    // per-session refactor — we don't pollute the user's globals.
+    let global_after = show_global(&sock, "status-left");
     assert_eq!(
-        show_opt(&sock, "@bosun_sb_refcount"),
-        "",
-        "refcount should be unset after last release"
+        global_before, global_after,
+        "configure_session must not touch global status-left"
     );
 
-    let restored_left = show_opt(&sock, "status-left");
-    assert!(
-        !restored_left.contains("bosun"),
-        "status-left should be restored, still contains 'bosun': {}",
-        restored_left
-    );
-
-    // Bindings should be gone from the prefix table.
-    let keys_after = list_prefix_keys(&sock);
-    let bosun_bindings_left = keys_after
-        .lines()
-        .filter(|l| l.contains("switch-client -t \"main\""))
-        .count();
+    // The legacy session should still show its inherited (global)
+    // status-left, which is unchanged from the baseline.
+    let legacy_after = show_session(&sock, "legacy", "status-left");
     assert_eq!(
-        bosun_bindings_left, 0,
-        "bosun jump bindings should be unbound after release, got:\n{}",
-        keys_after
+        legacy_before, legacy_after,
+        "legacy session's status-left must not change"
+    );
+    assert!(
+        !legacy_after.contains("bosun"),
+        "legacy session should not get bosun branding, got: {}",
+        legacy_after
     );
 
     kill_server(&sock);
 }
 
 #[test]
-fn nested_install_refcount_holds_bar_until_last_release() {
-    let sock = unique_socket("nested");
-    tmux(&sock, &["new-session", "-d", "-s", "main"]);
+fn install_and_uninstall_globals_bind_prefix_digits() {
+    let sock = unique_socket("globals");
+    tmux(&sock, &["new-session", "-d", "-s", "bosun-one"]);
+    tmux(&sock, &["new-session", "-d", "-s", "bosun-two"]);
 
-    let g1 = install(Some(&sock)).expect("install 1");
-    assert_eq!(show_opt(&sock, "@bosun_sb_refcount"), "1");
+    let sessions = vec![
+        ("bosun-one".to_string(), true),
+        ("bosun-two".to_string(), false),
+    ];
+    install_globals(Some(&sock), &sessions).expect("install globals ok");
 
-    let g2 = install(Some(&sock)).expect("install 2");
-    assert_eq!(show_opt(&sock, "@bosun_sb_refcount"), "2");
-    assert!(show_opt(&sock, "status-left").contains("bosun"));
-
-    // First release decrements but does not restore.
-    g2.release().expect("release 2");
-    assert_eq!(show_opt(&sock, "@bosun_sb_refcount"), "1");
+    let keys = list_prefix_keys(&sock);
     assert!(
-        show_opt(&sock, "status-left").contains("bosun"),
-        "bar should still be active with refcount=1"
+        keys.lines()
+            .any(|l| l.contains("prefix") && l.contains(" 1 ") && l.contains("switch-client")),
+        "expected a prefix-1 switch-client binding, got:\n{}",
+        keys
+    );
+    assert!(
+        keys.lines()
+            .any(|l| l.contains("prefix") && l.contains(" 2 ") && l.contains("switch-client")),
+        "expected a prefix-2 switch-client binding, got:\n{}",
+        keys
     );
 
-    // Second release restores.
-    g1.release().expect("release 1");
-    assert_eq!(show_opt(&sock, "@bosun_sb_refcount"), "");
-    assert!(!show_opt(&sock, "status-left").contains("bosun"));
+    uninstall_globals(Some(&sock));
+
+    let keys_after = list_prefix_keys(&sock);
+    let jump_bindings = keys_after
+        .lines()
+        .filter(|l| l.contains("switch-client -t \"bosun-"))
+        .count();
+    assert_eq!(
+        jump_bindings, 0,
+        "bosun jump bindings should be gone after uninstall, got:\n{}",
+        keys_after
+    );
 
     kill_server(&sock);
 }
