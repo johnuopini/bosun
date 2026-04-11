@@ -91,6 +91,14 @@ impl Theme {
         let src = match name {
             "opencode" => include_str!("../../themes/opencode.toml"),
             "tokyonight" => include_str!("../../themes/tokyonight.toml"),
+            "dracula" => include_str!("../../themes/dracula.toml"),
+            "catppuccin-mocha" => include_str!("../../themes/catppuccin-mocha.toml"),
+            "one-dark-pro" => include_str!("../../themes/one-dark-pro.toml"),
+            "ayu-mirage" => include_str!("../../themes/ayu-mirage.toml"),
+            "nord" => include_str!("../../themes/nord.toml"),
+            "gruvbox-dark" => include_str!("../../themes/gruvbox-dark.toml"),
+            "rose-pine" => include_str!("../../themes/rose-pine.toml"),
+            "github-dark" => include_str!("../../themes/github-dark.toml"),
             _ => return None,
         };
         match toml::from_str::<Theme>(src) {
@@ -100,6 +108,49 @@ impl Theme {
                 None
             }
         }
+    }
+
+    /// Names of every compiled-in theme, in the order we want them
+    /// shown in the picker. `opencode` is the default/anchor so it
+    /// goes first; the rest are alphabetized by common usage.
+    pub fn builtin_names() -> &'static [&'static str] {
+        &[
+            "opencode",
+            "tokyonight",
+            "dracula",
+            "catppuccin-mocha",
+            "one-dark-pro",
+            "ayu-mirage",
+            "nord",
+            "gruvbox-dark",
+            "rose-pine",
+            "github-dark",
+        ]
+    }
+
+    /// Collect every theme available at this moment: built-ins plus
+    /// any `.toml` files in the user themes directory. User themes
+    /// with the same name as a built-in override the built-in, so we
+    /// dedupe by name with user entries winning.
+    pub fn available(user_dir: Option<&Path>) -> Vec<String> {
+        let mut names: Vec<String> = Self::builtin_names().iter().map(|s| s.to_string()).collect();
+        if let Some(dir) = user_dir {
+            if let Ok(read) = std::fs::read_dir(dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                        continue;
+                    }
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let stem = stem.to_string();
+                        if !names.contains(&stem) {
+                            names.push(stem);
+                        }
+                    }
+                }
+            }
+        }
+        names
     }
 
     /// Hard fallback. The built-in opencode theme should always
@@ -151,6 +202,56 @@ mod tests {
         let t = Theme::builtin("tokyonight").expect("tokyonight must parse");
         assert_eq!(t.name, "tokyonight");
         assert_eq!(t.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
+    }
+
+    #[test]
+    fn every_builtin_listed_also_parses() {
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name)
+                .unwrap_or_else(|| panic!("built-in theme {name} must parse"));
+            assert_eq!(
+                t.name, *name,
+                "theme file {name}.toml has name = {:?}, expected {:?}",
+                t.name, name
+            );
+        }
+    }
+
+    #[test]
+    fn available_themes_include_all_builtins_when_no_user_dir() {
+        let names = Theme::available(None);
+        for builtin in Theme::builtin_names() {
+            assert!(names.iter().any(|n| n == builtin), "missing {builtin}");
+        }
+    }
+
+    #[test]
+    fn available_themes_add_user_dir_entries() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.join("my-custom.toml"),
+            r##"name = "my-custom"
+bg = "#000000"
+panel = "#000000"
+panel_alt = "#000000"
+selection_bg = "#000000"
+text = "#ffffff"
+text_muted = "#ffffff"
+accent = "#ff0000"
+shadow = "#000000"
+dim_fg = "#000000"
+status_running = "#00ff00"
+status_waiting = "#ffff00"
+status_idle = "#888888"
+status_error = "#ff0000"
+"##,
+        )
+        .unwrap();
+        let names = Theme::available(Some(&dir));
+        assert!(names.contains(&"my-custom".to_string()));
+        // User themes don't duplicate built-ins
+        let opencode_count = names.iter().filter(|n| *n == "opencode").count();
+        assert_eq!(opencode_count, 1);
     }
 
     #[test]
