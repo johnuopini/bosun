@@ -27,10 +27,12 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::events::{AppMsg, ClaudeSessionMode, Command, SessionSpec, SpecOptions};
+use crate::store::Store;
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
 use crate::tmux::session::SessionView;
 use crate::tmux::status_bar::{self, BarSession};
 use crate::tmux::{CreateSpec, TmuxClient};
+use crate::util::collision::resolve_name_collision;
 use crate::util::hysteresis::Smoother;
 
 /// RAII cleanup for globals installed by the status bar (prefix-1..9
@@ -54,6 +56,7 @@ pub fn spawn(
     client: Arc<dyn TmuxClient>,
     socket: Option<String>,
     config: Config,
+    store: Arc<Store>,
     mut cmd_rx: mpsc::Receiver<Command>,
     evt_tx: mpsc::Sender<AppMsg>,
 ) -> tokio::task::JoinHandle<()> {
@@ -125,16 +128,29 @@ pub fn spawn(
                     focused = Some(name);
                 }
                 Command::CreateSession(spec) => {
-                    match create_session(&*client, &config, spec).await {
+                    // Collision-check against the CURRENT live sessions
+                    // so "Bosun" auto-becomes "Bosun 2" when a session
+                    // with the same display name already exists.
+                    let spec = match resolve_collision(&*client, &config, spec).await {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e))).await;
+                            continue;
+                        }
+                    };
+
+                    match create_session(&*client, &config, spec.clone()).await {
                         Ok(internal_name) => {
                             focused = Some(internal_name.clone());
+                            // Save the recent (on the resolved spec —
+                            // so if "Bosun" became "Bosun 2", the
+                            // recents store remembers "Bosun 2").
+                            if let Err(e) = store.upsert_recent(&spec) {
+                                tracing::warn!("store upsert_recent: {}", e);
+                            }
                             let _ = evt_tx
                                 .send(AppMsg::Warn(format!("created {}", internal_name)))
                                 .await;
-                            // Force an immediate refresh so the new
-                            // session pops into the list without waiting
-                            // for the next tick, and tell the app to
-                            // jump its selection onto the new one.
                             let _ = do_refresh(
                                 &*client,
                                 &config,
@@ -271,6 +287,24 @@ async fn create_session(
         command,
     };
     client.create_session(&create).await.map(|_| internal)
+}
+
+/// Query the live session list, extract display names, and rename
+/// `spec.name` via `resolve_name_collision` if needed. Pure-ish
+/// wrapper; the one side-effect is the tmux list-sessions roundtrip.
+async fn resolve_collision(
+    client: &dyn TmuxClient,
+    config: &Config,
+    mut spec: SessionSpec,
+) -> crate::error::Result<SessionSpec> {
+    let sessions = client.list_sessions().await?;
+    let existing: Vec<String> = sessions
+        .into_iter()
+        .filter(|s| config.manages(&s.name))
+        .map(|s| s.display_name.unwrap_or(s.name))
+        .collect();
+    spec.name = resolve_name_collision(&spec.name, &existing);
+    Ok(spec)
 }
 
 #[allow(clippy::too_many_arguments)]

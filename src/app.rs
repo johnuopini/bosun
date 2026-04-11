@@ -15,6 +15,7 @@ use crate::actors::{input_actor, poller, tmux_actor};
 use crate::config::Config;
 use crate::error::{BosunError, Result};
 use crate::events::{AppMsg, Command};
+use crate::store::Store;
 use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
@@ -201,6 +202,7 @@ pub struct App {
     pub evt_rx: mpsc::Receiver<AppMsg>,
     pub evt_tx: mpsc::Sender<AppMsg>,
     pub socket: Option<String>,
+    pub store: Arc<Store>,
     /// Handle to the running input actor. Held here so we can stop it
     /// before handing stdin to tmux during an attach — otherwise the
     /// actor's crossterm reader races tmux for each stdin byte, and
@@ -210,7 +212,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Arc<dyn TmuxClient>, socket: Option<String>, config: Config) -> Self {
+    pub fn new(
+        client: Arc<dyn TmuxClient>,
+        socket: Option<String>,
+        config: Config,
+        store: Arc<Store>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
 
@@ -218,6 +225,7 @@ impl App {
             client.clone(),
             socket.clone(),
             config.clone(),
+            store.clone(),
             cmd_rx,
             evt_tx.clone(),
         );
@@ -230,6 +238,7 @@ impl App {
             evt_rx,
             evt_tx,
             socket,
+            store,
             input_handle: Some(input_handle),
         }
     }

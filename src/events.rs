@@ -19,13 +19,13 @@ pub struct SessionSpec {
 /// Agent-specific flags the user toggled in the new-session modal.
 /// The actor's `build_agent_command` reads these and produces the
 /// right CLI flags when spawning the agent.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpecOptions {
     pub claude: ClaudeOptions,
     pub codex: CodexOptions,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeOptions {
     pub session_mode: ClaudeSessionMode,
     pub skip_permissions: bool,
@@ -63,7 +63,7 @@ impl ClaudeSessionMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexOptions {
     /// Codex `--yolo` — bypass approvals and sandbox. Dangerous.
     pub yolo: bool,

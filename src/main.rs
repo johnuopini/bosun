@@ -11,6 +11,7 @@ use ratatui::Terminal;
 use bosun::app::App;
 use bosun::config::Config;
 use bosun::error::{BosunError, Result};
+use bosun::store::Store;
 use bosun::tmux::{
     attach::emergency_unbind, status_bar::emergency_uninstall as emergency_status_bar,
     TokioTmuxClient,
@@ -27,6 +28,17 @@ async fn main() -> Result<()> {
         None => Arc::new(TokioTmuxClient::new()),
     };
 
+    // Open the SQLite store for recents + future metadata. Failure
+    // here is non-fatal — we fall back to an in-memory store so bosun
+    // still runs, just without persistence across launches.
+    let store = Arc::new(match Store::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("store open failed, using in-memory: {}", e);
+            Store::in_memory().expect("in-memory store cannot fail")
+        }
+    });
+
     // Panic hook: restore terminal + clean up C-q binding + restore
     // the user's tmux status bar before we die.
     let socket_for_hook = socket.clone();
@@ -40,7 +52,7 @@ async fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(client, socket, config);
+    let mut app = App::new(client, socket, config, store);
     let run_result = app.run(&mut terminal).await;
     restore_terminal(&mut terminal)?;
     run_result

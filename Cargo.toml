@@ -18,6 +18,8 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 ansi-to-tui = "8"
+rusqlite = { version = "0.39", features = ["bundled"] }
+directories = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.4"

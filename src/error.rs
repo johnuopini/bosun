@@ -16,6 +16,9 @@ pub enum BosunError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("store error: {0}")]
+    Store(String),
+
     #[error("channel closed unexpectedly")]
     ChannelClosed,
 }
