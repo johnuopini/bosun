@@ -16,8 +16,10 @@ use ratatui::Frame;
 use crate::events::{
     ClaudeOptions, ClaudeSessionMode, CodexOptions, Command, SessionSpec, SpecOptions,
 };
+use crate::store::Recent;
 
-use super::{center_rect, Modal, ModalResult};
+use super::recents::RecentsModal;
+use super::{center_rect, Modal, ModalData, ModalResult};
 
 // --- Visual tokens (will move to theme in Phase 4) -------------------
 
@@ -81,10 +83,14 @@ pub struct NewSessionModal {
     codex: CodexOptions,
     field: Field,
     error: Option<String>,
+    /// Recents cached at modal construction time, used when the user
+    /// hits Ctrl+R to open the RecentsModal. Fresh on every new
+    /// modal open.
+    recents: Vec<Recent>,
 }
 
 impl NewSessionModal {
-    pub fn new() -> Self {
+    pub fn new(recents: Vec<Recent>) -> Self {
         let path = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~".to_string());
@@ -97,7 +103,24 @@ impl NewSessionModal {
             codex: CodexOptions::default(),
             field: Field::Name,
             error: None,
+            recents,
         }
+    }
+
+    /// Overwrite all form fields from a selected recent. Called by
+    /// `on_child_closed` when the RecentsModal returns a
+    /// `FillSessionSpec`.
+    fn fill_from_spec(&mut self, spec: SessionSpec) {
+        self.name = spec.name;
+        self.path = spec.path;
+        self.args = spec.args;
+        self.claude = spec.options.claude;
+        self.codex = spec.options.codex;
+        if let Some(idx) = AGENTS.iter().position(|a| *a == spec.agent) {
+            self.agent_idx = idx;
+        }
+        self.error = None;
+        self.field = Field::Name;
     }
 
     fn agent(&self) -> &'static str {
@@ -164,7 +187,7 @@ impl NewSessionModal {
 
 impl Default for NewSessionModal {
     fn default() -> Self {
-        Self::new()
+        Self::new(Vec::new())
     }
 }
 
@@ -177,6 +200,11 @@ impl Modal for NewSessionModal {
         // Let Ctrl-C close the modal as a convenience.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ModalResult::Close(None);
+        }
+
+        // Ctrl-R opens the recents picker.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ModalResult::Push(Box::new(RecentsModal::new(self.recents.clone())));
         }
 
         match key.code {
@@ -278,6 +306,11 @@ impl Modal for NewSessionModal {
         }
     }
 
+    fn on_child_closed(&mut self, data: ModalData) {
+        let ModalData::FillSessionSpec(spec) = data;
+        self.fill_from_spec(spec);
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
         let buf = frame.buffer_mut();
@@ -331,7 +364,7 @@ impl Modal for NewSessionModal {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "    tab next · esc cancel · enter create",
+                    "    tab next · ^r recents · esc cancel · enter create",
                     Style::default().fg(MUTED).bg(BG),
                 ),
             ]),
@@ -555,7 +588,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_fields_for_claude() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         assert_eq!(m.agent(), "claude");
         assert_eq!(m.field, Field::Name);
         m.handle(key(KeyCode::Tab));
@@ -575,7 +608,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_fields_for_codex() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         // Switch to codex (second in the list).
         m.agent_idx = 1;
         assert_eq!(m.agent(), "codex");
@@ -590,7 +623,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_fields_for_terminal() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         m.agent_idx = 2;
         assert_eq!(m.agent(), "terminal");
         m.handle(key(KeyCode::Tab)); // Name -> Path
@@ -603,7 +636,7 @@ mod tests {
 
     #[test]
     fn space_toggles_skip_permissions_when_focused() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         m.field = Field::ClaudeSkipPerm;
         assert!(!m.claude.skip_permissions);
         m.handle(key(KeyCode::Char(' ')));
@@ -614,7 +647,7 @@ mod tests {
 
     #[test]
     fn left_right_cycles_claude_session_mode() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         m.field = Field::ClaudeSession;
         assert_eq!(m.claude.session_mode, ClaudeSessionMode::New);
         m.handle(key(KeyCode::Right));
@@ -629,7 +662,7 @@ mod tests {
 
     #[test]
     fn space_toggles_codex_yolo_when_focused() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         m.agent_idx = 1;
         m.field = Field::CodexYolo;
         assert!(!m.codex.yolo);
@@ -639,7 +672,7 @@ mod tests {
 
     #[test]
     fn submit_spec_carries_claude_options() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "test".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -660,7 +693,7 @@ mod tests {
 
     #[test]
     fn typing_fills_focused_field() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "api".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -673,7 +706,7 @@ mod tests {
 
     #[test]
     fn left_right_on_agent_field_cycles_selection() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         m.field = Field::Agent;
         assert_eq!(m.agent(), "claude");
         m.handle(key(KeyCode::Right));
@@ -688,7 +721,7 @@ mod tests {
 
     #[test]
     fn enter_with_empty_name_shows_error() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         let r = m.handle(key(KeyCode::Enter));
         assert!(matches!(r, ModalResult::Consumed));
         assert!(m.error.is_some());
@@ -696,7 +729,7 @@ mod tests {
 
     #[test]
     fn enter_with_valid_data_closes_with_command() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "work".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -712,7 +745,7 @@ mod tests {
 
     #[test]
     fn bosun_prefix_is_stripped_from_name_on_submit() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "bosun-work".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -727,7 +760,7 @@ mod tests {
 
     #[test]
     fn name_with_spaces_is_accepted() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "My Rocket Fox".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -743,7 +776,7 @@ mod tests {
 
     #[test]
     fn name_with_only_symbols_is_rejected() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         for c in "!!!".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -754,8 +787,49 @@ mod tests {
 
     #[test]
     fn esc_closes_without_command() {
-        let mut m = NewSessionModal::new();
+        let mut m = NewSessionModal::new(Vec::new());
         let r = m.handle(key(KeyCode::Esc));
         assert!(matches!(r, ModalResult::Close(None)));
+    }
+
+    #[test]
+    fn ctrl_r_pushes_recents_modal() {
+        let recent = Recent {
+            id: 1,
+            name: "work".into(),
+            path: "/srv".into(),
+            agent: "claude".into(),
+            args: String::new(),
+            claude: ClaudeOptions::default(),
+            codex: CodexOptions::default(),
+            last_used_at: 0,
+            use_count: 1,
+        };
+        let mut m = NewSessionModal::new(vec![recent]);
+        let k = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let r = m.handle(k);
+        assert!(matches!(r, ModalResult::Push(_)));
+    }
+
+    #[test]
+    fn on_child_closed_fills_all_fields_from_spec() {
+        let mut m = NewSessionModal::new(Vec::new());
+        let spec = SessionSpec {
+            name: "api".into(),
+            path: "/srv/api".into(),
+            agent: "codex".into(),
+            args: "--verbose".into(),
+            options: SpecOptions {
+                claude: ClaudeOptions::default(),
+                codex: CodexOptions { yolo: true },
+            },
+        };
+        m.on_child_closed(ModalData::FillSessionSpec(spec));
+        assert_eq!(m.name, "api");
+        assert_eq!(m.path, "/srv/api");
+        assert_eq!(m.args, "--verbose");
+        assert_eq!(m.agent(), "codex");
+        assert!(m.codex.yolo);
+        assert_eq!(m.field, Field::Name);
     }
 }

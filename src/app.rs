@@ -20,7 +20,7 @@ use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
 use crate::ui;
-use crate::ui::modal::{new_session::NewSessionModal, ModalResult, ModalStack};
+use crate::ui::modal::{new_session::NewSessionModal, ModalStack, StackDispatch};
 
 fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
@@ -44,6 +44,16 @@ pub struct AppState {
     /// on every frame; `handle_key` routes key events to the top modal
     /// first.
     pub modals: ModalStack,
+    /// Internal signal from the reducer to the app loop: "I want a
+    /// modal opened". The app loop reads this after each `apply()`
+    /// and pushes the modal (with store-loaded recents etc) since
+    /// `AppState` doesn't hold the store itself.
+    pub pending_modal: Option<ModalRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalRequest {
+    NewSession,
 }
 
 impl AppState {
@@ -99,13 +109,10 @@ impl AppState {
                 // everything they see so typing in a text field doesn't
                 // leak into the main list.
                 if !self.modals.is_empty() {
-                    match self.modals.handle(k) {
-                        ModalResult::Consumed => {}
-                        ModalResult::PassThrough => {
-                            self.handle_key(k, &mut out);
-                        }
-                        ModalResult::Close(cmd) => {
-                            self.modals.pop();
+                    match self.modals.dispatch(k) {
+                        StackDispatch::Consumed => {}
+                        StackDispatch::PassThrough => self.handle_key(k, &mut out),
+                        StackDispatch::Closed(cmd) => {
                             if let Some(c) = cmd {
                                 out.push(c);
                             }
@@ -183,12 +190,12 @@ impl AppState {
                 out.push(Command::ListNow);
             }
             (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                // Don't open a second new-session modal if one is
-                // already on the stack. `modals.is_empty()` is enough
-                // here — modals consume keys so 'n' shouldn't even
-                // reach this branch while one's open — but belt + braces.
+                // We can't push the modal directly here because
+                // AppState doesn't hold the store — signal the app
+                // loop via pending_modal and it'll load recents +
+                // push.
                 if self.modals.top_id() != Some("new_session") {
-                    self.modals.push(Box::new(NewSessionModal::new()));
+                    self.pending_modal = Some(ModalRequest::NewSession);
                 }
             }
             _ => {}
@@ -263,6 +270,20 @@ impl App {
             let cmds = self.state.apply(msg);
             for c in cmds {
                 let _ = self.cmd_tx.send(c).await;
+            }
+
+            // Handle any modal-open requests from the reducer. This
+            // is where we load store-backed data (recents) and
+            // construct the actual modal.
+            if let Some(req) = self.state.pending_modal.take() {
+                match req {
+                    ModalRequest::NewSession => {
+                        let recents = self.store.list_recents(8).unwrap_or_default();
+                        self.state
+                            .modals
+                            .push(Box::new(NewSessionModal::new(recents)));
+                    }
+                }
             }
 
             // If the reducer queued an attach, perform it now: tear down the

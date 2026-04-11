@@ -1,24 +1,37 @@
 //! Modal dialog infrastructure.
 //!
-//! Phase 3 ships a single-modal stack that can render + handle input
-//! for one modal at a time. Phase 4 expands to a proper stack so the
-//! fuzzy-search modal can layer over the new-session modal etc.
+//! Modals can:
+//!   * Stay open and consume input (`ModalResult::Consumed`)
+//!   * Let the current key fall through to the main list (`PassThrough`)
+//!   * Close, optionally emitting a Command to the tmux actor (`Close`)
+//!   * Close AND hand typed data back to their parent modal on the
+//!     stack via `CloseWithData` + `Modal::on_child_closed`
+//!   * Push a child modal on top of themselves (`Push`) — used by
+//!     the new-session modal to open the recents picker on Ctrl+R
 //!
 //! Design rules:
 //!   * Modals own their own state (form fields, selection, etc).
 //!   * Modals render pure — take `&self` + a Frame + Rect.
-//!   * Input handling returns a `ModalResult` describing what the
-//!     app loop should do: keep the modal open, pass the key through
-//!     to the main list, or close the modal (optionally emitting a
-//!     `Command` to the tmux actor).
+//!   * Parent/child data passing is explicit via `ModalData` variants
+//!     so there's no `dyn Any` downcasting.
 
 pub mod new_session;
+pub mod recents;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::events::Command;
+use crate::events::{Command, SessionSpec};
+
+/// Typed payloads a closing child modal can return to its parent
+/// via `ModalResult::CloseWithData`. Parents implement
+/// `Modal::on_child_closed` and pattern-match to absorb the data.
+pub enum ModalData {
+    /// A `Recent` was picked — unpack into fields for the
+    /// new-session form.
+    FillSessionSpec(SessionSpec),
+}
 
 /// Result of dispatching a key event to a modal.
 pub enum ModalResult {
@@ -33,6 +46,14 @@ pub enum ModalResult {
     /// Close the modal. If `Some(cmd)`, the command is emitted to
     /// the tmux actor after the modal is popped.
     Close(Option<Command>),
+    /// Close the modal and hand the data to the next modal on the
+    /// stack (its parent) via `Modal::on_child_closed`. If there's
+    /// no parent, the data is silently dropped.
+    CloseWithData(ModalData),
+    /// Push a new modal on top of this one. Used when one modal
+    /// opens another, e.g. the new-session modal opens the recents
+    /// picker on Ctrl+R.
+    Push(Box<dyn Modal>),
 }
 
 pub trait Modal: Send {
@@ -42,6 +63,10 @@ pub trait Modal: Send {
     fn id(&self) -> &'static str;
     fn render(&self, frame: &mut Frame<'_>, area: Rect);
     fn handle(&mut self, key: KeyEvent) -> ModalResult;
+    /// Called when a child modal closes with data. Default: ignore.
+    /// Parents that care override this and pattern-match on the
+    /// `ModalData` variants they understand.
+    fn on_child_closed(&mut self, _data: ModalData) {}
 }
 
 #[derive(Default)]
@@ -99,12 +124,48 @@ impl ModalStack {
         }
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> ModalResult {
-        match self.stack.last_mut() {
-            Some(top) => top.handle(key),
-            None => ModalResult::PassThrough,
+    /// Dispatch a key to the top modal and apply the result to the
+    /// stack in-place. Returns an optional Command that the caller
+    /// should forward to the tmux actor (from `Close(Some(cmd))`),
+    /// plus a `PassThrough` signal so the caller knows whether to
+    /// route the key to the main list instead.
+    pub fn dispatch(&mut self, key: KeyEvent) -> StackDispatch {
+        if self.stack.is_empty() {
+            return StackDispatch::PassThrough;
+        }
+        let top = self.stack.last_mut().unwrap();
+        match top.handle(key) {
+            ModalResult::Consumed => StackDispatch::Consumed,
+            ModalResult::PassThrough => StackDispatch::PassThrough,
+            ModalResult::Close(cmd) => {
+                self.stack.pop();
+                StackDispatch::Closed(cmd)
+            }
+            ModalResult::CloseWithData(data) => {
+                self.stack.pop();
+                if let Some(parent) = self.stack.last_mut() {
+                    parent.on_child_closed(data);
+                }
+                StackDispatch::Consumed
+            }
+            ModalResult::Push(child) => {
+                self.stack.push(child);
+                StackDispatch::Consumed
+            }
         }
     }
+}
+
+/// What the app loop should do after dispatching a key into the
+/// modal stack.
+pub enum StackDispatch {
+    /// Stack handled it; don't touch the main list.
+    Consumed,
+    /// No modal was open, or the top modal explicitly passed.
+    PassThrough,
+    /// A modal just closed; forward its optional command to the
+    /// tmux actor.
+    Closed(Option<Command>),
 }
 
 fn dim_background(frame: &mut Frame<'_>, area: Rect) {
