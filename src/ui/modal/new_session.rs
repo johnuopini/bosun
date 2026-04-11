@@ -33,9 +33,12 @@ const ERROR: Color = Color::Rgb(255, 93, 107);
 const SHADOW: Color = Color::Rgb(5, 7, 11);
 
 const MODAL_WIDTH: u16 = 64;
-// Sized for the largest agent (claude with all options visible).
-// Smaller agents render with trailing blank space.
-const MODAL_HEIGHT: u16 = 26;
+// Sized for the largest agent (claude with all options visible) plus
+// space for up to `PATH_SUGGESTION_CAP` rows of recent-path dropdown.
+// Smaller agents / no suggestions render with trailing blank space.
+const MODAL_HEIGHT: u16 = 32;
+
+const PATH_SUGGESTION_CAP: usize = 5;
 
 // --- Agent dropdown --------------------------------------------------
 
@@ -87,6 +90,19 @@ pub struct NewSessionModal {
     /// hits Ctrl+R to open the RecentsModal. Fresh on every new
     /// modal open.
     recents: Vec<Recent>,
+    /// Index into `path_suggestions()` when the user has arrowed
+    /// down into the filesystem dropdown. `None` means the user is
+    /// typing freely (no dropdown entry highlighted).
+    path_suggestion_idx: Option<usize>,
+}
+
+/// One row in the filesystem dropdown. `name` is the last path
+/// segment; `is_dir` drives trailing-slash decoration and Enter's
+/// "dive in vs commit" behavior.
+#[derive(Debug, Clone)]
+struct PathEntry {
+    name: String,
+    is_dir: bool,
 }
 
 impl NewSessionModal {
@@ -104,7 +120,63 @@ impl NewSessionModal {
             field: Field::Name,
             error: None,
             recents,
+            path_suggestion_idx: None,
         }
+    }
+
+    /// Filesystem entries that match the current `self.path`.
+    /// Reads the directory portion of the typed path and filters by
+    /// the trailing segment. Capped at `PATH_SUGGESTION_CAP` for UI.
+    fn path_suggestions(&self) -> Vec<PathEntry> {
+        read_dir_filtered(&self.path, PATH_SUGGESTION_CAP)
+    }
+
+    /// Uncapped list of filesystem matches. Used by Tab's longest-
+    /// common-prefix completion so we don't miss matches beyond the
+    /// display window.
+    fn path_suggestions_all(&self) -> Vec<PathEntry> {
+        read_dir_filtered(&self.path, usize::MAX)
+    }
+
+    /// Commit a filesystem entry into `self.path`. Directories get a
+    /// trailing slash so the dropdown refreshes with their contents
+    /// on the next render.
+    fn commit_path_entry(&mut self, entry: &PathEntry) {
+        let (dir, _prefix) = split_path(&self.path);
+        let mut new_path = format!("{}{}", dir, entry.name);
+        if entry.is_dir {
+            new_path.push('/');
+        }
+        self.path = new_path;
+        self.path_suggestion_idx = None;
+    }
+
+    /// Shell-style Tab completion. Returns true if the path was
+    /// extended (caller should stay on the Path field); false means
+    /// "nothing to do, advance to next field".
+    fn tab_complete_path(&mut self) -> bool {
+        let suggestions = self.path_suggestions_all();
+        if suggestions.is_empty() {
+            return false;
+        }
+        let (dir, prefix) = split_path(&self.path);
+
+        // One match: commit it outright (with trailing slash for
+        // dirs so the user can dive further).
+        if suggestions.len() == 1 {
+            self.commit_path_entry(&suggestions[0]);
+            return true;
+        }
+
+        // Many matches: extend to the longest common prefix.
+        let names: Vec<&str> = suggestions.iter().map(|e| e.name.as_str()).collect();
+        let lcp = longest_common_prefix(&names);
+        if lcp.chars().count() > prefix.chars().count() {
+            self.path = format!("{}{}", dir, lcp);
+            self.path_suggestion_idx = None;
+            return true;
+        }
+        false
     }
 
     /// Overwrite all form fields from a selected recent. Called by
@@ -210,6 +282,23 @@ impl Modal for NewSessionModal {
         match key.code {
             KeyCode::Esc => ModalResult::Close(None),
             KeyCode::Tab => {
+                if self.field == Field::Path {
+                    // 1. If the user arrowed into the dropdown, Tab
+                    //    commits the highlighted entry. For dirs we
+                    //    stay on the field so they can dive further.
+                    if let Some(idx) = self.path_suggestion_idx {
+                        let entries = self.path_suggestions();
+                        if let Some(entry) = entries.get(idx).cloned() {
+                            self.commit_path_entry(&entry);
+                            return ModalResult::Consumed;
+                        }
+                    }
+                    // 2. Shell-style LCP completion against the live
+                    //    filesystem.
+                    if self.tab_complete_path() {
+                        return ModalResult::Consumed;
+                    }
+                }
                 self.next_field();
                 ModalResult::Consumed
             }
@@ -217,13 +306,32 @@ impl Modal for NewSessionModal {
                 self.prev_field();
                 ModalResult::Consumed
             }
-            KeyCode::Enter => match self.build_spec() {
-                Ok(spec) => ModalResult::Close(Some(Command::CreateSession(spec))),
-                Err(e) => {
-                    self.error = Some(e);
-                    ModalResult::Consumed
+            KeyCode::Enter => {
+                // Enter on Path with a highlighted dropdown entry:
+                // commit it. Directories → stay on Path so the user
+                // keeps browsing into subfolders. Files → advance to
+                // the next field (so Enter feels like "pick this").
+                if self.field == Field::Path {
+                    if let Some(idx) = self.path_suggestion_idx {
+                        let entries = self.path_suggestions();
+                        if let Some(entry) = entries.get(idx).cloned() {
+                            let was_dir = entry.is_dir;
+                            self.commit_path_entry(&entry);
+                            if !was_dir {
+                                self.next_field();
+                            }
+                            return ModalResult::Consumed;
+                        }
+                    }
                 }
-            },
+                match self.build_spec() {
+                    Ok(spec) => ModalResult::Close(Some(Command::CreateSession(spec))),
+                    Err(e) => {
+                        self.error = Some(e);
+                        ModalResult::Consumed
+                    }
+                }
+            }
             KeyCode::Left => {
                 match self.field {
                     Field::Agent => {
@@ -250,6 +358,24 @@ impl Modal for NewSessionModal {
                 }
                 ModalResult::Consumed
             }
+            KeyCode::Down if self.field == Field::Path => {
+                let suggestions = self.path_suggestions();
+                if !suggestions.is_empty() {
+                    self.path_suggestion_idx = Some(match self.path_suggestion_idx {
+                        None => 0,
+                        Some(i) if i + 1 < suggestions.len() => i + 1,
+                        Some(i) => i,
+                    });
+                }
+                ModalResult::Consumed
+            }
+            KeyCode::Up if self.field == Field::Path => {
+                self.path_suggestion_idx = match self.path_suggestion_idx {
+                    None | Some(0) => None,
+                    Some(i) => Some(i - 1),
+                };
+                ModalResult::Consumed
+            }
             KeyCode::Backspace => {
                 self.error = None;
                 match self.field {
@@ -258,6 +384,7 @@ impl Modal for NewSessionModal {
                     }
                     Field::Path => {
                         self.path.pop();
+                        self.path_suggestion_idx = None;
                     }
                     Field::Args => {
                         self.args.pop();
@@ -273,7 +400,10 @@ impl Modal for NewSessionModal {
                 self.error = None;
                 match self.field {
                     Field::Name => self.name.push(' '),
-                    Field::Path => self.path.push(' '),
+                    Field::Path => {
+                        self.path.push(' ');
+                        self.path_suggestion_idx = None;
+                    }
                     Field::Args => self.args.push(' '),
                     Field::Agent => {
                         self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
@@ -296,7 +426,10 @@ impl Modal for NewSessionModal {
                 self.error = None;
                 match self.field {
                     Field::Name => self.name.push(c),
-                    Field::Path => self.path.push(c),
+                    Field::Path => {
+                        self.path.push(c);
+                        self.path_suggestion_idx = None;
+                    }
                     Field::Args => self.args.push(c),
                     _ => {}
                 }
@@ -374,13 +507,26 @@ impl Modal for NewSessionModal {
             Line::from(""),
             label_line("path", self.field == Field::Path),
             input_line(&self.path, self.field == Field::Path, inner.width),
+        ];
+
+        // Filesystem dropdown — visible when the Path field is
+        // focused and the current directory has matching entries.
+        if self.field == Field::Path {
+            let suggestions = self.path_suggestions();
+            for (i, entry) in suggestions.iter().enumerate() {
+                let highlighted = self.path_suggestion_idx == Some(i);
+                lines.push(path_suggestion_line(entry, highlighted, inner.width));
+            }
+        }
+
+        lines.extend([
             Line::from(""),
             label_line("agent", self.field == Field::Agent),
             agent_line(self.agent_idx, self.field == Field::Agent),
             Line::from(""),
             label_line("args (optional)", self.field == Field::Args),
             input_line(&self.args, self.field == Field::Args, inner.width),
-        ];
+        ]);
 
         // Agent-specific options section.
         match self.agent() {
@@ -437,6 +583,122 @@ fn label_line(label: &str, focused: bool) -> Line<'static> {
         Span::styled(format!(" {} ", marker), label_style),
         Span::styled(label.to_string(), label_style),
     ])
+}
+
+/// One row in the filesystem dropdown. Directories get a trailing
+/// slash so they're visually distinct from files. Highlighted rows
+/// get the accent background and a ▸ marker.
+fn path_suggestion_line(entry: &PathEntry, highlighted: bool, width: u16) -> Line<'static> {
+    let bg = if highlighted {
+        FIELD_BG_FOCUS
+    } else {
+        FIELD_BG
+    };
+    let fg = if highlighted { TEXT } else { MUTED };
+    let marker = if highlighted { "▸" } else { " " };
+    let suffix = if entry.is_dir { "/" } else { "" };
+
+    let full = format!(" {} {}{}", marker, entry.name, suffix);
+    let field_width = width.saturating_sub(3) as usize;
+    let mut padded = full;
+    while padded.chars().count() < field_width {
+        padded.push(' ');
+    }
+
+    Line::from(vec![
+        Span::styled("   ", Style::default().bg(BG)),
+        Span::styled(padded, Style::default().fg(fg).bg(bg)),
+    ])
+}
+
+// --- Filesystem helpers ---------------------------------------------
+
+/// Split a path into its directory portion (with trailing `/`) and
+/// the trailing segment the user is typing. Preserves a leading `~`
+/// so the stored path keeps its original form.
+fn split_path(path: &str) -> (String, String) {
+    if path.is_empty() {
+        return (String::new(), String::new());
+    }
+    if path.ends_with('/') {
+        return (path.to_string(), String::new());
+    }
+    match path.rfind('/') {
+        Some(idx) => (path[..=idx].to_string(), path[idx + 1..].to_string()),
+        None => (String::new(), path.to_string()),
+    }
+}
+
+/// Expand a leading `~` or `~/` to `$HOME`. Only used for the actual
+/// `read_dir` call; the stored path retains the user's form.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_default();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        return format!("{}/{}", home, rest);
+    }
+    path.to_string()
+}
+
+/// Read the directory implied by `path` and return entries whose
+/// names start with the trailing segment of `path`. Dirs come first,
+/// then files, alphabetically within each group. Hidden entries
+/// (starting with `.`) are excluded unless the user's typed prefix
+/// also starts with `.`. Capped at `limit` entries.
+fn read_dir_filtered(path: &str, limit: usize) -> Vec<PathEntry> {
+    let (dir, prefix) = split_path(path);
+    // Empty dir = CWD. Otherwise expand ~ for the filesystem lookup.
+    let lookup = if dir.is_empty() {
+        ".".to_string()
+    } else {
+        expand_tilde(&dir)
+    };
+    let Ok(read) = std::fs::read_dir(&lookup) else {
+        return Vec::new();
+    };
+    let show_hidden = prefix.starts_with('.');
+    let mut out: Vec<PathEntry> = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let is_dir = entry.file_type().ok().map(|t| t.is_dir()).unwrap_or(false);
+        out.push(PathEntry { name, is_dir });
+    }
+    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    out.truncate(limit);
+    out
+}
+
+/// Longest common prefix of a set of strings (character-wise, so
+/// multi-byte Unicode is handled correctly).
+fn longest_common_prefix(strs: &[&str]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let mut prefix: Vec<char> = strs[0].chars().collect();
+    for s in &strs[1..] {
+        let common_len = prefix
+            .iter()
+            .zip(s.chars())
+            .take_while(|(a, b)| **a == *b)
+            .count();
+        prefix.truncate(common_len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.into_iter().collect()
 }
 
 fn input_line(value: &str, focused: bool, width: u16) -> Line<'static> {
@@ -809,6 +1071,30 @@ mod tests {
         let k = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         let r = m.handle(k);
         assert!(matches!(r, ModalResult::Push(_)));
+    }
+
+    #[test]
+    fn split_path_handles_absolute_and_relative() {
+        assert_eq!(
+            split_path("/home/rhuk/proj"),
+            ("/home/rhuk/".to_string(), "proj".to_string())
+        );
+        assert_eq!(
+            split_path("/home/rhuk/"),
+            ("/home/rhuk/".to_string(), "".to_string())
+        );
+        assert_eq!(split_path("proj"), ("".to_string(), "proj".to_string()));
+        assert_eq!(split_path(""), ("".to_string(), "".to_string()));
+    }
+
+    #[test]
+    fn longest_common_prefix_handles_unicode() {
+        assert_eq!(longest_common_prefix(&["abcd", "abce"]), "abc");
+        assert_eq!(longest_common_prefix(&["abc", "xyz"]), "");
+        assert_eq!(longest_common_prefix(&["same", "same"]), "same");
+        assert_eq!(longest_common_prefix(&[]), "");
+        // Multi-byte characters handled char-wise.
+        assert_eq!(longest_common_prefix(&["日本語", "日本人"]), "日本");
     }
 
     #[test]
