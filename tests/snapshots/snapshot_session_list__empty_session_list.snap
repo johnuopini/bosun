@@ -1,0 +1,15 @@
+---
+source: tests/snapshot_session_list.rs
+assertion_line: 44
+expression: frame
+---
+                              preview coming in Phase 2                         
+  no tmux sessions                                                              
+  (press r to refresh)                                                          
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ bosun  0 sessions                                  ↑/↓ nav · ↵ attach · q quit

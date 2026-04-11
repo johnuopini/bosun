@@ -1,0 +1,11 @@
+---
+source: tests/snapshot_session_list.rs
+assertion_line: 66
+expression: frame
+---
+ ▌ alpha                      preview coming in Phase 2                         
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ bosun  list: tmux not running                      ↑/↓ nav · ↵ attach · q quit

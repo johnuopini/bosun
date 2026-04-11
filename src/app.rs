@@ -1,0 +1,310 @@
+//! Central app state + event loop.
+//!
+//! Single-writer invariant: `AppState` is owned by the one task that runs
+//! [`App::run`]. Nothing else mutates it. Everything else sends messages.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use ratatui::Terminal;
+use tokio::sync::mpsc;
+
+use crate::actors::{input_actor, poller, tmux_actor};
+use crate::error::{BosunError, Result};
+
+fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
+    BosunError::Io(std::io::Error::other(e.to_string()))
+}
+use crate::events::{AppMsg, Command};
+use crate::tmux::attach::attach_with_ctrl_q_detach;
+use crate::tmux::{TmuxClient, TmuxSession};
+use crate::ui;
+
+/// Everything the UI renders from. Pure data; no locks.
+#[derive(Debug, Default)]
+pub struct AppState {
+    pub sessions: Vec<TmuxSession>,
+    pub selected: usize,
+    pub warning: Option<String>,
+    pub quit: bool,
+    /// Set when the user hit Enter on a session — the event loop drains
+    /// this on the next turn, tears down the terminal, and performs the
+    /// blocking `tmux attach` on the controlling tty.
+    pub pending_attach: Option<String>,
+}
+
+impl AppState {
+    fn clamp_selection(&mut self) {
+        if self.sessions.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.sessions.len() {
+            self.selected = self.sessions.len() - 1;
+        }
+    }
+
+    /// Pure reducer. Returns a list of Commands the caller should dispatch.
+    pub fn apply(&mut self, msg: AppMsg) -> Vec<Command> {
+        let mut out = Vec::new();
+        match msg {
+            AppMsg::Tick(_) => {
+                out.push(Command::ListNow);
+            }
+            AppMsg::SessionsRefreshed(sessions) => {
+                // Preserve selection by name across refreshes.
+                let prior_name = self.sessions.get(self.selected).map(|s| s.name.clone());
+                self.sessions = sessions;
+                if let Some(name) = prior_name {
+                    if let Some(idx) = self.sessions.iter().position(|s| s.name == name) {
+                        self.selected = idx;
+                    }
+                }
+                self.clamp_selection();
+                // A successful refresh clears any stale list warning.
+                if let Some(w) = &self.warning {
+                    if w.starts_with("list:") {
+                        self.warning = None;
+                    }
+                }
+            }
+            AppMsg::Key(k) => self.handle_key(k, &mut out),
+            AppMsg::Resize(_, _) => { /* ratatui auto-redraws next frame */ }
+            AppMsg::Warn(w) => self.warning = Some(w),
+            AppMsg::Fatal(w) => {
+                self.warning = Some(w);
+                self.quit = true;
+            }
+            AppMsg::Shutdown => self.quit = true,
+            AppMsg::Resume => { /* redraw happens unconditionally below */ }
+            AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
+                // Phase 1: attach is done inline; these arms are for future use.
+            }
+        }
+        out
+    }
+
+    fn handle_key(&mut self, k: KeyEvent, out: &mut Vec<Command>) {
+        // Only react to Press events. crossterm reports Repeat and Release too.
+        if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
+            return;
+        }
+        // Explicitly never consume Ctrl-Z so the terminal can deliver SIGTSTP.
+        if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
+
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.quit = true;
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                if !self.sessions.is_empty() {
+                    self.selected = (self.selected + 1).min(self.sessions.len() - 1);
+                }
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            (KeyCode::Enter, _) => {
+                if let Some(s) = self.sessions.get(self.selected) {
+                    self.pending_attach = Some(s.name.clone());
+                }
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                out.push(Command::ListNow);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub struct App {
+    pub state: AppState,
+    pub cmd_tx: mpsc::Sender<Command>,
+    pub evt_rx: mpsc::Receiver<AppMsg>,
+    pub evt_tx: mpsc::Sender<AppMsg>,
+    pub socket: Option<String>,
+}
+
+impl App {
+    pub fn new(client: Arc<dyn TmuxClient>, socket: Option<String>) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
+        let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
+
+        tmux_actor::spawn(client.clone(), cmd_rx, evt_tx.clone());
+        poller::spawn(evt_tx.clone(), Duration::from_millis(1000));
+        input_actor::spawn(evt_tx.clone());
+
+        Self {
+            state: AppState::default(),
+            cmd_tx,
+            evt_rx,
+            evt_tx,
+            socket,
+        }
+    }
+
+    pub async fn run<B: ratatui::backend::Backend + std::io::Write>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()> {
+        // Initial refresh kick.
+        let _ = self.cmd_tx.send(Command::ListNow).await;
+
+        terminal
+            .draw(|f| ui::draw(f, &self.state))
+            .map_err(term_err)?;
+
+        while !self.state.quit {
+            let msg = match self.evt_rx.recv().await {
+                Some(m) => m,
+                None => break,
+            };
+
+            let cmds = self.state.apply(msg);
+            for c in cmds {
+                let _ = self.cmd_tx.send(c).await;
+            }
+
+            // If the reducer queued an attach, perform it now: tear down the
+            // terminal, hand the tty to tmux, install/remove the Ctrl-Q binding.
+            if let Some(name) = self.state.pending_attach.take() {
+                self.perform_attach(terminal, &name)?;
+                // After return, kick a refresh — the session may have been killed.
+                let _ = self.cmd_tx.send(Command::ListNow).await;
+            }
+
+            terminal
+                .draw(|f| ui::draw(f, &self.state))
+                .map_err(term_err)?;
+        }
+
+        Ok(())
+    }
+
+    fn perform_attach<B: ratatui::backend::Backend + std::io::Write>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        name: &str,
+    ) -> Result<()> {
+        // 1. Tear down ratatui's grip on the terminal so tmux can own it.
+        crossterm::terminal::disable_raw_mode().map_err(BosunError::Io)?;
+        execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+        )
+        .map_err(BosunError::Io)?;
+
+        // 2. Install binding + run attach (blocking).
+        let result = attach_with_ctrl_q_detach(self.socket.as_deref(), name);
+
+        // 3. Re-enter raw mode / alt screen regardless of attach result.
+        crossterm::terminal::enable_raw_mode().map_err(BosunError::Io)?;
+        execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+        )
+        .map_err(BosunError::Io)?;
+        terminal.clear().map_err(term_err)?;
+
+        if let Err(e) = result {
+            self.state.warning = Some(format!("attach: {}", e));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn ses(name: &str) -> TmuxSession {
+        TmuxSession {
+            name: name.into(),
+            windows: 1,
+            attached: false,
+            created: Some(SystemTime::now()),
+            last_activity: Some(SystemTime::now()),
+            current_path: None,
+        }
+    }
+
+    fn state_with(sessions: Vec<TmuxSession>, selected: usize) -> AppState {
+        AppState {
+            sessions,
+            selected,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn selection_clamps_after_refresh() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 2);
+        s.apply(AppMsg::SessionsRefreshed(vec![ses("a")]));
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn selection_preserved_by_name() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 1);
+        s.apply(AppMsg::SessionsRefreshed(vec![
+            ses("c"),
+            ses("b"),
+            ses("a"),
+        ]));
+        assert_eq!(s.selected, 1); // still "b"
+        assert_eq!(s.sessions[s.selected].name, "b");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn arrow_keys_navigate() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert_eq!(s.selected, 1);
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert_eq!(s.selected, 2);
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert_eq!(s.selected, 2); // clamped
+        s.apply(AppMsg::Key(key(KeyCode::Up)));
+        assert_eq!(s.selected, 1);
+    }
+
+    #[test]
+    fn q_quits() {
+        let mut s = AppState::default();
+        s.apply(AppMsg::Key(key(KeyCode::Char('q'))));
+        assert!(s.quit);
+    }
+
+    #[test]
+    fn ctrl_z_is_not_consumed() {
+        let mut s = state_with(vec![ses("a")], 0);
+        let k = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        s.apply(AppMsg::Key(k));
+        assert!(!s.quit);
+        assert_eq!(s.selected, 0);
+        assert!(s.pending_attach.is_none());
+    }
+
+    #[test]
+    fn enter_queues_attach() {
+        let mut s = state_with(vec![ses("main")], 0);
+        s.apply(AppMsg::Key(key(KeyCode::Enter)));
+        assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn tick_requests_list_now() {
+        let mut s = AppState::default();
+        let cmds = s.apply(AppMsg::Tick(std::time::Instant::now()));
+        assert!(matches!(cmds.as_slice(), [Command::ListNow]));
+    }
+}

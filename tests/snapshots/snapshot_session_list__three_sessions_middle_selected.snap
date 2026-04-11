@@ -1,0 +1,15 @@
+---
+source: tests/snapshot_session_list.rs
+assertion_line: 57
+expression: frame
+---
+   alpha                      preview coming in Phase 2                         
+ ▌ beta  • attached                                                             
+   gamma                                                                        
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ bosun  3 sessions                                  ↑/↓ nav · ↵ attach · q quit
