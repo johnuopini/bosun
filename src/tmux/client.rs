@@ -351,8 +351,14 @@ impl TmuxClient for TokioTmuxClient {
 
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>> {
         // Single display-message call returns all 7 fields separated
-        // by ASCII unit separators. Empty fields become empty strings.
-        const SEP: &str = "\x1f";
+        // by `|||`. We can't use a control character (the old `\x1f`
+        // unit separator) because tmux 3.4+ escapes control chars in
+        // format output as octal sequences (`\037`), which the parser
+        // would never see as a real separator — that was breaking the
+        // Ubuntu CI lifecycle integration test. `|||` is printable so
+        // tmux passes it through untouched. See the matching fix in
+        // `tmux::parse::LIST_SESSIONS_FORMAT`.
+        const SEP: &str = "|||";
         let fmt = format!(
             "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}",
             SEP = SEP
