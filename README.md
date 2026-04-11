@@ -1,22 +1,58 @@
 # Bosun
 
-Tmux-native orchestrator for AI agent sessions. Written in Rust with ratatui.
+Tmux-native orchestrator for AI agent sessions. Written in Rust with
+[ratatui](https://ratatui.rs/).
 
-Bosun is a reimagining of [agent-deck](https://github.com/yetidevworks/agent-deck) — the core workflow is the same (manage a set of tmux sessions running AI agents, with status, previews, and quick attach/detach) but the architecture is rebuilt around a few rules that keep it simple and robust:
+Bosun lists, previews, creates, and manages tmux sessions running AI coding
+agents (Claude Code, Codex, or a plain shell) from a single terminal UI. It
+was built as a from-scratch reimagining of
+[agent-deck](https://github.com/yetidevworks/agent-deck) — same workflow, new
+architecture, designed around a few rules that keep it simple and robust:
 
-- **Tmux is the source of truth.** Bosun polls tmux each tick. No shared database state to race on; multi-instance coexistence is trivial.
-- **One actor owns tmux I/O. One task owns `AppState`.** No nested mutexes.
-- **Pluggable status detection.** Claude is just one detector among many; you can drop in your own regex rules via config.
-- **Opencode aesthetic.** Borderless, subtly shaded panels, bold accents, multi-modal dialogs with accent bars and depth.
+- **Tmux is the source of truth.** Bosun polls `tmux list-sessions` every
+  tick. No shared database state to race on; multi-instance coexistence is
+  trivial because every bosun reads the same tmux server.
+- **Actor pattern, single-writer app state.** One task owns tmux I/O, one
+  task owns `AppState`. No nested mutexes, no `Arc<Mutex<...>>` scattered
+  across the render path.
+- **Dedicated tmux socket.** Bosun runs its sessions on `tmux -L bosun` by
+  default so it never touches your other tmux state, and so Claude Code's
+  macOS Keychain auth lineage flows through bosun's process tree correctly.
+- **Per-session status bar.** Bosun writes its status line with
+  `set-option -t <session>`, never globally, so non-bosun sessions on the
+  same server are untouched.
+- **Opencode aesthetic.** Borderless, subtly shaded panels, bold accents,
+  modal dialogs with left accent bars and drop shadow. Ten built-in themes
+  to pick from (opencode, tokyonight, dracula, catppuccin-mocha,
+  one-dark-pro, ayu-mirage, nord, gruvbox-dark, rose-pine, github-dark),
+  switched live with `t`.
 
-This is a greenfield project under active development. The initial milestone ships a walking skeleton; later phases add previews, a new-session modal, recents, theming, and full lifecycle controls.
+## Features
+
+- Live session list with smoothed status detection
+  (`●` running · `◐` waiting · `○` idle · `✕` error) and pane preview
+- Create new bosun-managed sessions from a modal form: name, path, agent
+  choice, and agent-specific options (Claude `--continue` / `--resume` /
+  skip-permissions, Codex `--yolo`)
+- Filesystem tab-completion in the path field (shell-style LCP matching
+  against live directory contents)
+- Recent sessions picker (`Ctrl+R` from the new-session modal) backed by
+  SQLite, with live substring filter and delete-from-list
+- Session lifecycle: attach (`Enter`), rename (`r`), restart (`R`), kill (`d`)
+- Ten built-in themes plus user themes from
+  `$XDG_CONFIG_HOME/bosun/themes/*.toml`; live preview picker on `t`
+- Config file at `$XDG_CONFIG_HOME/bosun/config.toml` with `theme`,
+  `session_prefix`, `tmux_socket` knobs (env vars still override)
+- One-key detach: `Ctrl+Q` inside any attach returns you to bosun without
+  touching your tmux prefix or leaving stray bindings behind
 
 ## Requirements
 
-- Rust 1.80+ (tested on 1.94)
-- tmux 3.x (tested on 3.6a)
+- Rust 1.80 or newer
+- tmux 3.x (tested against 3.6)
+- macOS or Linux (Windows is not supported)
 
-## Build & run
+## Build
 
 ```sh
 cargo build --release
@@ -27,52 +63,123 @@ During development:
 
 ```sh
 cargo run
-BOSUN_LOG=info cargo run    # enable tracing to stderr
+BOSUN_LOG=info cargo run    # tracing to stderr
 ```
 
-## Phase 1 — walking skeleton (current)
+## Key bindings
 
-What works right now:
+### Main list
 
-- Lists running tmux sessions on the left
-- Arrow keys / `j` / `k` navigate
-- `Enter` attaches to the selected session (tears down the TUI, hands the tty to tmux, restores on return)
-- `Ctrl-Q` inside a Bosun-managed attach detaches you back to Bosun without touching your tmux prefix
-- `r` forces an immediate refresh
-- `q` or `Ctrl-C` quits
-- `Ctrl-Z` suspends Bosun normally; `fg` resumes cleanly
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` / `k` / `j` | Move selection |
+| `Enter` | Attach to selected session |
+| `n` | New session |
+| `r` | Rename selected session |
+| `R` | Restart selected session (kill + recreate with same spec) |
+| `d` | Kill selected session (with confirm) |
+| `t` | Theme picker (arrows live-preview, Enter applies + persists) |
+| `Ctrl+R` | Force immediate refresh |
+| `q` / `Ctrl+C` | Quit |
 
-What's NOT yet implemented (tracked in the plan):
+### Inside a bosun-managed attach
 
-- Live pane preview on the right
-- Status detection (running / waiting / idle / error)
-- New-session / rename / kill modals
-- Fuzzy search / recents
-- Theming and config file
-- SQLite metadata store
+| Key | Action |
+|-----|--------|
+| `Ctrl+Q` | Detach back to bosun |
 
-## Smoke test
+The `Ctrl+Q` binding is installed on the root key-table only for the
+duration of the attach and removed on return. It never touches your tmux
+prefix (`C-b` by default, `C-a` for a lot of us), so muscle memory keeps
+working.
 
-```sh
-# 1. Make sure you have a tmux session or two.
-tmux new -d -s demo
-tmux new -d -s scratch
+### New-session modal
 
-# 2. Run Bosun. You should see both sessions listed.
-cargo run
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift-Tab` | Next / previous field |
+| `Ctrl+R` | Open recents picker and pre-fill from a past session |
+| `Tab` (in path field) | Filesystem completion — 1 match commits, N matches extend to longest common prefix |
+| `↑` / `↓` (in path field) | Navigate filesystem dropdown |
+| `Space` (on checkbox) | Toggle option |
+| `Enter` | Create session |
+| `Esc` | Cancel |
 
-# 3. Arrow-key to `demo`, press Enter. You should be attached to tmux.
-# 4. Press Ctrl-Q. You should be back in Bosun.
-# 5. Confirm Bosun did not leave a stray binding behind:
-tmux list-keys -T root | grep C-q || echo 'clean'
+## Themes
 
-# 6. Suspend/resume job control should still work.
-#    From inside Bosun, press Ctrl-Z, then `fg`.
+Ten themes ship built in. Press `t` on the main list to open the picker —
+arrow keys live-preview the whole UI including the modal itself, `Enter`
+applies and writes the choice to `config.toml`, `Esc` reverts.
+
+Built-ins:
+
+- `opencode` (default)
+- `tokyonight`
+- `dracula`
+- `catppuccin-mocha`
+- `one-dark-pro`
+- `ayu-mirage`
+- `nord`
+- `gruvbox-dark`
+- `rose-pine`
+- `github-dark`
+
+### Custom themes
+
+Drop a `<name>.toml` into `$XDG_CONFIG_HOME/bosun/themes/` (on macOS:
+`~/Library/Application Support/dev.yetidevworks.bosun/themes/`) and it
+shows up in the picker alongside the built-ins. User themes override
+built-ins of the same name. A theme is a set of hex colors for 13
+semantic slots:
+
+```toml
+name = "my-theme"
+
+bg             = "#0b0d12"   # deepest background
+panel          = "#11141b"   # session list row bg
+panel_alt      = "#131722"   # status bar + modal bg
+selection_bg   = "#1e2433"   # selected row / focused field
+text           = "#e6e9ef"
+text_muted     = "#7c8495"
+accent         = "#7c5cff"   # primary accent, selection marker, modal bars
+shadow         = "#05070b"   # modal drop shadow
+dim_fg         = "#3c4254"   # dim-background foreground behind modals
+status_running = "#62d98c"
+status_waiting = "#f4c169"
+status_idle    = "#7c8495"
+status_error   = "#ff5d6b"
 ```
 
-## How the Ctrl-Q detach works
+See `themes/opencode.toml` in the repo for the authoritative reference.
 
-Bosun installs a temporary tmux root key-table binding just before each attach:
+## Configuration
+
+Bosun reads (in order of precedence):
+
+1. Built-in defaults
+2. `$XDG_CONFIG_HOME/bosun/config.toml`
+3. Environment variables
+
+Example `config.toml`:
+
+```toml
+theme          = "tokyonight"
+session_prefix = "bosun-"        # bosun only manages sessions with this prefix
+tmux_socket    = "bosun"         # dedicated tmux -L socket; "default" uses your shared socket
+```
+
+Environment overrides:
+
+| Var | Equivalent |
+|-----|------------|
+| `BOSUN_THEME` | `theme` |
+| `BOSUN_PREFIX` | `session_prefix` (empty string = show all sessions) |
+| `BOSUN_TMUX_SOCKET` | `tmux_socket` (empty or `default` = shared socket) |
+| `BOSUN_LOG` | Tracing filter, e.g. `BOSUN_LOG=info` |
+
+## How `Ctrl-Q` detach works
+
+Just before each attach bosun installs a temporary root-table binding:
 
 ```
 tmux bind-key -T root C-q detach-client
@@ -80,54 +187,82 @@ tmux attach-session -t <name>    # blocks until you detach
 tmux unbind-key -T root C-q      # on return
 ```
 
-A refcount kept in the tmux user option `@bosun_attach_refcount` makes this safe when two Bosun instances are both attached — only the last detach clears the binding. A `Drop` guard plus a panic hook make sure we never leave a dangling binding if Bosun crashes.
+Per-attach install/uninstall (no refcount) keeps the return path under
+50 ms. A panic hook ensures the binding is cleaned up even if bosun dies
+unexpectedly — that path is exercised by a dedicated integration test.
 
-If you have your own `C-q` binding, Bosun will (Phase 5) detect the conflict on startup, save your binding, and restore it on exit. Configurable alternative detach keys will land alongside that work.
+## Why a dedicated tmux socket
 
-## Testing
+By default bosun runs on `tmux -L bosun`, which starts a separate tmux
+server owned by the bosun process. Two reasons:
+
+1. **macOS Keychain lineage.** Claude Code stores its auth tokens in the
+   user's Keychain. macOS gates Keychain access by process tree. Bosun's
+   tmux server is a child of bosun, which is a child of your login shell,
+   so Claude sessions started inside bosun see your cached credentials.
+   Sessions on a random long-lived tmux server started months ago by some
+   other tool don't have that lineage and fail to authenticate.
+2. **Isolation.** Bosun never touches your other tmux sessions, bindings,
+   or status bar. If you want the opposite — bosun managing your main
+   tmux server — set `BOSUN_TMUX_SOCKET=default`.
+
+## Development
 
 ```sh
-cargo test                 # unit + snapshot tests
+cargo test                                     # unit + snapshot tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-
-# Integration tests that spawn a real tmux server (needs tmux installed):
-cargo test --features tmux-it
+cargo test --features tmux-it                  # integration tests that spawn a real tmux
 ```
 
-Snapshot tests use `insta`. When intentional UI changes cause failures:
+Snapshot tests use [`insta`](https://insta.rs/). After an intentional UI
+change:
 
 ```sh
-cargo install cargo-insta    # once
-cargo insta review           # accept/reject each diff
+cargo install cargo-insta     # once
+cargo insta accept            # accept all new snapshots
 ```
 
-## Layout
+### Layout
 
 ```
 src/
-  main.rs                entry point, panic hook, terminal setup
-  app.rs                 AppState, central event loop, attach orchestration
-  events.rs              Command / AppMsg types
-  error.rs
+  main.rs                    entry point, panic hook, terminal setup
+  app.rs                     AppState, central event loop, attach orchestration
+  config.rs                  config.toml loader + env overlay + write_theme
+  events.rs                  Command / AppMsg types
+  store/                     SQLite-backed recents
   tmux/
-    client.rs            tokio::process wrapper (all tmux I/O lives here)
-    parse.rs             pure parsers for tmux CLI output
-    attach.rs            Ctrl-Q keytable + refcount + panic safety
+    client.rs                tokio::process wrapper (all tmux I/O lives here)
+    parse.rs                 pure parsers for tmux CLI output
+    attach.rs                Ctrl-Q keytable + panic safety
+    status_bar.rs            per-session status line management
+    detector.rs              status detection (Running/Waiting/Idle/Error)
     session.rs
   actors/
-    tmux_actor.rs        owns TmuxClient, handles Commands
-    poller.rs            periodic tick pump
-    input_actor.rs       crossterm event stream -> AppMsg
+    tmux_actor.rs            owns TmuxClient, handles Commands
+    poller.rs                periodic tick pump
+    input_actor.rs           crossterm event stream -> AppMsg
   ui/
-    mod.rs               draw(frame, state)
-    layout.rs            region rects
-    session_list.rs
+    mod.rs                   draw(frame, state, theme)
+    theme.rs                 Theme struct + built-in loader + user dir scan
+    layout.rs
+    session_list.rs          2-line rows (name + agent·path)
+    preview.rs               live pane preview from capture-pane
     statusbar.rs
+    modal/
+      mod.rs                 modal stack + ModalResult enum
+      new_session.rs
+      recents.rs
+      rename.rs
+      confirm.rs
+      theme.rs               theme picker with live preview
+themes/                      10 built-in theme .toml files (embedded via include_str!)
 tests/
   snapshot_session_list.rs
+  integration_*.rs           real-tmux integration tests (feature = tmux-it)
 ```
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 Andy Miller
