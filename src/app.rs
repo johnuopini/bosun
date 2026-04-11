@@ -126,6 +126,12 @@ pub struct App {
     pub evt_rx: mpsc::Receiver<AppMsg>,
     pub evt_tx: mpsc::Sender<AppMsg>,
     pub socket: Option<String>,
+    /// Handle to the running input actor. Held here so we can stop it
+    /// before handing stdin to tmux during an attach — otherwise the
+    /// actor's crossterm reader races tmux for each stdin byte, and
+    /// the user ends up needing to press Ctrl-Q twice because the
+    /// first press is read by Bosun and silently dropped.
+    input_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -135,7 +141,7 @@ impl App {
 
         tmux_actor::spawn(client.clone(), cmd_rx, evt_tx.clone());
         poller::spawn(evt_tx.clone(), Duration::from_millis(1000));
-        input_actor::spawn(evt_tx.clone());
+        let input_handle = input_actor::spawn(evt_tx.clone());
 
         Self {
             state: AppState::default(),
@@ -143,6 +149,7 @@ impl App {
             evt_rx,
             evt_tx,
             socket,
+            input_handle: Some(input_handle),
         }
     }
 
@@ -171,7 +178,20 @@ impl App {
             // If the reducer queued an attach, perform it now: tear down the
             // terminal, hand the tty to tmux, install/remove the Ctrl-Q binding.
             if let Some(name) = self.state.pending_attach.take() {
-                self.perform_attach(terminal, &name)?;
+                // Stop the input actor so tmux has stdin to itself. Without
+                // this, Bosun's crossterm reader and tmux race for each key
+                // byte and the user has to press Ctrl-Q twice to detach.
+                if let Some(h) = self.input_handle.take() {
+                    h.abort();
+                    let _ = h.await;
+                }
+
+                let attach_result = self.perform_attach(terminal, &name);
+
+                // Respawn the input actor now that the terminal is back.
+                self.input_handle = Some(input_actor::spawn(self.evt_tx.clone()));
+
+                attach_result?;
                 // After return, kick a refresh — the session may have been killed.
                 let _ = self.cmd_tx.send(Command::ListNow).await;
             }

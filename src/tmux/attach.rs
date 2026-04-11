@@ -5,13 +5,11 @@
 //! This lets the user press Ctrl-Q inside a Bosun-managed tmux session to
 //! detach back to Bosun, without permanently altering their tmux config.
 //!
-//! Multi-instance safety:
-//!   * We refcount bindings in a tmux user option `@bosun_attach_refcount`.
-//!     Increment before bind, decrement after, only unbind at zero.
-//!   * Two Bosun instances both running `bind` the same action is idempotent.
-//!   * If the user already has a `C-q` binding at `-T root`, we save it on
-//!     startup and restore it on unbind. (Phase 5 work — for Phase 1 we
-//!     just warn if a conflict is detected.)
+//! Phase 1 uses a single bind/unbind per attach (1 subprocess call on each
+//! side). Phase 5 adds the multi-instance refcount hardening and conflict
+//! detection against a user's existing `C-q` binding. Keeping Phase 1 lean
+//! matters for perceived latency: every extra `tmux` subprocess adds ~10-30ms
+//! on the return-from-attach path.
 //!
 //! Panic safety:
 //!   * `AttachGuard` has a `Drop` impl that synchronously runs `unbind-key`.
@@ -75,14 +73,6 @@ pub fn install_detach_key_for_test(socket: Option<&str>) -> Result<AttachGuard> 
 }
 
 fn install_detach_key(socket: Option<&str>) -> Result<AttachGuard> {
-    // Increment refcount (best-effort; tmux options are atomic within set-option).
-    // We read current value, increment, write back. Two Bosun processes racing
-    // here is unlikely at human speed, and even if both read the same value the
-    // worst case is an off-by-one that self-heals once both detach.
-    let current = read_refcount(socket);
-    let next = current + 1;
-    set_refcount(socket, next)?;
-
     // Bind Ctrl-Q at the root key table. `-T root` bindings fire before any
     // prefix, so we catch Ctrl-Q regardless of user's prefix key.
     let status = sync_tmux(socket, ["bind-key", "-T", "root", "C-q", "detach-client"])
@@ -112,43 +102,12 @@ fn run_attach(socket: Option<&str>, name: &str) -> Result<()> {
 }
 
 fn unbind_detach_key(socket: Option<&str>) -> Result<()> {
-    let current = read_refcount(socket);
-    if current > 1 {
-        set_refcount(socket, current - 1)?;
-        return Ok(());
-    }
-
-    // Last one out turns off the lights.
     let status = sync_tmux(socket, ["unbind-key", "-T", "root", "C-q"])
         .status()
         .map_err(BosunError::Io)?;
     if !status.success() {
-        // Not fatal — the binding might already be cleared. Log later.
+        // Not fatal — the binding might already be cleared.
         tracing::warn!("unbind-key C-q returned {}", status);
-    }
-    set_refcount(socket, 0)?;
-    Ok(())
-}
-
-fn read_refcount(socket: Option<&str>) -> u32 {
-    // `tmux show-options -gqv @bosun_attach_refcount` -> "" if unset.
-    let output = sync_tmux(socket, ["show-options", "-gqv", "@bosun_attach_refcount"]).output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.trim().parse().unwrap_or(0)
-        }
-        _ => 0,
-    }
-}
-
-fn set_refcount(socket: Option<&str>, value: u32) -> Result<()> {
-    let v = value.to_string();
-    let status = sync_tmux(socket, ["set-option", "-g", "@bosun_attach_refcount", &v])
-        .status()
-        .map_err(BosunError::Io)?;
-    if !status.success() {
-        tracing::warn!("set-option @bosun_attach_refcount returned {}", status);
     }
     Ok(())
 }

@@ -40,11 +40,6 @@ fn count_ctrl_q_bindings(socket: &str) -> usize {
     keys.lines().filter(|l| l.contains("C-q")).count()
 }
 
-fn refcount(socket: &str) -> String {
-    let out = tmux(socket, &["show-options", "-gqv", "@bosun_attach_refcount"]);
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 fn kill_server(socket: &str) {
     let _ = tmux(socket, &["kill-server"]);
 }
@@ -64,7 +59,6 @@ fn install_then_release_leaves_no_binding() {
         "expected C-q binding to be installed, got: {}",
         list_keys_root(&sock)
     );
-    assert_eq!(refcount(&sock), "1");
 
     guard.release().expect("release ok");
     assert_eq!(
@@ -73,38 +67,13 @@ fn install_then_release_leaves_no_binding() {
         "expected C-q binding gone after release, got:\n{}",
         list_keys_root(&sock)
     );
-    assert_eq!(refcount(&sock), "0");
 
     kill_server(&sock);
 }
 
-#[test]
-fn refcount_survives_nested_installs() {
-    let sock = unique_socket("nested");
-    tmux(&sock, &["new-session", "-d", "-s", "dummy"]);
-
-    let g1 = install_detach_key_for_test(Some(&sock)).expect("install 1");
-    assert_eq!(refcount(&sock), "1");
-
-    let g2 = install_detach_key_for_test(Some(&sock)).expect("install 2");
-    assert_eq!(refcount(&sock), "2");
-
-    // Releasing g2 should NOT remove the binding — g1 is still holding it.
-    g2.release().expect("release 2");
-    assert_eq!(refcount(&sock), "1");
-    assert!(
-        count_ctrl_q_bindings(&sock) >= 1,
-        "binding dropped too early; list-keys:\n{}",
-        list_keys_root(&sock)
-    );
-
-    // Releasing g1 drops the refcount to 0 and actually unbinds.
-    g1.release().expect("release 1");
-    assert_eq!(refcount(&sock), "0");
-    assert_eq!(count_ctrl_q_bindings(&sock), 0);
-
-    kill_server(&sock);
-}
+// Phase 5 TODO: add a refcount-based test for multi-instance safety
+// when we reintroduce `@bosun_attach_refcount`. Phase 1 uses a single
+// bind/unbind per attach for lower latency.
 
 #[test]
 fn drop_without_release_still_unbinds() {
