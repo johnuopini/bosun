@@ -1,10 +1,10 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 44
+assertion_line: 54
 expression: frame
 ---
-                              preview coming in Phase 2                         
-  no tmux sessions                                                              
+                                                                                
+  no tmux sessions              preview: capturing…                             
   (press r to refresh)                                                          
                                                                                 
                                                                                 

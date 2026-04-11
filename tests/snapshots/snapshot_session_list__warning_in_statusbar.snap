@@ -1,10 +1,10 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 66
+assertion_line: 76
 expression: frame
 ---
- ▌ alpha                      preview coming in Phase 2                         
-                                                                                
+ ▌ ○  alpha  1w                                                                 
+                                preview: capturing…                             
                                                                                 
                                                                                 
                                                                                 

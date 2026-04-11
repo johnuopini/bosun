@@ -4,3 +4,4 @@ pub mod error;
 pub mod events;
 pub mod tmux;
 pub mod ui;
+pub mod util;

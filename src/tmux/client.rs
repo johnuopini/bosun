@@ -17,6 +17,12 @@ pub trait TmuxClient: Send + Sync {
     /// Run `tmux list-sessions` and return parsed sessions. An empty
     /// server (exit code 1, "no server running") returns `Ok(vec![])`.
     async fn list_sessions(&self) -> Result<Vec<TmuxSession>>;
+
+    /// Capture the most recent `lines` of the session's active pane,
+    /// preserving ANSI escape sequences so we can render them with
+    /// `ansi-to-tui` and pass them to detectors. Dead sessions return
+    /// `Ok(vec![])`.
+    async fn capture_pane(&self, session: &str, lines: u16) -> Result<Vec<u8>>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -96,6 +102,45 @@ impl TmuxClient for TokioTmuxClient {
 
         Err(BosunError::Tmux(format!(
             "list-sessions failed ({}): {}",
+            output.status,
+            stderr.trim()
+        )))
+    }
+
+    async fn capture_pane(&self, session: &str, lines: u16) -> Result<Vec<u8>> {
+        let mut cmd = self.cmd();
+        // -p : stdout
+        // -e : include escape sequences
+        // -J : join wrapped lines (so we don't split in the middle of an
+        //      ANSI sequence)
+        // -S -<lines> : start `lines` from the bottom of the visible pane
+        let start = format!("-{}", lines);
+        cmd.arg("capture-pane")
+            .arg("-p")
+            .arg("-e")
+            .arg("-J")
+            .arg("-t")
+            .arg(session)
+            .arg("-S")
+            .arg(&start);
+
+        let output = cmd.output().await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BosunError::TmuxNotInstalled,
+            _ => BosunError::Io(e),
+        })?;
+
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+
+        // Session may have just been killed — treat as empty capture.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("can't find session") || stderr.contains("no server running") {
+            return Ok(Vec::new());
+        }
+        Err(BosunError::Tmux(format!(
+            "capture-pane {} failed ({}): {}",
+            session,
             output.status,
             stderr.trim()
         )))

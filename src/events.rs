@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyEvent;
 
-use crate::tmux::session::TmuxSession;
+use crate::tmux::session::SessionView;
 
 /// Commands flow from the UI/app task into the tmux actor.
 #[derive(Debug)]
@@ -11,8 +11,14 @@ pub enum Command {
     ListNow,
     /// Attach to the selected session. The actor takes care of
     /// installing the Ctrl-Q binding before attach and removing it after.
+    #[allow(dead_code)]
     Attach { name: String },
+    /// The user selected a different session; the actor should capture
+    /// its pane with priority so the preview updates quickly. The name
+    /// is owned so the command can cross the mpsc boundary.
+    FocusPreview { name: String },
     /// Graceful shutdown signal.
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -26,8 +32,9 @@ pub enum AppMsg {
     Key(KeyEvent),
     /// Terminal was resized.
     Resize(u16, u16),
-    /// Fresh session list from tmux.
-    SessionsRefreshed(Vec<TmuxSession>),
+    /// Fresh session list from tmux, with smoothed status and optional
+    /// preview buffer per entry.
+    SessionsRefreshed(Vec<SessionView>),
     /// An attach just started — the UI should render a placeholder
     /// while we block in `tmux attach`.
     AttachStarted { name: String },

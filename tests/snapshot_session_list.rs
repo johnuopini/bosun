@@ -6,19 +6,29 @@
 use std::time::SystemTime;
 
 use bosun::app::AppState;
+use bosun::tmux::detector::Status;
+use bosun::tmux::session::SessionView;
 use bosun::tmux::TmuxSession;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-fn ses(name: &str, attached: bool) -> TmuxSession {
-    TmuxSession {
-        name: name.into(),
-        windows: 1,
-        attached,
-        created: Some(SystemTime::UNIX_EPOCH),
-        last_activity: Some(SystemTime::UNIX_EPOCH),
-        current_path: Some("/tmp".into()),
-    }
+fn ses(name: &str, attached: bool) -> SessionView {
+    ses_with_status(name, attached, Status::Idle)
+}
+
+fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
+    SessionView::new(
+        TmuxSession {
+            name: name.into(),
+            windows: 1,
+            attached,
+            created: Some(SystemTime::UNIX_EPOCH),
+            last_activity: Some(SystemTime::UNIX_EPOCH),
+            current_path: Some("/tmp".into()),
+        },
+        status,
+        None,
+    )
 }
 
 fn render(state: &AppState, width: u16, height: u16) -> String {
@@ -64,4 +74,20 @@ fn warning_shows_in_statusbar() {
     };
     let frame = render(&state, 80, 6);
     insta::assert_snapshot!("warning_in_statusbar", frame);
+}
+
+#[test]
+fn mixed_statuses_render_glyphs() {
+    let state = AppState {
+        sessions: vec![
+            ses_with_status("build", false, Status::Running),
+            ses_with_status("review", true, Status::Waiting),
+            ses_with_status("shell", false, Status::Idle),
+            ses_with_status("crashed", false, Status::Error),
+        ],
+        selected: 1,
+        ..Default::default()
+    };
+    let frame = render(&state, 80, 10);
+    insta::assert_snapshot!("mixed_statuses", frame);
 }

@@ -13,19 +13,20 @@ use tokio::sync::mpsc;
 
 use crate::actors::{input_actor, poller, tmux_actor};
 use crate::error::{BosunError, Result};
+use crate::events::{AppMsg, Command};
+use crate::tmux::attach::attach_with_ctrl_q_detach;
+use crate::tmux::session::SessionView;
+use crate::tmux::TmuxClient;
+use crate::ui;
 
 fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
 }
-use crate::events::{AppMsg, Command};
-use crate::tmux::attach::attach_with_ctrl_q_detach;
-use crate::tmux::{TmuxClient, TmuxSession};
-use crate::ui;
 
 /// Everything the UI renders from. Pure data; no locks.
 #[derive(Debug, Default)]
 pub struct AppState {
-    pub sessions: Vec<TmuxSession>,
+    pub sessions: Vec<SessionView>,
     pub selected: usize,
     pub warning: Option<String>,
     pub quit: bool,
@@ -33,6 +34,9 @@ pub struct AppState {
     /// this on the next turn, tears down the terminal, and performs the
     /// blocking `tmux attach` on the controlling tty.
     pub pending_attach: Option<String>,
+    /// Last session name we told the tmux actor to prioritize for preview
+    /// capture. Used to debounce FocusPreview commands.
+    pub focus_sent: Option<String>,
 }
 
 impl AppState {
@@ -53,10 +57,13 @@ impl AppState {
             }
             AppMsg::SessionsRefreshed(sessions) => {
                 // Preserve selection by name across refreshes.
-                let prior_name = self.sessions.get(self.selected).map(|s| s.name.clone());
+                let prior_name = self
+                    .sessions
+                    .get(self.selected)
+                    .map(|v| v.name().to_string());
                 self.sessions = sessions;
                 if let Some(name) = prior_name {
-                    if let Some(idx) = self.sessions.iter().position(|s| s.name == name) {
+                    if let Some(idx) = self.sessions.iter().position(|v| v.name() == name) {
                         self.selected = idx;
                     }
                 }
@@ -67,8 +74,13 @@ impl AppState {
                         self.warning = None;
                     }
                 }
+                // Make sure the actor has the right focused session.
+                self.sync_focus(&mut out);
             }
-            AppMsg::Key(k) => self.handle_key(k, &mut out),
+            AppMsg::Key(k) => {
+                self.handle_key(k, &mut out);
+                self.sync_focus(&mut out);
+            }
             AppMsg::Resize(_, _) => { /* ratatui auto-redraws next frame */ }
             AppMsg::Warn(w) => self.warning = Some(w),
             AppMsg::Fatal(w) => {
@@ -82,6 +94,26 @@ impl AppState {
             }
         }
         out
+    }
+
+    fn sync_focus(&mut self, out: &mut Vec<Command>) {
+        let current = self
+            .sessions
+            .get(self.selected)
+            .map(|v| v.name().to_string());
+        if current != self.focus_sent {
+            if let Some(name) = &current {
+                out.push(Command::FocusPreview { name: name.clone() });
+            }
+            self.focus_sent = current;
+        }
+    }
+
+    /// The preview buffer for the currently selected session, if any.
+    pub fn selected_preview(&self) -> Option<&[u8]> {
+        self.sessions
+            .get(self.selected)
+            .and_then(|v| v.preview.as_deref())
     }
 
     fn handle_key(&mut self, k: KeyEvent, out: &mut Vec<Command>) {
@@ -109,7 +141,7 @@ impl AppState {
             }
             (KeyCode::Enter, _) => {
                 if let Some(s) = self.sessions.get(self.selected) {
-                    self.pending_attach = Some(s.name.clone());
+                    self.pending_attach = Some(s.name().to_string());
                 }
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
@@ -240,20 +272,26 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::detector::Status;
+    use crate::tmux::TmuxSession;
     use std::time::SystemTime;
 
-    fn ses(name: &str) -> TmuxSession {
-        TmuxSession {
-            name: name.into(),
-            windows: 1,
-            attached: false,
-            created: Some(SystemTime::now()),
-            last_activity: Some(SystemTime::now()),
-            current_path: None,
-        }
+    fn ses(name: &str) -> SessionView {
+        SessionView::new(
+            TmuxSession {
+                name: name.into(),
+                windows: 1,
+                attached: false,
+                created: Some(SystemTime::now()),
+                last_activity: Some(SystemTime::now()),
+                current_path: None,
+            },
+            Status::Idle,
+            None,
+        )
     }
 
-    fn state_with(sessions: Vec<TmuxSession>, selected: usize) -> AppState {
+    fn state_with(sessions: Vec<SessionView>, selected: usize) -> AppState {
         AppState {
             sessions,
             selected,
@@ -277,7 +315,7 @@ mod tests {
             ses("a"),
         ]));
         assert_eq!(s.selected, 1); // still "b"
-        assert_eq!(s.sessions[s.selected].name, "b");
+        assert_eq!(s.sessions[s.selected].name(), "b");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

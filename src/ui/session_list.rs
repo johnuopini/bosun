@@ -1,5 +1,4 @@
-//! Session list panel. Phase 1: name + attached marker, hardcoded colors.
-//! Theme integration comes in Phase 4.
+//! Session list panel. Phase 2: status glyphs + color-coded per state.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -8,6 +7,8 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::AppState;
+use crate::tmux::detector::Status;
+use crate::tmux::session::SessionView;
 
 const BG: Color = Color::Rgb(11, 13, 18);
 const PANEL: Color = Color::Rgb(17, 20, 27);
@@ -15,7 +16,11 @@ const SELECTION_BG: Color = Color::Rgb(30, 36, 51);
 const ACCENT: Color = Color::Rgb(124, 92, 255);
 const TEXT: Color = Color::Rgb(230, 233, 239);
 const MUTED: Color = Color::Rgb(124, 132, 149);
-const GREEN: Color = Color::Rgb(98, 217, 140);
+
+const STATUS_RUNNING: Color = Color::Rgb(98, 217, 140);
+const STATUS_WAITING: Color = Color::Rgb(244, 193, 105);
+const STATUS_IDLE: Color = Color::Rgb(124, 132, 149);
+const STATUS_ERROR: Color = Color::Rgb(255, 93, 107);
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let block = Block::default().style(Style::default().bg(BG));
@@ -37,7 +42,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .sessions
             .iter()
             .enumerate()
-            .map(|(i, s)| render_row(i, s, i == state.selected))
+            .map(|(i, v)| render_row(v, i == state.selected))
             .collect()
     };
 
@@ -45,11 +50,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(p, area);
 }
 
-fn render_row(_idx: usize, session: &crate::tmux::TmuxSession, selected: bool) -> Line<'static> {
-    let marker = if selected { "▌" } else { " " };
-    let name = session.name.clone();
-    let attached = session.attached;
+fn status_color(status: Status) -> Color {
+    match status {
+        Status::Running => STATUS_RUNNING,
+        Status::Waiting => STATUS_WAITING,
+        Status::Idle | Status::Unknown => STATUS_IDLE,
+        Status::Error => STATUS_ERROR,
+    }
+}
 
+fn render_row(view: &SessionView, selected: bool) -> Line<'static> {
+    let marker = if selected { "▌" } else { " " };
     let row_bg = if selected { SELECTION_BG } else { PANEL };
 
     let marker_style = if selected {
@@ -67,18 +78,26 @@ fn render_row(_idx: usize, session: &crate::tmux::TmuxSession, selected: bool) -
         Style::default().fg(TEXT).bg(row_bg)
     };
 
-    let attached_style = Style::default().fg(GREEN).bg(row_bg);
+    let status_style = Style::default().fg(status_color(view.status)).bg(row_bg);
+    let glyph = view.status.glyph().to_string();
+    let name = view.name().to_string();
+    let windows = view.session.windows;
 
     let mut spans = vec![
         Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled(glyph, status_style),
+        Span::styled("  ", Style::default().bg(row_bg)),
         Span::styled(name, name_style),
+        Span::styled(
+            format!("  {}w", windows),
+            Style::default().fg(MUTED).bg(row_bg),
+        ),
     ];
 
-    if attached {
-        spans.push(Span::styled("  •", attached_style));
+    if view.session.attached {
         spans.push(Span::styled(
-            " attached",
-            Style::default().fg(MUTED).bg(row_bg),
+            "  •attached",
+            Style::default().fg(STATUS_RUNNING).bg(row_bg),
         ));
     }
 
