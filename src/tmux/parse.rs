@@ -10,7 +10,12 @@ use crate::tmux::session::TmuxSession;
 /// The format string we pass to `tmux list-sessions -F`. Fields are separated
 /// by `\x1f` (ASCII unit separator) so session names can safely contain `|`,
 /// `:`, tabs, etc. without colliding with the delimiter.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_created}\x1f#{session_activity}\x1f#{session_path}";
+///
+/// The last field reads a user option we set at create time, so the UI can
+/// show the pretty "rasterfox" name even though the internal tmux session
+/// is `bosun-rasterfox-<uniqid>`. Unset returns empty and we fall back to
+/// using `session_name`.
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_created}\x1f#{session_activity}\x1f#{session_path}\x1f#{@bosun_display}";
 
 const FIELD_SEP: char = '\x1f';
 
@@ -50,6 +55,7 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         .next()
         .ok_or_else(|| "missing session_activity".to_string())?;
     let path = parts.next().map(|s| s.to_string());
+    let display_raw = parts.next().map(|s| s.to_string());
 
     if parts.next().is_some() {
         return Err("unexpected extra field".into());
@@ -76,6 +82,7 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         created,
         last_activity,
         current_path: path.filter(|p| !p.is_empty()),
+        display_name: display_raw.filter(|s| !s.is_empty()),
     })
 }
 

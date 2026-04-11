@@ -8,7 +8,15 @@ use crate::tmux::detector::Status;
 /// structs on every poll from `tmux list-sessions -F ...`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxSession {
+    /// Actual tmux session name — includes prefix + uniq suffix for
+    /// bosun-managed sessions, e.g. `bosun-rasterfox-a1b2c3d4`. This
+    /// is what we pass to `tmux attach-session -t`, `capture-pane -t`,
+    /// etc.
     pub name: String,
+    /// Pretty name shown in bosun's UI. Populated from the tmux user
+    /// option `@bosun_display` that we set at create time. `None` for
+    /// sessions bosun didn't create (or ones set by an older bosun).
+    pub display_name: Option<String>,
     pub windows: u32,
     pub attached: bool,
     pub created: Option<SystemTime>,
@@ -17,11 +25,10 @@ pub struct TmuxSession {
 }
 
 impl TmuxSession {
-    /// Convenience: stable display title. For Phase 1 this is just the name.
-    /// Phase 3 will overlay metadata from the store.
-    #[allow(dead_code)]
+    /// Pretty name for the UI. Falls back to the internal session name
+    /// if no display name was set.
     pub fn display(&self) -> &str {
-        &self.name
+        self.display_name.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -47,7 +54,13 @@ impl SessionView {
         }
     }
 
+    /// The internal tmux name — use this when talking to tmux.
     pub fn name(&self) -> &str {
         &self.session.name
+    }
+
+    /// The pretty display name — use this in the UI.
+    pub fn display(&self) -> &str {
+        self.session.display()
     }
 }

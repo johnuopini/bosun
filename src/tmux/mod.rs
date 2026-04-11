@@ -5,5 +5,5 @@ pub mod parse;
 pub mod session;
 pub mod status_bar;
 
-pub use client::{TmuxClient, TokioTmuxClient};
+pub use client::{CreateSpec, TmuxClient, TokioTmuxClient};
 pub use session::{SessionView, TmuxSession};

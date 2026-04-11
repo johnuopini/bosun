@@ -11,6 +11,27 @@ use crate::error::{BosunError, Result};
 use crate::tmux::parse::{parse_list_sessions, LIST_SESSIONS_FORMAT};
 use crate::tmux::session::TmuxSession;
 
+/// Spec for creating a new tmux session. All strings are expected to
+/// already be shell-safe (no unescaped quotes, no interior control
+/// characters); the actor is responsible for building this from the
+/// form modal's output.
+#[derive(Debug, Clone)]
+pub struct CreateSpec {
+    /// Full tmux session name, including any prefix like `bosun-` and
+    /// a uniqueness suffix. This is the name tmux actually uses.
+    pub name: String,
+    /// Pretty name for the UI. If `Some`, bosun sets the per-session
+    /// tmux user option `@bosun_display` to this value so the UI can
+    /// show "rasterfox" even though the internal name is
+    /// `bosun-rasterfox-a1b2c3d4`.
+    pub display_name: Option<String>,
+    /// Working directory for the new session. Must exist.
+    pub path: String,
+    /// Shell command to run as the initial process. Empty means use
+    /// the user's default shell.
+    pub command: String,
+}
+
 /// Abstraction over the tmux CLI. Real impl shells out; mocks record calls.
 #[async_trait]
 pub trait TmuxClient: Send + Sync {
@@ -23,6 +44,11 @@ pub trait TmuxClient: Send + Sync {
     /// sequences so we can render them with `ansi-to-tui` and pass
     /// them to detectors. Dead sessions return `Ok(vec![])`.
     async fn capture_pane(&self, session: &str) -> Result<Vec<u8>>;
+
+    /// Create a detached tmux session. The session appears in
+    /// subsequent `list_sessions` calls. Returns the name of the
+    /// newly-created session on success.
+    async fn create_session(&self, spec: &CreateSpec) -> Result<String>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -144,6 +170,49 @@ impl TmuxClient for TokioTmuxClient {
             output.status,
             stderr.trim()
         )))
+    }
+
+    async fn create_session(&self, spec: &CreateSpec) -> Result<String> {
+        let mut cmd = self.cmd();
+        cmd.arg("new-session").arg("-d").arg("-s").arg(&spec.name);
+        if !spec.path.is_empty() {
+            cmd.arg("-c").arg(&spec.path);
+        }
+        if !spec.command.is_empty() {
+            // Last positional is the shell command to run as pane 0.
+            cmd.arg(&spec.command);
+        }
+
+        let output = cmd.output().await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BosunError::TmuxNotInstalled,
+            _ => BosunError::Io(e),
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BosunError::Tmux(format!(
+                "new-session -s {} failed: {}",
+                spec.name,
+                stderr.trim()
+            )));
+        }
+
+        // Set the pretty display name on the freshly-created session
+        // via a per-session user option. Best-effort — if this fails,
+        // the UI will fall back to showing the internal name.
+        if let Some(display) = &spec.display_name {
+            let mut set = self.cmd();
+            set.arg("set-option")
+                .arg("-t")
+                .arg(&spec.name)
+                .arg("@bosun_display")
+                .arg(display);
+            if let Err(e) = set.output().await {
+                tracing::warn!("set @bosun_display on {}: {}", spec.name, e);
+            }
+        }
+
+        Ok(spec.name.clone())
     }
 }
 

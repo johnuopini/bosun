@@ -20,6 +20,7 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
     SessionView::new(
         TmuxSession {
             name: name.into(),
+            display_name: None,
             windows: 1,
             attached,
             created: Some(SystemTime::UNIX_EPOCH),

@@ -26,11 +26,11 @@ use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::events::{AppMsg, Command};
+use crate::events::{AppMsg, Command, SessionSpec};
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
 use crate::tmux::session::SessionView;
 use crate::tmux::status_bar;
-use crate::tmux::TmuxClient;
+use crate::tmux::{CreateSpec, TmuxClient};
 use crate::util::hysteresis::Smoother;
 
 /// RAII cleanup for globals installed by the status bar (prefix-1..9
@@ -83,12 +83,12 @@ pub fn spawn(
                             smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
 
                             // Only sync the status bar when the set of
-                            // (name, attached) pairs has actually
+                            // (display_name, attached) pairs has actually
                             // changed. This skips the ~N*7 set-option
                             // calls on ticks where nothing's moved.
                             let state: Vec<(String, bool)> = views
                                 .iter()
-                                .map(|v| (v.name().to_string(), v.session.attached))
+                                .map(|v| (v.display().to_string(), v.session.attached))
                                 .collect();
                             if state != last_bar_state {
                                 sync_status_bar(socket.as_deref(), &state, &mut globals);
@@ -113,6 +113,41 @@ pub fn spawn(
                 Command::FocusPreview { name } => {
                     focused = Some(name);
                 }
+                Command::CreateSession(spec) => {
+                    match create_session(&*client, &config, spec).await {
+                        Ok(internal_name) => {
+                            focused = Some(internal_name);
+                            // Force an immediate refresh so the new session
+                            // pops into the list without waiting for the
+                            // next tick.
+                            let _ = evt_tx
+                                .send(AppMsg::Warn(format!(
+                                    "created {}",
+                                    focused.as_deref().unwrap_or("")
+                                )))
+                                .await;
+                            // Re-enter the loop head; the app loop will
+                            // issue a ListNow on the next tick, and our
+                            // own debounced refresh handling takes it from
+                            // there. To avoid a 1s delay, kick one now:
+                            let _ = do_refresh(
+                                &*client,
+                                &config,
+                                &registry,
+                                &mut smoothers,
+                                focused.as_deref(),
+                                socket.as_deref(),
+                                &mut last_bar_state,
+                                &mut globals,
+                                &evt_tx,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(AppMsg::Warn(format!("create: {}", e))).await;
+                        }
+                    }
+                }
                 Command::Attach { .. } => {
                     tracing::warn!("tmux_actor received Attach — ignored; app task handles attach");
                 }
@@ -123,6 +158,90 @@ pub fn spawn(
         // `globals` drops here → uninstall_globals runs.
         drop(globals);
     })
+}
+
+/// Assemble the internal tmux session name from the user's typed
+/// display name. Internal format: `<prefix><display>-<hex-suffix>`,
+/// e.g. `bosun-rasterfox-a1b2c3d4`. The hex suffix makes the internal
+/// name unique even if the user creates two sessions with the same
+/// display name.
+fn build_internal_name(prefix: &str, display: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let suffix = format!("{:08x}", nanos as u32);
+    let sanitized: String = display
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{}{}-{}", prefix, sanitized, suffix)
+}
+
+/// Map the agent + args into a shell command to run as the new
+/// session's initial process. `terminal` means "just the shell".
+fn build_agent_command(agent: &str, args: &str) -> String {
+    let args = args.trim();
+    match agent {
+        "claude" if args.is_empty() => "claude".to_string(),
+        "claude" => format!("claude {}", args),
+        "codex" if args.is_empty() => "codex".to_string(),
+        "codex" => format!("codex {}", args),
+        // "terminal" and anything else → run whatever extra args the
+        // user typed, or nothing (tmux uses the default shell).
+        _ => args.to_string(),
+    }
+}
+
+async fn create_session(
+    client: &dyn TmuxClient,
+    config: &Config,
+    spec: SessionSpec,
+) -> crate::error::Result<String> {
+    let internal = build_internal_name(&config.session_prefix, &spec.name);
+    let command = build_agent_command(&spec.agent, &spec.args);
+    let create = CreateSpec {
+        name: internal.clone(),
+        display_name: Some(spec.name.clone()),
+        path: spec.path.clone(),
+        command,
+    };
+    client.create_session(&create).await.map(|_| internal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_refresh(
+    client: &dyn TmuxClient,
+    config: &Config,
+    registry: &DetectorRegistry,
+    smoothers: &mut HashMap<String, Smoother>,
+    focused: Option<&str>,
+    socket: Option<&str>,
+    last_bar_state: &mut Vec<(String, bool)>,
+    globals: &mut GlobalsGuard,
+    evt_tx: &mpsc::Sender<AppMsg>,
+) -> crate::error::Result<()> {
+    let views = refresh_all(client, config, registry, smoothers, focused).await?;
+    smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
+
+    let state: Vec<(String, bool)> = views
+        .iter()
+        .map(|v| (v.display().to_string(), v.session.attached))
+        .collect();
+    if state != *last_bar_state {
+        sync_status_bar(socket, &state, globals);
+        *last_bar_state = state;
+    }
+
+    let _ = evt_tx.send(AppMsg::SessionsRefreshed(views)).await;
+    Ok(())
 }
 
 fn sync_status_bar(socket: Option<&str>, sessions: &[(String, bool)], globals: &mut GlobalsGuard) {

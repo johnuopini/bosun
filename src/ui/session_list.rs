@@ -80,7 +80,7 @@ fn render_row(view: &SessionView, selected: bool) -> Line<'static> {
 
     let status_style = Style::default().fg(status_color(view.status)).bg(row_bg);
     let glyph = view.status.glyph().to_string();
-    let name = view.name().to_string();
+    let name = view.display().to_string();
     let windows = view.session.windows;
 
     let mut spans = vec![

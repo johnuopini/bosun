@@ -4,6 +4,17 @@ use crossterm::event::KeyEvent;
 
 use crate::tmux::session::SessionView;
 
+/// Data the new-session modal gathers and hands off to the tmux actor.
+/// The `name` is the unprefixed user-entered name; the actor prepends
+/// `Config::session_prefix` (e.g. `bosun-`) before calling tmux.
+#[derive(Debug, Clone)]
+pub struct SessionSpec {
+    pub name: String,
+    pub path: String,
+    pub agent: String,
+    pub args: String,
+}
+
 /// Commands flow from the UI/app task into the tmux actor.
 #[derive(Debug)]
 pub enum Command {
@@ -17,6 +28,8 @@ pub enum Command {
     /// its pane with priority so the preview updates quickly. The name
     /// is owned so the command can cross the mpsc boundary.
     FocusPreview { name: String },
+    /// Create a new tmux session from the new-session modal's form data.
+    CreateSession(SessionSpec),
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

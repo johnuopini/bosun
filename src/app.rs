@@ -19,6 +19,7 @@ use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
 use crate::ui;
+use crate::ui::modal::{new_session::NewSessionModal, ModalResult, ModalStack};
 
 fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
@@ -38,6 +39,10 @@ pub struct AppState {
     /// Last session name we told the tmux actor to prioritize for preview
     /// capture. Used to debounce FocusPreview commands.
     pub focus_sent: Option<String>,
+    /// Stack of open modals. `ui::draw` renders them over the main list
+    /// on every frame; `handle_key` routes key events to the top modal
+    /// first.
+    pub modals: ModalStack,
 }
 
 impl AppState {
@@ -79,7 +84,25 @@ impl AppState {
                 self.sync_focus(&mut out);
             }
             AppMsg::Key(k) => {
-                self.handle_key(k, &mut out);
+                // Route through open modals first. Most modals consume
+                // everything they see so typing in a text field doesn't
+                // leak into the main list.
+                if !self.modals.is_empty() {
+                    match self.modals.handle(k) {
+                        ModalResult::Consumed => {}
+                        ModalResult::PassThrough => {
+                            self.handle_key(k, &mut out);
+                        }
+                        ModalResult::Close(cmd) => {
+                            self.modals.pop();
+                            if let Some(c) = cmd {
+                                out.push(c);
+                            }
+                        }
+                    }
+                } else {
+                    self.handle_key(k, &mut out);
+                }
                 self.sync_focus(&mut out);
             }
             AppMsg::Resize(_, _) => { /* ratatui auto-redraws next frame */ }
@@ -147,6 +170,15 @@ impl AppState {
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
                 out.push(Command::ListNow);
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                // Don't open a second new-session modal if one is
+                // already on the stack. `modals.is_empty()` is enough
+                // here — modals consume keys so 'n' shouldn't even
+                // reach this branch while one's open — but belt + braces.
+                if self.modals.top_id() != Some("new_session") {
+                    self.modals.push(Box::new(NewSessionModal::new()));
+                }
             }
             _ => {}
         }
@@ -287,6 +319,7 @@ mod tests {
         SessionView::new(
             TmuxSession {
                 name: name.into(),
+                display_name: None,
                 windows: 1,
                 attached: false,
                 created: Some(SystemTime::now()),
