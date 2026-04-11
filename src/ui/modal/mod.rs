@@ -19,6 +19,7 @@ pub mod confirm;
 pub mod new_session;
 pub mod recents;
 pub mod rename;
+pub mod theme;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;

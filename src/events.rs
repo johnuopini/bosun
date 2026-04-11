@@ -102,6 +102,14 @@ pub enum Command {
     /// primary key. The RecentsModal emits this when the user hits
     /// `d` on a highlighted row.
     DeleteRecent(i64),
+    /// Set the active theme. Intercepted by the app loop — this
+    /// command is NEVER forwarded to the tmux actor (it's a pure UI
+    /// state change). `persist=false` is a transient live preview
+    /// (sent by the theme picker on every arrow key); `persist=true`
+    /// also writes `theme = "<name>"` to `config.toml`. On cancel,
+    /// the picker emits `SetTheme { original, persist: false }` to
+    /// revert the UI without touching disk.
+    SetTheme { name: String, persist: bool },
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

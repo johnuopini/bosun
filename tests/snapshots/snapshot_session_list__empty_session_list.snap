@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 55
 expression: frame
 ---
                                                                                 
@@ -12,4 +11,4 @@ expression: frame
                                                                                 
                                                                                 
                                                                                 
- bosun  0 sessions       ↵ attach · n new · r ren · R restart · d kill · q quit
+ bosun  0 sessions ↵ attach · n new · r ren · R rst · d kill · t theme · q quit

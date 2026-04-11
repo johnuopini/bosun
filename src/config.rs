@@ -16,7 +16,7 @@ use std::env;
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The default prefix that bosun considers "managed". Only tmux
 /// sessions whose name starts with this prefix appear in bosun's UI
@@ -74,13 +74,15 @@ impl Default for Config {
 
 /// Shape of `config.toml` on disk. All fields are optional and
 /// defaulted independently so a half-written file still loads.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Serialize` is used by `write_theme` to round-trip the file on
+/// disk: read → update one field → write.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct ConfigFile {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     session_prefix: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_socket: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
 }
 
@@ -169,6 +171,35 @@ fn read_config_file() -> Option<ConfigFile> {
             None
         }
     }
+}
+
+/// Persist a new theme choice to `config.toml`. Read-modify-write:
+/// existing file fields are preserved, only `theme` is updated. If
+/// the file doesn't exist it's created. Returns `Err` if the config
+/// dir can't be resolved or writing fails — callers (the theme
+/// picker) surface this as a warning in the status bar but still
+/// apply the change to the live UI.
+pub fn write_theme(name: &str) -> std::io::Result<()> {
+    let dir = config_dir()
+        .ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.theme = Some(name.to_string());
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
+    // Atomic write: temp file + rename. Avoids a half-written
+    // config.toml if bosun is killed mid-write.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// If `$TMUX` is set, ask tmux for the current session name. Used to

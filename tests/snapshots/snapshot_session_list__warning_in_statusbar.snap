@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 77
 expression: frame
 ---
  ▌ ○  alpha  1w                                                                 
@@ -8,4 +7,4 @@ expression: frame
                                                                                 
                                                                                 
                                                                                 
- bosun  list: tmux not running↵ attach · n new · r ren · R restart · d kill · q
+ bosun  list: tmux not running↵ attach · n new · r ren · R rst · d kill · t them

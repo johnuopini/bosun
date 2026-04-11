@@ -23,6 +23,7 @@ use crate::ui;
 use crate::ui::modal::confirm::ConfirmModal;
 use crate::ui::modal::new_session::NewSessionModal;
 use crate::ui::modal::rename::RenameModal;
+use crate::ui::modal::theme::ThemeModal;
 use crate::ui::modal::{ModalStack, StackDispatch};
 use crate::ui::Theme;
 
@@ -58,6 +59,11 @@ pub struct AppState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalRequest {
     NewSession,
+    /// Open the theme picker. The app loop fills in the list of
+    /// currently-available themes (built-ins + user dir) before
+    /// constructing `ThemeModal`, so `AppState::apply` doesn't need
+    /// to touch the filesystem.
+    Theme,
 }
 
 impl AppState {
@@ -244,6 +250,14 @@ impl AppState {
                     self.pending_modal = Some(ModalRequest::NewSession);
                 }
             }
+            (KeyCode::Char('t'), KeyModifiers::NONE) => {
+                // Same reason as NewSession: AppState can't read the
+                // filesystem to build the theme list, so we signal
+                // the app loop to do it.
+                if self.modals.top_id() != Some("theme") {
+                    self.pending_modal = Some(ModalRequest::Theme);
+                }
+            }
             _ => {}
         }
     }
@@ -321,7 +335,27 @@ impl App {
 
             let cmds = self.state.apply(msg);
             for c in cmds {
-                let _ = self.cmd_tx.send(c).await;
+                // Intercept SetTheme here — it's a pure UI action and
+                // must not reach the tmux actor. `persist: true`
+                // additionally writes the choice to config.toml so
+                // it survives restart.
+                match c {
+                    Command::SetTheme { name, persist } => {
+                        self.theme = Theme::load(
+                            &name,
+                            crate::config::user_themes_dir().as_deref(),
+                        );
+                        if persist {
+                            if let Err(e) = crate::config::write_theme(&name) {
+                                self.state.warning =
+                                    Some(format!("theme: failed to save: {e}"));
+                            }
+                        }
+                    }
+                    other => {
+                        let _ = self.cmd_tx.send(other).await;
+                    }
+                }
             }
 
             // Handle any modal-open requests from the reducer. This
@@ -334,6 +368,14 @@ impl App {
                         self.state
                             .modals
                             .push(Box::new(NewSessionModal::new(recents)));
+                    }
+                    ModalRequest::Theme => {
+                        let names =
+                            Theme::available(crate::config::user_themes_dir().as_deref());
+                        let original = self.theme.name.clone();
+                        self.state
+                            .modals
+                            .push(Box::new(ThemeModal::new(names, original)));
                     }
                 }
             }
