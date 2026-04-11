@@ -7,9 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::{BosunError, Result};
 use crate::tmux::session::TmuxSession;
 
-/// The format string we pass to `tmux list-sessions -F`. Fields are separated
-/// by `\x1f` (ASCII unit separator) so session names can safely contain `|`,
-/// `:`, tabs, etc. without colliding with the delimiter.
+/// The format string we pass to `tmux list-sessions -F`. Fields are
+/// separated by the printable sequence `|||`. We can't use a control
+/// character (like `\x1f`) because tmux 3.4+ escapes all control
+/// characters in format output as octal sequences (`\037` for 0x1f)
+/// as a security measure against terminal-injection via session
+/// names — that broke the Ubuntu CI job, which ships tmux 3.4. `|||`
+/// is printable ASCII, so tmux passes it through unmodified, and
+/// three pipes is vanishingly unlikely to appear in a real session
+/// name, display name, or filesystem path.
 ///
 /// The trailing `@bosun_*` fields read user options we set at create time:
 /// - `@bosun_display` — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
@@ -18,9 +24,9 @@ use crate::tmux::session::TmuxSession;
 ///
 /// All three are empty strings for non-bosun sessions and get parsed as
 /// `None` so the UI renders them only when available.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_created}\x1f#{session_activity}\x1f#{session_path}\x1f#{@bosun_display}\x1f#{@bosun_agent}\x1f#{@bosun_path}";
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}";
 
-const FIELD_SEP: char = '\x1f';
+const FIELD_SEP: &str = "|||";
 
 /// Parse the full `tmux list-sessions -F <LIST_SESSIONS_FORMAT>` output.
 /// One session per line; empty input is valid (no sessions).
@@ -119,7 +125,7 @@ mod tests {
 
     #[test]
     fn parses_single_session() {
-        let line = "main\x1f3\x1f1\x1f1712000000\x1f1712003600\x1f/home/rhuk/code";
+        let line = "main|||3|||1|||1712000000|||1712003600|||/home/rhuk/code";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
@@ -134,9 +140,9 @@ mod tests {
     #[test]
     fn parses_multiple_sessions() {
         let input = concat!(
-            "alpha\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/tmp\n",
-            "beta\x1f2\x1f1\x1f1700001000\x1f1700002000\x1f/home/rhuk\n",
-            "gamma\x1f5\x1f0\x1f1700003000\x1f1700004000\x1f\n",
+            "alpha|||1|||0|||1700000000|||1700000100|||/tmp\n",
+            "beta|||2|||1|||1700001000|||1700002000|||/home/rhuk\n",
+            "gamma|||5|||0|||1700003000|||1700004000|||\n",
         );
         let sessions = parse_list_sessions(input).unwrap();
         assert_eq!(sessions.len(), 3);
@@ -149,29 +155,32 @@ mod tests {
     }
 
     #[test]
-    fn names_with_special_chars_survive_unit_separator() {
-        let line = "work: proj | v2\x1f1\x1f1\x1f1700000000\x1f1700000100\x1f/srv";
+    fn names_with_special_chars_survive_separator() {
+        // Colons, single pipes, and spaces must all pass through —
+        // the separator is specifically `|||` (three pipes) so a
+        // lone `|` in a name doesn't trip the split.
+        let line = "work: proj | v2|||1|||1|||1700000000|||1700000100|||/srv";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions[0].name, "work: proj | v2");
     }
 
     #[test]
     fn unicode_name_preserved() {
-        let line = "日本語セッション\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/tmp";
+        let line = "日本語セッション|||1|||0|||1700000000|||1700000100|||/tmp";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions[0].name, "日本語セッション");
     }
 
     #[test]
     fn attached_client_count_treated_as_bool() {
-        let line = "multi\x1f1\x1f3\x1f1700000000\x1f1700000100\x1f/tmp";
+        let line = "multi|||1|||3|||1700000000|||1700000100|||/tmp";
         let sessions = parse_list_sessions(line).unwrap();
         assert!(sessions[0].attached);
     }
 
     #[test]
     fn empty_lines_skipped() {
-        let input = "\nalpha\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/tmp\n\n";
+        let input = "\nalpha|||1|||0|||1700000000|||1700000100|||/tmp\n\n";
         let sessions = parse_list_sessions(input).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "alpha");
@@ -179,7 +188,7 @@ mod tests {
 
     #[test]
     fn malformed_line_errors_with_line_number() {
-        let input = "alpha\x1f1\x1f0\nbroken_but_no_seps";
+        let input = "alpha|||1|||0\nbroken_but_no_seps";
         let err = parse_list_sessions(input).unwrap_err();
         let msg = format!("{}", err);
         assert!(
@@ -191,7 +200,7 @@ mod tests {
 
     #[test]
     fn missing_activity_ok_but_none() {
-        let line = "alpha\x1f1\x1f0\x1f1700000000\x1f\x1f/tmp";
+        let line = "alpha|||1|||0|||1700000000||||||/tmp";
         let sessions = parse_list_sessions(line).unwrap();
         assert!(sessions[0].created.is_some());
         assert!(sessions[0].last_activity.is_none());
@@ -199,8 +208,7 @@ mod tests {
 
     #[test]
     fn bosun_user_options_parse_when_present() {
-        let line =
-            "bosun-foo\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1ffoo\x1fclaude\x1f~/proj";
+        let line = "bosun-foo|||1|||0|||1700000000|||1700000100|||/srv|||foo|||claude|||~/proj";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions[0].display_name.as_deref(), Some("foo"));
         assert_eq!(sessions[0].agent.as_deref(), Some("claude"));
@@ -212,7 +220,7 @@ mod tests {
         // Non-bosun session: `@bosun_*` all return empty strings,
         // which we parse as None. Also covers the back-compat case
         // where `@bosun_agent`/`@bosun_path` were added later.
-        let line = "plain\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1f\x1f\x1f";
+        let line = "plain|||1|||0|||1700000000|||1700000100|||/srv|||||||||";
         let sessions = parse_list_sessions(line).unwrap();
         assert!(sessions[0].display_name.is_none());
         assert!(sessions[0].agent.is_none());
