@@ -21,10 +21,9 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::app::AppState;
+use crate::ui::Theme;
 
-const MUTED: Color = Color::Rgb(124, 132, 149);
-
-pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     // Reset every cell in the preview area to Color::Reset before drawing
     // so any leftover styling from a previous frame (e.g. the placeholder
     // text) doesn't bleed through into a later TUI capture.
@@ -33,13 +32,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let text: Text<'_> = if state.sessions.is_empty() {
         // Nothing to preview if there are no managed sessions at all.
         // Stay quiet rather than saying "capturing…" which is misleading.
-        placeholder("")
+        placeholder("", theme)
     } else {
         match state.selected_preview() {
             Some(bytes) if !bytes.is_empty() => bytes
                 .into_text()
-                .unwrap_or_else(|_| placeholder("preview: (ansi parse failed)")),
-            _ => placeholder("preview: capturing…"),
+                .unwrap_or_else(|_| placeholder("preview: (ansi parse failed)", theme)),
+            _ => placeholder("preview: capturing…", theme),
         }
     };
 
@@ -69,12 +68,12 @@ fn reset_area(buf: &mut Buffer, area: Rect) {
     }
 }
 
-fn placeholder(msg: &str) -> Text<'static> {
+fn placeholder(msg: &str, theme: &Theme) -> Text<'static> {
     Text::from(vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("  {}", msg),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme.text_muted),
         )),
     ])
 }

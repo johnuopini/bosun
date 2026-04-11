@@ -25,6 +25,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::events::{Command, SessionSpec};
+use crate::ui::Theme;
 
 /// Typed payloads a closing child modal can return to its parent
 /// via `ModalResult::CloseWithData`. Parents implement
@@ -68,7 +69,7 @@ pub trait Modal: Send {
     /// for de-duplicating repeat opens ("don't push another
     /// new_session modal if one is already on top").
     fn id(&self) -> &'static str;
-    fn render(&self, frame: &mut Frame<'_>, area: Rect);
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme);
     fn handle(&mut self, key: KeyEvent) -> ModalResult;
     /// Called when a child modal closes with data. Default: ignore.
     /// Parents that care override this and pattern-match on the
@@ -118,16 +119,16 @@ impl ModalStack {
         self.stack.last().map(|m| m.id())
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         // Dim the background, then render the top modal (plus any
         // stacked ones once we support that). Bottom-up so the top
         // modal paints last.
         if self.stack.is_empty() {
             return;
         }
-        dim_background(frame, area);
+        dim_background(frame, area, theme);
         for modal in &self.stack {
-            modal.render(frame, area);
+            modal.render(frame, area, theme);
         }
     }
 
@@ -178,8 +179,7 @@ pub enum StackDispatch {
     Emit(Command),
 }
 
-fn dim_background(frame: &mut Frame<'_>, area: Rect) {
-    use ratatui::style::Color;
+fn dim_background(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let buf = frame.buffer_mut();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -188,8 +188,8 @@ fn dim_background(frame: &mut Frame<'_>, area: Rect) {
             // with a muted gray. This preserves the underlying glyph
             // layout so the modal looks like it's floating above a
             // real UI rather than painted onto a blank rectangle.
-            cell.set_fg(Color::Rgb(60, 66, 84));
-            cell.set_bg(Color::Rgb(11, 13, 18));
+            cell.set_fg(theme.dim_fg);
+            cell.set_bg(theme.bg);
         }
     }
 }

@@ -5,22 +5,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::events::Command;
+use crate::ui::Theme;
 
 use super::{center_rect, Modal, ModalResult};
-
-const BG: Color = Color::Rgb(19, 23, 34);
-const ACCENT: Color = Color::Rgb(124, 92, 255);
-const TEXT: Color = Color::Rgb(230, 233, 239);
-const MUTED: Color = Color::Rgb(124, 132, 149);
-const FIELD_BG: Color = Color::Rgb(30, 36, 51);
-const SHADOW: Color = Color::Rgb(5, 7, 11);
-const ERROR: Color = Color::Rgb(255, 93, 107);
 
 const MODAL_WIDTH: u16 = 54;
 const MODAL_HEIGHT: u16 = 10;
@@ -84,14 +77,15 @@ impl Modal for RenameModal {
         }
     }
 
-    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
         if rect.x + rect.width < area.x + area.width && rect.y + rect.height < area.y + area.height
         {
             let shadow = Rect::new(rect.x + 1, rect.y + 1, rect.width, rect.height);
-            let style = Style::default().bg(SHADOW);
+            let style = Style::default().bg(theme.shadow);
             for y in shadow.top()..shadow.bottom() {
                 for x in shadow.left()..shadow.right() {
                     buf[(x, y)].set_style(style);
@@ -99,7 +93,7 @@ impl Modal for RenameModal {
             }
         }
 
-        let body_style = Style::default().bg(BG);
+        let body_style = Style::default().bg(body_bg);
         for y in rect.top()..rect.bottom() {
             for x in rect.left()..rect.right() {
                 let cell = &mut buf[(x, y)];
@@ -108,7 +102,7 @@ impl Modal for RenameModal {
             }
         }
 
-        let accent_style = Style::default().bg(ACCENT);
+        let accent_style = Style::default().bg(theme.accent);
         for y in rect.top()..rect.bottom() {
             let cell = &mut buf[(rect.left(), y)];
             cell.set_char(' ');
@@ -123,8 +117,8 @@ impl Modal for RenameModal {
         );
 
         let title_style = Style::default()
-            .fg(TEXT)
-            .bg(BG)
+            .fg(theme.text)
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD);
 
         let field_width = (inner.width as usize).saturating_sub(2);
@@ -138,20 +132,20 @@ impl Modal for RenameModal {
                 Span::styled("Rename session", title_style),
                 Span::styled(
                     "     esc · cancel     enter · save",
-                    Style::default().fg(MUTED).bg(BG),
+                    Style::default().fg(theme.text_muted).bg(body_bg),
                 ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 " new display name",
                 Style::default()
-                    .fg(ACCENT)
-                    .bg(BG)
+                    .fg(theme.accent)
+                    .bg(body_bg)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 value_padded,
-                Style::default().fg(TEXT).bg(FIELD_BG),
+                Style::default().fg(theme.text).bg(theme.selection_bg),
             )),
         ];
 
@@ -159,12 +153,12 @@ impl Modal for RenameModal {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(" ! {}", e),
-                Style::default().fg(ERROR).bg(BG),
+                Style::default().fg(theme.status_error).bg(body_bg),
             )));
         }
 
         Paragraph::new(lines)
-            .style(Style::default().bg(BG))
+            .style(Style::default().bg(body_bg))
             .render(inner, frame.buffer_mut());
     }
 }

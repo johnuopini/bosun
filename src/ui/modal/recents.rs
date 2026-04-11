@@ -8,25 +8,16 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::events::Command;
 use crate::store::Recent;
+use crate::ui::Theme;
 
 use super::{center_rect, Modal, ModalData, ModalResult};
-
-// --- Visual tokens ---------------------------------------------------
-
-const BG: Color = Color::Rgb(19, 23, 34);
-const ACCENT: Color = Color::Rgb(124, 92, 255);
-const TEXT: Color = Color::Rgb(230, 233, 239);
-const MUTED: Color = Color::Rgb(124, 132, 149);
-const FIELD_BG: Color = Color::Rgb(11, 13, 18);
-const SELECTION_BG: Color = Color::Rgb(30, 36, 51);
-const SHADOW: Color = Color::Rgb(5, 7, 11);
 
 const MODAL_WIDTH: u16 = 74;
 const MODAL_HEIGHT: u16 = 18;
@@ -152,15 +143,16 @@ impl Modal for RecentsModal {
         }
     }
 
-    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
         // Shadow behind the modal.
         if rect.x + rect.width < area.x + area.width && rect.y + rect.height < area.y + area.height
         {
             let shadow = Rect::new(rect.x + 1, rect.y + 1, rect.width, rect.height);
-            let style = Style::default().bg(SHADOW);
+            let style = Style::default().bg(theme.shadow);
             for y in shadow.top()..shadow.bottom() {
                 for x in shadow.left()..shadow.right() {
                     buf[(x, y)].set_style(style);
@@ -169,7 +161,7 @@ impl Modal for RecentsModal {
         }
 
         // Body fill.
-        let body_style = Style::default().bg(BG);
+        let body_style = Style::default().bg(body_bg);
         for y in rect.top()..rect.bottom() {
             for x in rect.left()..rect.right() {
                 let cell = &mut buf[(x, y)];
@@ -179,7 +171,7 @@ impl Modal for RecentsModal {
         }
 
         // Left accent bar.
-        let accent_style = Style::default().bg(ACCENT);
+        let accent_style = Style::default().bg(theme.accent);
         for y in rect.top()..rect.bottom() {
             let cell = &mut buf[(rect.left(), y)];
             cell.set_char(' ');
@@ -200,13 +192,13 @@ impl Modal for RecentsModal {
             Span::styled(
                 "Recent sessions",
                 Style::default()
-                    .fg(TEXT)
-                    .bg(BG)
+                    .fg(theme.text)
+                    .bg(body_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "   esc · ↑↓ select · ↵ pick · ^d delete",
-                Style::default().fg(MUTED).bg(BG),
+                Style::default().fg(theme.text_muted).bg(body_bg),
             ),
         ]));
         lines.push(Line::from(""));
@@ -215,7 +207,7 @@ impl Modal for RecentsModal {
         let filter_display = format!(" filter: {}▎", self.filter);
         lines.push(Line::from(vec![Span::styled(
             filter_display,
-            Style::default().fg(TEXT).bg(FIELD_BG),
+            Style::default().fg(theme.text).bg(theme.bg),
         )]));
         lines.push(Line::from(""));
 
@@ -224,22 +216,22 @@ impl Modal for RecentsModal {
         if self.recents.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (no recent sessions yet — create some first)",
-                Style::default().fg(MUTED).bg(BG),
+                Style::default().fg(theme.text_muted).bg(body_bg),
             )));
         } else if filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (no matches)",
-                Style::default().fg(MUTED).bg(BG),
+                Style::default().fg(theme.text_muted).bg(body_bg),
             )));
         } else {
             for (vi, rec_idx) in filtered.iter().enumerate().take(max_rows) {
                 let r = &self.recents[*rec_idx];
-                lines.push(render_row(r, vi == self.selected, inner.width));
+                lines.push(render_row(r, vi == self.selected, inner.width, theme));
             }
         }
 
         Paragraph::new(lines)
-            .style(Style::default().bg(BG))
+            .style(Style::default().bg(body_bg))
             .render(inner, frame.buffer_mut());
     }
 }
@@ -250,24 +242,28 @@ fn row_matches(r: &Recent, needle: &str) -> bool {
         || r.path.to_lowercase().contains(needle)
 }
 
-fn render_row(r: &Recent, selected: bool, width: u16) -> Line<'static> {
+fn render_row(r: &Recent, selected: bool, width: u16, theme: &Theme) -> Line<'static> {
     let marker = if selected { "▸" } else { " " };
-    let row_bg = if selected { SELECTION_BG } else { BG };
+    let row_bg = if selected {
+        theme.selection_bg
+    } else {
+        theme.panel_alt
+    };
 
     let marker_style = if selected {
-        Style::default().fg(ACCENT).bg(row_bg)
+        Style::default().fg(theme.accent).bg(row_bg)
     } else {
         Style::default().fg(row_bg).bg(row_bg)
     };
     let name_style = if selected {
         Style::default()
-            .fg(TEXT)
+            .fg(theme.text)
             .bg(row_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(TEXT).bg(row_bg)
+        Style::default().fg(theme.text).bg(row_bg)
     };
-    let meta_style = Style::default().fg(MUTED).bg(row_bg);
+    let meta_style = Style::default().fg(theme.text_muted).bg(row_bg);
 
     let path_short = shorten_path(&r.path);
     let label = format!(" {} {} · {} · {}", marker, r.name, r.agent, path_short);

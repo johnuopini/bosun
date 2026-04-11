@@ -9,6 +9,7 @@ use bosun::app::AppState;
 use bosun::tmux::detector::Status;
 use bosun::tmux::session::SessionView;
 use bosun::tmux::TmuxSession;
+use bosun::ui::Theme;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -35,7 +36,10 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
 fn render(state: &AppState, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| bosun::ui::draw(f, state)).unwrap();
+    let theme = Theme::default_opencode();
+    terminal
+        .draw(|f| bosun::ui::draw(f, state, &theme))
+        .unwrap();
     // TestBackend exposes a Buffer; dump the visible characters.
     let buf = terminal.backend().buffer();
     let mut out = String::new();

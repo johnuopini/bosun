@@ -24,6 +24,7 @@ use crate::ui::modal::confirm::ConfirmModal;
 use crate::ui::modal::new_session::NewSessionModal;
 use crate::ui::modal::rename::RenameModal;
 use crate::ui::modal::{ModalStack, StackDispatch};
+use crate::ui::Theme;
 
 fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
@@ -255,6 +256,9 @@ pub struct App {
     pub evt_tx: mpsc::Sender<AppMsg>,
     pub socket: Option<String>,
     pub store: Arc<Store>,
+    /// Active theme. Resolved once at startup from the config's
+    /// theme name; render code reads it via `ui::draw`.
+    pub theme: Theme,
     /// Handle to the running input actor. Held here so we can stop it
     /// before handing stdin to tmux during an attach — otherwise the
     /// actor's crossterm reader races tmux for each stdin byte, and
@@ -272,6 +276,8 @@ impl App {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<AppMsg>(256);
+
+        let theme = Theme::load(&config.theme, crate::config::user_themes_dir().as_deref());
 
         tmux_actor::spawn(
             client.clone(),
@@ -291,6 +297,7 @@ impl App {
             evt_tx,
             socket,
             store,
+            theme,
             input_handle: Some(input_handle),
         }
     }
@@ -303,7 +310,7 @@ impl App {
         let _ = self.cmd_tx.send(Command::ListNow).await;
 
         terminal
-            .draw(|f| ui::draw(f, &self.state))
+            .draw(|f| ui::draw(f, &self.state, &self.theme))
             .map_err(term_err)?;
 
         while !self.state.quit {
@@ -353,7 +360,7 @@ impl App {
             }
 
             terminal
-                .draw(|f| ui::draw(f, &self.state))
+                .draw(|f| ui::draw(f, &self.state, &self.theme))
                 .map_err(term_err)?;
         }
 

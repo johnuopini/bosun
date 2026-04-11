@@ -3,21 +3,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::events::Command;
+use crate::ui::Theme;
 
 use super::{center_rect, Modal, ModalResult};
-
-const BG: Color = Color::Rgb(19, 23, 34);
-const ACCENT: Color = Color::Rgb(124, 92, 255);
-const TEXT: Color = Color::Rgb(230, 233, 239);
-const MUTED: Color = Color::Rgb(124, 132, 149);
-const DANGER: Color = Color::Rgb(255, 93, 107);
-const SHADOW: Color = Color::Rgb(5, 7, 11);
 
 const MODAL_WIDTH: u16 = 54;
 const MODAL_HEIGHT: u16 = 9;
@@ -67,14 +61,15 @@ impl Modal for ConfirmModal {
         }
     }
 
-    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
         if rect.x + rect.width < area.x + area.width && rect.y + rect.height < area.y + area.height
         {
             let shadow = Rect::new(rect.x + 1, rect.y + 1, rect.width, rect.height);
-            let style = Style::default().bg(SHADOW);
+            let style = Style::default().bg(theme.shadow);
             for y in shadow.top()..shadow.bottom() {
                 for x in shadow.left()..shadow.right() {
                     buf[(x, y)].set_style(style);
@@ -82,7 +77,7 @@ impl Modal for ConfirmModal {
             }
         }
 
-        let body_style = Style::default().bg(BG);
+        let body_style = Style::default().bg(body_bg);
         for y in rect.top()..rect.bottom() {
             for x in rect.left()..rect.right() {
                 let cell = &mut buf[(x, y)];
@@ -91,7 +86,11 @@ impl Modal for ConfirmModal {
             }
         }
 
-        let accent_color = if self.destructive { DANGER } else { ACCENT };
+        let accent_color = if self.destructive {
+            theme.status_error
+        } else {
+            theme.accent
+        };
         let accent_style = Style::default().bg(accent_color);
         for y in rect.top()..rect.bottom() {
             let cell = &mut buf[(rect.left(), y)];
@@ -107,8 +106,12 @@ impl Modal for ConfirmModal {
         );
 
         let title_style = Style::default()
-            .fg(if self.destructive { DANGER } else { TEXT })
-            .bg(BG)
+            .fg(if self.destructive {
+                theme.status_error
+            } else {
+                theme.text
+            })
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD);
 
         let lines: Vec<Line<'static>> = vec![
@@ -116,17 +119,17 @@ impl Modal for ConfirmModal {
             Line::from(""),
             Line::from(Span::styled(
                 self.message.clone(),
-                Style::default().fg(TEXT).bg(BG),
+                Style::default().fg(theme.text).bg(body_bg),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 " enter / y · confirm      esc / n · cancel",
-                Style::default().fg(MUTED).bg(BG),
+                Style::default().fg(theme.text_muted).bg(body_bg),
             )),
         ];
 
         Paragraph::new(lines)
-            .style(Style::default().bg(BG))
+            .style(Style::default().bg(body_bg))
             .render(inner, frame.buffer_mut());
     }
 }

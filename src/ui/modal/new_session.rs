@@ -8,7 +8,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
@@ -17,20 +17,10 @@ use crate::events::{
     ClaudeOptions, ClaudeSessionMode, CodexOptions, Command, SessionSpec, SpecOptions,
 };
 use crate::store::Recent;
+use crate::ui::Theme;
 
 use super::recents::RecentsModal;
 use super::{center_rect, Modal, ModalData, ModalResult};
-
-// --- Visual tokens (will move to theme in Phase 4) -------------------
-
-const BG: Color = Color::Rgb(19, 23, 34);
-const ACCENT: Color = Color::Rgb(124, 92, 255);
-const TEXT: Color = Color::Rgb(230, 233, 239);
-const MUTED: Color = Color::Rgb(124, 132, 149);
-const FIELD_BG: Color = Color::Rgb(11, 13, 18);
-const FIELD_BG_FOCUS: Color = Color::Rgb(30, 36, 51);
-const ERROR: Color = Color::Rgb(255, 93, 107);
-const SHADOW: Color = Color::Rgb(5, 7, 11);
 
 const MODAL_WIDTH: u16 = 64;
 // Sized for the largest agent (claude with all options visible) plus
@@ -444,15 +434,16 @@ impl Modal for NewSessionModal {
         self.fill_from_spec(spec);
     }
 
-    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
         // Drop shadow: 1 row below + 1 col right in near-black.
         if rect.x + rect.width < area.x + area.width && rect.y + rect.height < area.y + area.height
         {
             let shadow = Rect::new(rect.x + 1, rect.y + 1, rect.width, rect.height);
-            let style = Style::default().bg(SHADOW);
+            let style = Style::default().bg(theme.shadow);
             for y in shadow.top()..shadow.bottom() {
                 for x in shadow.left()..shadow.right() {
                     let cell = &mut buf[(x, y)];
@@ -462,7 +453,7 @@ impl Modal for NewSessionModal {
         }
 
         // Modal body: solid panel fill.
-        let body_style = Style::default().bg(BG);
+        let body_style = Style::default().bg(body_bg);
         for y in rect.top()..rect.bottom() {
             for x in rect.left()..rect.right() {
                 let cell = &mut buf[(x, y)];
@@ -472,7 +463,7 @@ impl Modal for NewSessionModal {
         }
 
         // Left accent bar — 1 col wide, full height.
-        let accent_style = Style::default().bg(ACCENT);
+        let accent_style = Style::default().bg(theme.accent);
         for y in rect.top()..rect.bottom() {
             let cell = &mut buf[(rect.left(), y)];
             cell.set_char(' ');
@@ -492,21 +483,21 @@ impl Modal for NewSessionModal {
                 Span::styled(
                     "New session",
                     Style::default()
-                        .fg(TEXT)
-                        .bg(BG)
+                        .fg(theme.text)
+                        .bg(body_bg)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     "    tab next · ^r recents · esc cancel · enter create",
-                    Style::default().fg(MUTED).bg(BG),
+                    Style::default().fg(theme.text_muted).bg(body_bg),
                 ),
             ]),
             Line::from(""),
-            label_line("name", self.field == Field::Name),
-            input_line(&self.name, self.field == Field::Name, inner.width),
+            label_line("name", self.field == Field::Name, theme),
+            input_line(&self.name, self.field == Field::Name, inner.width, theme),
             Line::from(""),
-            label_line("path", self.field == Field::Path),
-            input_line(&self.path, self.field == Field::Path, inner.width),
+            label_line("path", self.field == Field::Path, theme),
+            input_line(&self.path, self.field == Field::Path, inner.width, theme),
         ];
 
         // Filesystem dropdown — visible when the Path field is
@@ -515,41 +506,44 @@ impl Modal for NewSessionModal {
             let suggestions = self.path_suggestions();
             for (i, entry) in suggestions.iter().enumerate() {
                 let highlighted = self.path_suggestion_idx == Some(i);
-                lines.push(path_suggestion_line(entry, highlighted, inner.width));
+                lines.push(path_suggestion_line(entry, highlighted, inner.width, theme));
             }
         }
 
         lines.extend([
             Line::from(""),
-            label_line("agent", self.field == Field::Agent),
-            agent_line(self.agent_idx, self.field == Field::Agent),
+            label_line("agent", self.field == Field::Agent, theme),
+            agent_line(self.agent_idx, self.field == Field::Agent, theme),
             Line::from(""),
-            label_line("args (optional)", self.field == Field::Args),
-            input_line(&self.args, self.field == Field::Args, inner.width),
+            label_line("args (optional)", self.field == Field::Args, theme),
+            input_line(&self.args, self.field == Field::Args, inner.width, theme),
         ]);
 
         // Agent-specific options section.
         match self.agent() {
             "claude" => {
                 lines.push(Line::from(""));
-                lines.push(section_header("— Claude options —"));
+                lines.push(section_header("— Claude options —", theme));
                 lines.push(session_radio_line(
                     self.claude.session_mode,
                     self.field == Field::ClaudeSession,
+                    theme,
                 ));
                 lines.push(checkbox_line(
                     "Skip permissions (--dangerously-skip-permissions)",
                     self.claude.skip_permissions,
                     self.field == Field::ClaudeSkipPerm,
+                    theme,
                 ));
             }
             "codex" => {
                 lines.push(Line::from(""));
-                lines.push(section_header("— Codex options —"));
+                lines.push(section_header("— Codex options —", theme));
                 lines.push(checkbox_line(
                     "YOLO mode (--yolo · bypass approvals & sandbox)",
                     self.codex.yolo,
                     self.field == Field::CodexYolo,
+                    theme,
                 ));
             }
             _ => {}
@@ -559,25 +553,25 @@ impl Modal for NewSessionModal {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("  ! {}", e),
-                Style::default().fg(ERROR).bg(BG),
+                Style::default().fg(theme.status_error).bg(body_bg),
             )));
         }
 
         Paragraph::new(lines)
-            .style(Style::default().bg(BG))
+            .style(Style::default().bg(body_bg))
             .render(inner, frame.buffer_mut());
     }
 }
 
-fn label_line(label: &str, focused: bool) -> Line<'static> {
+fn label_line(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
     let marker = if focused { "▸" } else { " " };
     let label_style = if focused {
         Style::default()
-            .fg(ACCENT)
-            .bg(BG)
+            .fg(theme.accent)
+            .bg(theme.panel_alt)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        Style::default().fg(theme.text_muted).bg(theme.panel_alt)
     };
     Line::from(vec![
         Span::styled(format!(" {} ", marker), label_style),
@@ -588,13 +582,22 @@ fn label_line(label: &str, focused: bool) -> Line<'static> {
 /// One row in the filesystem dropdown. Directories get a trailing
 /// slash so they're visually distinct from files. Highlighted rows
 /// get the accent background and a ▸ marker.
-fn path_suggestion_line(entry: &PathEntry, highlighted: bool, width: u16) -> Line<'static> {
+fn path_suggestion_line(
+    entry: &PathEntry,
+    highlighted: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
     let bg = if highlighted {
-        FIELD_BG_FOCUS
+        theme.selection_bg
     } else {
-        FIELD_BG
+        theme.bg
     };
-    let fg = if highlighted { TEXT } else { MUTED };
+    let fg = if highlighted {
+        theme.text
+    } else {
+        theme.text_muted
+    };
     let marker = if highlighted { "▸" } else { " " };
     let suffix = if entry.is_dir { "/" } else { "" };
 
@@ -606,7 +609,7 @@ fn path_suggestion_line(entry: &PathEntry, highlighted: bool, width: u16) -> Lin
     }
 
     Line::from(vec![
-        Span::styled("   ", Style::default().bg(BG)),
+        Span::styled("   ", Style::default().bg(theme.panel_alt)),
         Span::styled(padded, Style::default().fg(fg).bg(bg)),
     ])
 }
@@ -701,9 +704,13 @@ fn longest_common_prefix(strs: &[&str]) -> String {
     prefix.into_iter().collect()
 }
 
-fn input_line(value: &str, focused: bool, width: u16) -> Line<'static> {
-    let bg = if focused { FIELD_BG_FOCUS } else { FIELD_BG };
-    let fg = if value.is_empty() { MUTED } else { TEXT };
+fn input_line(value: &str, focused: bool, width: u16, theme: &Theme) -> Line<'static> {
+    let bg = if focused { theme.selection_bg } else { theme.bg };
+    let fg = if value.is_empty() {
+        theme.text_muted
+    } else {
+        theme.text
+    };
     let cursor = if focused { "│" } else { "" };
     let content = format!(" {}{} ", value, cursor);
     // Pad content to field width so the bg extends cleanly.
@@ -718,70 +725,72 @@ fn input_line(value: &str, focused: bool, width: u16) -> Line<'static> {
         content
     };
     Line::from(vec![
-        Span::styled("   ", Style::default().bg(BG)),
+        Span::styled("   ", Style::default().bg(theme.panel_alt)),
         Span::styled(padded, Style::default().fg(fg).bg(bg)),
     ])
 }
 
-fn section_header(text: &str) -> Line<'static> {
+fn section_header(text: &str, theme: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled("   ", Style::default().bg(BG)),
+        Span::styled("   ", Style::default().bg(theme.panel_alt)),
         Span::styled(
             text.to_string(),
             Style::default()
-                .fg(MUTED)
-                .bg(BG)
+                .fg(theme.text_muted)
+                .bg(theme.panel_alt)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
 }
 
-fn checkbox_line(label: &str, checked: bool, focused: bool) -> Line<'static> {
+fn checkbox_line(label: &str, checked: bool, focused: bool, theme: &Theme) -> Line<'static> {
+    let body_bg = theme.panel_alt;
     let marker = if focused { "▸" } else { " " };
     let box_glyph = if checked { "[x]" } else { "[ ]" };
     let label_style = if focused {
         Style::default()
-            .fg(ACCENT)
-            .bg(BG)
+            .fg(theme.accent)
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD)
     } else if checked {
-        Style::default().fg(TEXT).bg(BG)
+        Style::default().fg(theme.text).bg(body_bg)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        Style::default().fg(theme.text_muted).bg(body_bg)
     };
     let box_style = if checked {
         Style::default()
-            .fg(ACCENT)
-            .bg(BG)
+            .fg(theme.accent)
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        Style::default().fg(theme.text_muted).bg(body_bg)
     };
     Line::from(vec![
         Span::styled(format!(" {} ", marker), label_style),
         Span::styled(box_glyph.to_string(), box_style),
-        Span::styled(" ", Style::default().bg(BG)),
+        Span::styled(" ", Style::default().bg(body_bg)),
         Span::styled(label.to_string(), label_style),
     ])
 }
 
-fn session_radio_line(mode: ClaudeSessionMode, focused: bool) -> Line<'static> {
+fn session_radio_line(mode: ClaudeSessionMode, focused: bool, theme: &Theme) -> Line<'static> {
+    let body_bg = theme.panel_alt;
     let marker = if focused { "▸" } else { " " };
     let marker_style = if focused {
         Style::default()
-            .fg(ACCENT)
-            .bg(BG)
+            .fg(theme.accent)
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        Style::default().fg(theme.text_muted).bg(body_bg)
     };
     let label_style = if focused {
         Style::default()
-            .fg(ACCENT)
-            .bg(BG)
+            .fg(theme.accent)
+            .bg(body_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        Style::default().fg(theme.text_muted).bg(body_bg)
     };
 
     let mut spans: Vec<Span<'static>> = vec![
@@ -797,45 +806,46 @@ fn session_radio_line(mode: ClaudeSessionMode, focused: bool) -> Line<'static> {
         let (dot, val_style) = if selected {
             let style = if focused {
                 Style::default()
-                    .fg(ACCENT)
-                    .bg(BG)
+                    .fg(theme.accent)
+                    .bg(body_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(TEXT)
-                    .bg(BG)
+                    .fg(theme.text)
+                    .bg(body_bg)
                     .add_modifier(Modifier::BOLD)
             };
             ("(•)", style)
         } else {
-            ("( )", Style::default().fg(MUTED).bg(BG))
+            ("( )", Style::default().fg(theme.text_muted).bg(body_bg))
         };
         spans.push(Span::styled(format!(" {} ", dot), val_style));
         spans.push(Span::styled(option.label().to_string(), val_style));
-        spans.push(Span::styled(" ", Style::default().bg(BG)));
+        spans.push(Span::styled(" ", Style::default().bg(body_bg)));
     }
     Line::from(spans)
 }
 
-fn agent_line(selected: usize, focused: bool) -> Line<'static> {
+fn agent_line(selected: usize, focused: bool, theme: &Theme) -> Line<'static> {
+    let body_bg = theme.panel_alt;
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled("   ", Style::default().bg(BG)));
+    spans.push(Span::styled("   ", Style::default().bg(body_bg)));
     for (i, agent) in AGENTS.iter().enumerate() {
         let style = if i == selected && focused {
             Style::default()
-                .fg(Color::Rgb(11, 13, 18))
-                .bg(ACCENT)
+                .fg(theme.bg)
+                .bg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else if i == selected {
             Style::default()
-                .fg(ACCENT)
-                .bg(BG)
+                .fg(theme.accent)
+                .bg(body_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(MUTED).bg(BG)
+            Style::default().fg(theme.text_muted).bg(body_bg)
         };
         spans.push(Span::styled(format!(" {} ", agent), style));
-        spans.push(Span::styled(" ", Style::default().bg(BG)));
+        spans.push(Span::styled(" ", Style::default().bg(body_bg)));
     }
     Line::from(spans)
 }
