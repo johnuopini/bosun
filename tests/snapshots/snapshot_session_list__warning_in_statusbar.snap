@@ -3,7 +3,7 @@ source: tests/snapshot_session_list.rs
 expression: frame
 ---
  ▌ ○  alpha  1w                                                                 
-       claude · ~/work          preview: capturing…                             
+       claude · /tmp/work       preview: capturing…                             
                                                                                 
                                                                                 
                                                                                 

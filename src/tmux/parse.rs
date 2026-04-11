@@ -30,10 +30,13 @@ pub fn parse_list_sessions(input: &str) -> Result<Vec<TmuxSession>> {
         if line.trim().is_empty() {
             continue;
         }
-        out.push(
-            parse_session_line(line)
-                .map_err(|e| BosunError::Parse(format!("line {}: {}", idx + 1, e)))?,
-        );
+        out.push(parse_session_line(line).map_err(|e| {
+            // Include the raw line (with control chars debug-escaped so
+            // the ASCII-31 `\x1f` separators are visible) in the error —
+            // when this fires on CI the message tells us exactly what
+            // tmux output instead of leaving us guessing.
+            BosunError::Parse(format!("line {}: {} — raw: {:?}", idx + 1, e, line))
+        })?);
     }
     Ok(out)
 }
