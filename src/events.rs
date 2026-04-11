@@ -100,8 +100,15 @@ pub enum AppMsg {
     /// Terminal was resized.
     Resize(u16, u16),
     /// Fresh session list from tmux, with smoothed status and optional
-    /// preview buffer per entry.
-    SessionsRefreshed(Vec<SessionView>),
+    /// preview buffer per entry. `select_after` carries an internal
+    /// session name that the app should jump the selection to — set
+    /// when this refresh is the result of a create (so the new session
+    /// auto-highlights). `None` for regular tick-driven refreshes,
+    /// where the app preserves its existing selection.
+    SessionsRefreshed {
+        sessions: Vec<SessionView>,
+        select_after: Option<String>,
+    },
     /// An attach just started — the UI should render a placeholder
     /// while we block in `tmux attach`.
     AttachStarted { name: String },

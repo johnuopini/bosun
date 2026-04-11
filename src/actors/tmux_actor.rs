@@ -99,7 +99,14 @@ pub fn spawn(
                                 last_bar_state = state;
                             }
 
-                            if evt_tx.send(AppMsg::SessionsRefreshed(views)).await.is_err() {
+                            if evt_tx
+                                .send(AppMsg::SessionsRefreshed {
+                                    sessions: views,
+                                    select_after: None,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -120,20 +127,14 @@ pub fn spawn(
                 Command::CreateSession(spec) => {
                     match create_session(&*client, &config, spec).await {
                         Ok(internal_name) => {
-                            focused = Some(internal_name);
-                            // Force an immediate refresh so the new session
-                            // pops into the list without waiting for the
-                            // next tick.
+                            focused = Some(internal_name.clone());
                             let _ = evt_tx
-                                .send(AppMsg::Warn(format!(
-                                    "created {}",
-                                    focused.as_deref().unwrap_or("")
-                                )))
+                                .send(AppMsg::Warn(format!("created {}", internal_name)))
                                 .await;
-                            // Re-enter the loop head; the app loop will
-                            // issue a ListNow on the next tick, and our
-                            // own debounced refresh handling takes it from
-                            // there. To avoid a 1s delay, kick one now:
+                            // Force an immediate refresh so the new
+                            // session pops into the list without waiting
+                            // for the next tick, and tell the app to
+                            // jump its selection onto the new one.
                             let _ = do_refresh(
                                 &*client,
                                 &config,
@@ -144,6 +145,7 @@ pub fn spawn(
                                 &mut last_bar_state,
                                 &mut globals,
                                 &evt_tx,
+                                Some(internal_name),
                             )
                             .await;
                         }
@@ -282,6 +284,7 @@ async fn do_refresh(
     last_bar_state: &mut Vec<BarSession>,
     globals: &mut GlobalsGuard,
     evt_tx: &mpsc::Sender<AppMsg>,
+    select_after: Option<String>,
 ) -> crate::error::Result<()> {
     let views = refresh_all(client, config, registry, smoothers, focused).await?;
     smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
@@ -299,7 +302,12 @@ async fn do_refresh(
         *last_bar_state = state;
     }
 
-    let _ = evt_tx.send(AppMsg::SessionsRefreshed(views)).await;
+    let _ = evt_tx
+        .send(AppMsg::SessionsRefreshed {
+            sessions: views,
+            select_after,
+        })
+        .await;
     Ok(())
 }
 

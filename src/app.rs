@@ -61,14 +61,24 @@ impl AppState {
             AppMsg::Tick(_) => {
                 out.push(Command::ListNow);
             }
-            AppMsg::SessionsRefreshed(sessions) => {
-                // Preserve selection by name across refreshes.
+            AppMsg::SessionsRefreshed {
+                sessions,
+                select_after,
+            } => {
+                // Preserve selection by name across refreshes — unless
+                // `select_after` is Some, in which case the refresh was
+                // triggered by a create and the app should jump to the
+                // newly-created session.
                 let prior_name = self
                     .sessions
                     .get(self.selected)
                     .map(|v| v.name().to_string());
                 self.sessions = sessions;
-                if let Some(name) = prior_name {
+                if let Some(target) = select_after {
+                    if let Some(idx) = self.sessions.iter().position(|v| v.name() == target) {
+                        self.selected = idx;
+                    }
+                } else if let Some(name) = prior_name {
                     if let Some(idx) = self.sessions.iter().position(|v| v.name() == name) {
                         self.selected = idx;
                     }
@@ -339,22 +349,36 @@ mod tests {
         }
     }
 
+    fn refreshed(sessions: Vec<SessionView>) -> AppMsg {
+        AppMsg::SessionsRefreshed {
+            sessions,
+            select_after: None,
+        }
+    }
+
     #[test]
     fn selection_clamps_after_refresh() {
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 2);
-        s.apply(AppMsg::SessionsRefreshed(vec![ses("a")]));
+        s.apply(refreshed(vec![ses("a")]));
         assert_eq!(s.selected, 0);
     }
 
     #[test]
     fn selection_preserved_by_name() {
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 1);
-        s.apply(AppMsg::SessionsRefreshed(vec![
-            ses("c"),
-            ses("b"),
-            ses("a"),
-        ]));
+        s.apply(refreshed(vec![ses("c"), ses("b"), ses("a")]));
         assert_eq!(s.selected, 1); // still "b"
+        assert_eq!(s.sessions[s.selected].name(), "b");
+    }
+
+    #[test]
+    fn select_after_jumps_to_new_session() {
+        let mut s = state_with(vec![ses("a")], 0);
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("a"), ses("b")],
+            select_after: Some("b".to_string()),
+        });
+        assert_eq!(s.selected, 1);
         assert_eq!(s.sessions[s.selected].name(), "b");
     }
 

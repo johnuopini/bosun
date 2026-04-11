@@ -1,10 +1,10 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 54
+assertion_line: 55
 expression: frame
 ---
                                                                                 
-  no tmux sessions              preview: capturing…                             
+  no tmux sessions                                                              
   (press r to refresh)                                                          
                                                                                 
                                                                                 

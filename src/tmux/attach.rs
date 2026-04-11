@@ -75,11 +75,17 @@ pub fn install_detach_key_for_test(socket: Option<&str>) -> Result<AttachGuard> 
 fn install_detach_key(socket: Option<&str>) -> Result<AttachGuard> {
     // Bind Ctrl-Q at the root key table. `-T root` bindings fire before any
     // prefix, so we catch Ctrl-Q regardless of user's prefix key.
-    let status = sync_tmux(socket, ["bind-key", "-T", "root", "C-q", "detach-client"])
-        .status()
+    // Use output() (not status()) so any error text is captured instead
+    // of bleeding into the user's terminal.
+    let out = sync_tmux(socket, ["bind-key", "-T", "root", "C-q", "detach-client"])
+        .output()
         .map_err(BosunError::Io)?;
-    if !status.success() {
-        return Err(BosunError::Tmux(format!("bind-key failed: {}", status)));
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(BosunError::Tmux(format!(
+            "bind-key failed: {}",
+            stderr.trim()
+        )));
     }
 
     Ok(AttachGuard {
@@ -102,23 +108,28 @@ fn run_attach(socket: Option<&str>, name: &str) -> Result<()> {
 }
 
 fn unbind_detach_key(socket: Option<&str>) -> Result<()> {
-    let status = sync_tmux(socket, ["unbind-key", "-T", "root", "C-q"])
-        .status()
+    // Capture output so "no server running" errors from a killed
+    // server don't leak into bosun's TUI.
+    let out = sync_tmux(socket, ["unbind-key", "-T", "root", "C-q"])
+        .output()
         .map_err(BosunError::Io)?;
-    if !status.success() {
-        // Not fatal — the binding might already be cleared.
-        tracing::warn!("unbind-key C-q returned {}", status);
+    if !out.status.success() {
+        // Not fatal — the binding might already be cleared, or the
+        // whole server is gone. Log to tracing only.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!("unbind-key C-q: {}", stderr.trim());
     }
     Ok(())
 }
 
 /// Panic-safe cleanup: call this from a `std::panic::set_hook` to make sure
 /// we don't leave a dangling `C-q` binding if Bosun crashes mid-attach.
+/// Uses `output()` so any error text is captured instead of spilled.
 pub fn emergency_unbind(socket: Option<&str>) {
     let _ = Command::new("tmux")
         .args(match socket {
             Some(s) => vec!["-L", s, "unbind-key", "-T", "root", "C-q"],
             None => vec!["unbind-key", "-T", "root", "C-q"],
         })
-        .status();
+        .output();
 }

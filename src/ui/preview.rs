@@ -30,11 +30,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     // text) doesn't bleed through into a later TUI capture.
     reset_area(frame.buffer_mut(), area);
 
-    let text: Text<'_> = match state.selected_preview() {
-        Some(bytes) if !bytes.is_empty() => bytes
-            .into_text()
-            .unwrap_or_else(|_| placeholder("preview: (ansi parse failed)")),
-        _ => placeholder("preview: capturing…"),
+    let text: Text<'_> = if state.sessions.is_empty() {
+        // Nothing to preview if there are no managed sessions at all.
+        // Stay quiet rather than saying "capturing…" which is misleading.
+        placeholder("")
+    } else {
+        match state.selected_preview() {
+            Some(bytes) if !bytes.is_empty() => bytes
+                .into_text()
+                .unwrap_or_else(|_| placeholder("preview: (ansi parse failed)")),
+            _ => placeholder("preview: capturing…"),
+        }
     };
 
     // Scroll so the bottom of the captured pane aligns with the bottom

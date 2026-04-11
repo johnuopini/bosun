@@ -208,12 +208,20 @@ fn show_option(socket: Option<&str>, opt: &str) -> String {
     }
 }
 
+/// Run a tmux command quietly — capture stdout/stderr so they don't
+/// bleed into bosun's alt-screen TUI. This is called continuously
+/// from the actor on every refresh; if the tmux server dies mid-run
+/// (last session exited), subsequent calls fail with "no server
+/// running..." on stderr, and we really don't want that text painted
+/// over the UI.
 fn run(socket: Option<&str>, args: &[&str]) -> Result<()> {
-    let status = sync_tmux(socket, args).status().map_err(BosunError::Io)?;
-    if !status.success() {
+    let output = sync_tmux(socket, args).output().map_err(BosunError::Io)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BosunError::Tmux(format!(
             "tmux {:?} failed: {}",
-            args, status
+            args,
+            stderr.trim()
         )));
     }
     Ok(())
