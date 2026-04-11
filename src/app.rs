@@ -278,7 +278,7 @@ pub struct App {
     /// actor's crossterm reader races tmux for each stdin byte, and
     /// the user ends up needing to press Ctrl-Q twice because the
     /// first press is read by Bosun and silently dropped.
-    input_handle: Option<tokio::task::JoinHandle<()>>,
+    input_handle: Option<input_actor::Handle>,
 }
 
 impl App {
@@ -382,9 +382,13 @@ impl App {
                 // Stop the input actor so tmux has stdin to itself. Without
                 // this, Bosun's crossterm reader and tmux race for each key
                 // byte and the user has to press Ctrl-Q twice to detach.
+                // `shutdown().await` sets an atomic flag and waits for the
+                // blocking reader task to notice on its next ~100ms poll
+                // cycle — no tokio cancellation involved, so there's no
+                // way for the reader thread to end up stranded on a
+                // stuck channel (the freeze that prompted this rewrite).
                 if let Some(h) = self.input_handle.take() {
-                    h.abort();
-                    let _ = h.await;
+                    h.shutdown().await;
                 }
 
                 let attach_result = self.perform_attach(terminal, &name);
