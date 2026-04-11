@@ -22,6 +22,16 @@ pub struct TmuxSession {
     pub created: Option<SystemTime>,
     pub last_activity: Option<SystemTime>,
     pub current_path: Option<String>,
+    /// Agent name stored in `@bosun_agent` at create time
+    /// (`claude` / `codex` / `terminal`). `None` for non-bosun
+    /// sessions or sessions from an older bosun that didn't persist
+    /// the user option.
+    pub agent: Option<String>,
+    /// Original spec path stored in `@bosun_path` at create time.
+    /// This is the path the user typed into the new-session modal,
+    /// which is more stable than `current_path` (which tracks the
+    /// shell's cwd and can drift). `None` for non-bosun sessions.
+    pub spec_path: Option<String>,
 }
 
 impl TmuxSession {
@@ -29,6 +39,15 @@ impl TmuxSession {
     /// if no display name was set.
     pub fn display(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Best-available path for the UI: the user's declared spec path
+    /// if the session is bosun-managed, otherwise the shell's current
+    /// working directory. `None` if neither is known.
+    pub fn best_path(&self) -> Option<&str> {
+        self.spec_path
+            .as_deref()
+            .or(self.current_path.as_deref())
     }
 }
 

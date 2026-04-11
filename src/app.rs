@@ -459,6 +459,8 @@ mod tests {
                 created: Some(SystemTime::now()),
                 last_activity: Some(SystemTime::now()),
                 current_path: None,
+                agent: None,
+                spec_path: None,
             },
             Status::Idle,
             None,

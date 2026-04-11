@@ -27,6 +27,8 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
             created: Some(SystemTime::UNIX_EPOCH),
             last_activity: Some(SystemTime::UNIX_EPOCH),
             current_path: Some("/tmp".into()),
+            agent: Some("claude".into()),
+            spec_path: Some("/Users/rhuk/work".into()),
         },
         status,
         None,

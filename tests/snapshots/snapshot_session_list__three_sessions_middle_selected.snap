@@ -3,11 +3,11 @@ source: tests/snapshot_session_list.rs
 expression: frame
 ---
    ○  alpha  1w                                                                 
- ▌ ○  beta  1w  •attached       preview: capturing…                             
+       claude · ~/work          preview: capturing…                             
+ ▌ ○  beta  1w  •attached                                                       
+       claude · ~/work                                                          
    ○  gamma  1w                                                                 
-                                                                                
-                                                                                
-                                                                                
+       claude · ~/work                                                          
                                                                                 
                                                                                 
                                                                                 

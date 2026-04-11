@@ -11,11 +11,14 @@ use crate::tmux::session::TmuxSession;
 /// by `\x1f` (ASCII unit separator) so session names can safely contain `|`,
 /// `:`, tabs, etc. without colliding with the delimiter.
 ///
-/// The last field reads a user option we set at create time, so the UI can
-/// show the pretty "rasterfox" name even though the internal tmux session
-/// is `bosun-rasterfox-<uniqid>`. Unset returns empty and we fall back to
-/// using `session_name`.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_created}\x1f#{session_activity}\x1f#{session_path}\x1f#{@bosun_display}";
+/// The trailing `@bosun_*` fields read user options we set at create time:
+/// - `@bosun_display` — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
+/// - `@bosun_agent`   — agent kind (claude / codex / terminal)
+/// - `@bosun_path`    — spec path the user typed into the new-session modal
+///
+/// All three are empty strings for non-bosun sessions and get parsed as
+/// `None` so the UI renders them only when available.
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_created}\x1f#{session_activity}\x1f#{session_path}\x1f#{@bosun_display}\x1f#{@bosun_agent}\x1f#{@bosun_path}";
 
 const FIELD_SEP: char = '\x1f';
 
@@ -56,6 +59,12 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         .ok_or_else(|| "missing session_activity".to_string())?;
     let path = parts.next().map(|s| s.to_string());
     let display_raw = parts.next().map(|s| s.to_string());
+    // `@bosun_agent` and `@bosun_path` are optional trailing fields
+    // — older tmux list-sessions outputs (from before we added them
+    // to LIST_SESSIONS_FORMAT) may not include them, and fixtures
+    // in tests sometimes omit them for brevity.
+    let agent_raw = parts.next().map(|s| s.to_string());
+    let spec_path_raw = parts.next().map(|s| s.to_string());
 
     if parts.next().is_some() {
         return Err("unexpected extra field".into());
@@ -83,6 +92,8 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         last_activity,
         current_path: path.filter(|p| !p.is_empty()),
         display_name: display_raw.filter(|s| !s.is_empty()),
+        agent: agent_raw.filter(|s| !s.is_empty()),
+        spec_path: spec_path_raw.filter(|s| !s.is_empty()),
     })
 }
 
@@ -181,5 +192,26 @@ mod tests {
         let sessions = parse_list_sessions(line).unwrap();
         assert!(sessions[0].created.is_some());
         assert!(sessions[0].last_activity.is_none());
+    }
+
+    #[test]
+    fn bosun_user_options_parse_when_present() {
+        let line = "bosun-foo\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1ffoo\x1fclaude\x1f~/proj";
+        let sessions = parse_list_sessions(line).unwrap();
+        assert_eq!(sessions[0].display_name.as_deref(), Some("foo"));
+        assert_eq!(sessions[0].agent.as_deref(), Some("claude"));
+        assert_eq!(sessions[0].spec_path.as_deref(), Some("~/proj"));
+    }
+
+    #[test]
+    fn missing_bosun_options_are_none_not_error() {
+        // Non-bosun session: `@bosun_*` all return empty strings,
+        // which we parse as None. Also covers the back-compat case
+        // where `@bosun_agent`/`@bosun_path` were added later.
+        let line = "plain\x1f1\x1f0\x1f1700000000\x1f1700000100\x1f/srv\x1f\x1f\x1f";
+        let sessions = parse_list_sessions(line).unwrap();
+        assert!(sessions[0].display_name.is_none());
+        assert!(sessions[0].agent.is_none());
+        assert!(sessions[0].spec_path.is_none());
     }
 }
