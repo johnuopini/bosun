@@ -41,5 +41,13 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Same codegen as release but preserves debug symbols so tools like
+# `sample` / `atos` / `lldb` can resolve stack frames. Use this when
+# chasing a bug that only repros under release timing.
+[profile.release-debug]
+inherits = "release"
+strip = "none"
+debug = true
+
 [profile.dev]
 opt-level = 1  # Fast enough dev builds, much snappier TUI than opt-level=0.
