@@ -220,24 +220,39 @@ impl TmuxClient for TokioTmuxClient {
 
         // Step 3: type the agent command via send-keys so it runs
         // inside the user's shell with their full environment set up.
-        // send-keys queues keystrokes — the shell reads them when it's
-        // ready, so we don't need to synchronize on shell startup.
+        //
+        // We match agent-deck's idiom here:
+        //   * `send-keys -l -- <cmd>` for the literal characters, so
+        //     tmux doesn't interpret things like `C-c` or `Space` in
+        //     the command as key-name shortcuts.
+        //   * A brief sleep (100ms) so tmux's bracketed-paste handler
+        //     finishes processing the literal chunk before Enter lands.
+        //   * A separate `send-keys Enter` to submit. Sending Enter in
+        //     the same call as `-l` would make it a literal "Enter"
+        //     string instead of a newline.
         if !spec.command.is_empty() {
-            let mut sk = self.cmd();
-            sk.arg("send-keys")
+            let mut literal = self.cmd();
+            literal
+                .arg("send-keys")
+                .arg("-l")
                 .arg("-t")
                 .arg(&spec.name)
-                .arg(&spec.command)
+                .arg("--")
+                .arg(&spec.command);
+            if let Err(e) = literal.output().await {
+                tracing::warn!("send-keys -l to {}: {}", spec.name, e);
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let mut enter = self.cmd();
+            enter
+                .arg("send-keys")
+                .arg("-t")
+                .arg(&spec.name)
                 .arg("Enter");
-            match sk.output().await {
-                Ok(out) if !out.status.success() => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    tracing::warn!("send-keys to {}: {}", spec.name, stderr.trim());
-                }
-                Err(e) => {
-                    tracing::warn!("send-keys to {}: {}", spec.name, e);
-                }
-                _ => {}
+            if let Err(e) = enter.output().await {
+                tracing::warn!("send-keys Enter to {}: {}", spec.name, e);
             }
         }
 

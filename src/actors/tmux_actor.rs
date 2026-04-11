@@ -165,10 +165,11 @@ pub fn spawn(
 }
 
 /// Assemble the internal tmux session name from the user's typed
-/// display name. Internal format: `<prefix><display>-<hex-suffix>`,
-/// e.g. `bosun-rasterfox-a1b2c3d4`. The hex suffix makes the internal
-/// name unique even if the user creates two sessions with the same
-/// display name.
+/// display name. Internal format: `<prefix><slug>-<hex-suffix>`,
+/// e.g. `bosun-my-rocket-fox-a1b2c3d4`. The display name can contain
+/// caps, spaces, punctuation — anything — but the tmux-visible name
+/// is a lowercase dashed slug + unique hex suffix so it's safe to
+/// pass to `-t` and always unique even for duplicate display names.
 fn build_internal_name(prefix: &str, display: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -176,35 +177,64 @@ fn build_internal_name(prefix: &str, display: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let suffix = format!("{:08x}", nanos as u32);
-    let sanitized: String = display
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("{}{}-{}", prefix, sanitized, suffix)
+    let slug = slugify(display);
+    // If the slug somehow ends up empty (e.g. display was all symbols,
+    // which the modal should reject but be defensive), fall back to
+    // "session".
+    let slug = if slug.is_empty() {
+        "session".to_string()
+    } else {
+        slug
+    };
+    format!("{}{}-{}", prefix, slug, suffix)
 }
 
-/// Map the agent + options + extra args into a shell command to run
-/// as the new session's initial process. `terminal` means "just the
-/// shell" — options are ignored, and any `args` are run as a raw
-/// command (empty = default shell).
+/// Lowercase slug: alphanumeric and underscores are kept (underscore
+/// is valid in tmux session names); everything else collapses to
+/// single dashes; leading/trailing dashes are trimmed.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            for lower in c.to_lowercase() {
+                out.push(lower);
+            }
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// Map the agent + options + extra args into a shell command to type
+/// into the session's pane.
+///
+/// We type the command directly into the user's login shell — no
+/// `bash -c 'exec ...'` wrapping. Bosun runs its own tmux server on
+/// a dedicated `-L bosun` socket, which is a child of the bosun
+/// process, so pane shells inherit the right environment (including
+/// Keychain lineage for Claude Code). The agent runs as a child of
+/// the shell; Ctrl-Z suspends the agent directly, fg resumes it, and
+/// when the agent exits the shell stays alive so the session doesn't
+/// die.
+///
+/// `terminal` just types whatever extra args the user provided (or
+/// nothing — you get a plain shell).
 fn build_agent_command(agent: &str, options: &SpecOptions, args: &str) -> String {
     let args = args.trim();
     match agent {
         "claude" => {
-            let mut parts: Vec<String> = vec!["claude".to_string()];
+            let mut parts: Vec<String> = vec!["claude".into()];
             match options.claude.session_mode {
                 ClaudeSessionMode::New => {}
-                ClaudeSessionMode::Continue => parts.push("--continue".to_string()),
-                ClaudeSessionMode::Resume => parts.push("--resume".to_string()),
+                ClaudeSessionMode::Continue => parts.push("--continue".into()),
+                ClaudeSessionMode::Resume => parts.push("--resume".into()),
             }
             if options.claude.skip_permissions {
-                parts.push("--dangerously-skip-permissions".to_string());
+                parts.push("--dangerously-skip-permissions".into());
             }
             if !args.is_empty() {
                 parts.push(args.to_string());
@@ -212,17 +242,15 @@ fn build_agent_command(agent: &str, options: &SpecOptions, args: &str) -> String
             parts.join(" ")
         }
         "codex" => {
-            let mut parts: Vec<String> = vec!["codex".to_string()];
+            let mut parts: Vec<String> = vec!["codex".into()];
             if options.codex.yolo {
-                parts.push("--yolo".to_string());
+                parts.push("--yolo".into());
             }
             if !args.is_empty() {
                 parts.push(args.to_string());
             }
             parts.join(" ")
         }
-        // "terminal" and anything unknown → whatever extra args the
-        // user typed, or nothing (tmux uses the default shell).
         _ => args.to_string(),
     }
 }
@@ -451,5 +479,14 @@ mod build_cmd_tests {
             "vim .zshrc"
         );
         assert_eq!(build_agent_command("terminal", &opts(), ""), "");
+    }
+
+    #[test]
+    fn slugify_lowercases_and_dashes() {
+        assert_eq!(slugify("My Rocket Fox"), "my-rocket-fox");
+        assert_eq!(slugify("Foo.Bar_baz"), "foo-bar_baz");
+        assert_eq!(slugify("  leading space"), "leading-space");
+        assert_eq!(slugify("multi   spaces"), "multi-spaces");
+        assert_eq!(slugify("trailing!!!"), "trailing");
     }
 }

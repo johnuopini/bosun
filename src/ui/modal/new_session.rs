@@ -138,8 +138,10 @@ impl NewSessionModal {
         // prefix in the actor based on Config. Strip it here if they
         // typed it, so the stored form is always the bare name.
         let name = name.strip_prefix("bosun-").unwrap_or(name);
-        if name.contains(char::is_whitespace) {
-            return Err("name cannot contain whitespace".into());
+        // The internal tmux session name is slugified from this, so
+        // we need at least one alphanumeric character to work with.
+        if !name.chars().any(|c| c.is_alphanumeric()) {
+            return Err("name must contain at least one letter or digit".into());
         }
 
         let path = self.path.trim();
@@ -724,14 +726,30 @@ mod tests {
     }
 
     #[test]
-    fn name_with_whitespace_errors() {
+    fn name_with_spaces_is_accepted() {
         let mut m = NewSessionModal::new();
-        for c in "bad name".chars() {
+        for c in "My Rocket Fox".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        let r = m.handle(key(KeyCode::Enter));
+        match r {
+            ModalResult::Close(Some(Command::CreateSession(spec))) => {
+                // Display name preserved verbatim, caps + spaces included.
+                assert_eq!(spec.name, "My Rocket Fox");
+            }
+            _ => panic!("expected CreateSession with 'My Rocket Fox'"),
+        }
+    }
+
+    #[test]
+    fn name_with_only_symbols_is_rejected() {
+        let mut m = NewSessionModal::new();
+        for c in "!!!".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
         let r = m.handle(key(KeyCode::Enter));
         assert!(matches!(r, ModalResult::Consumed));
-        assert!(m.error.as_deref().unwrap().contains("whitespace"));
+        assert!(m.error.as_deref().unwrap().contains("letter"));
     }
 
     #[test]

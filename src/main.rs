@@ -21,8 +21,11 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let config = Config::from_env();
-    let client = Arc::new(TokioTmuxClient::new());
-    let socket: Option<String> = None;
+    let socket = config.tmux_socket.clone();
+    let client: Arc<TokioTmuxClient> = match &socket {
+        Some(s) => Arc::new(TokioTmuxClient::with_socket(s.clone())),
+        None => Arc::new(TokioTmuxClient::new()),
+    };
 
     // Panic hook: restore terminal + clean up C-q binding + restore
     // the user's tmux status bar before we die.

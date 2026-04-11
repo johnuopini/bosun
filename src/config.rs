@@ -11,12 +11,28 @@ use std::env;
 /// to see every session on the server.
 pub const DEFAULT_SESSION_PREFIX: &str = "bosun-";
 
+/// Default tmux `-L <socket>` that bosun uses. Putting bosun on its
+/// own socket means bosun's tmux server is a **child of the bosun
+/// process**, which inherits whatever shell context bosun was
+/// launched from — critically, including the macOS Keychain lineage
+/// that lets Claude Code see its cached credentials. With the default
+/// socket, bosun's sessions would live on some ancient server started
+/// by some other context and Claude wouldn't see the user's auth.
+///
+/// Set `BOSUN_TMUX_SOCKET=default` to opt back into the shared
+/// default socket (at the cost of the auth issue and of seeing every
+/// other tmux session on the machine).
+pub const DEFAULT_TMUX_SOCKET: &str = "bosun";
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Only sessions whose name starts with this prefix are shown in
     /// bosun's UI and get the bosun status bar applied. Empty string
     /// means "show everything".
     pub session_prefix: String,
+    /// Tmux `-L` socket name. `None` means use tmux's default socket.
+    /// `Some("bosun")` (the default) means `tmux -L bosun ...`.
+    pub tmux_socket: Option<String>,
     /// Name of the tmux session bosun is currently running inside,
     /// if any. `None` if bosun was launched outside tmux. We exclude
     /// this session from bosun's own list so the preview doesn't
@@ -30,9 +46,23 @@ impl Config {
     pub fn from_env() -> Self {
         let session_prefix =
             env::var("BOSUN_PREFIX").unwrap_or_else(|_| DEFAULT_SESSION_PREFIX.to_string());
-        let self_session = detect_self_session();
+        let tmux_socket = match env::var("BOSUN_TMUX_SOCKET") {
+            Ok(s) if s.is_empty() || s == "default" => None,
+            Ok(s) => Some(s),
+            Err(_) => Some(DEFAULT_TMUX_SOCKET.to_string()),
+        };
+        // Only detect self-session if we're on the same socket as
+        // the caller's tmux. If bosun uses a dedicated socket, the
+        // parent tmux (if any) is on a different server and bosun
+        // isn't "inside" any session on its own socket.
+        let self_session = if tmux_socket.is_none() {
+            detect_self_session()
+        } else {
+            None
+        };
         Self {
             session_prefix,
+            tmux_socket,
             self_session,
         }
     }
@@ -76,6 +106,7 @@ mod tests {
     fn cfg(prefix: &str) -> Config {
         Config {
             session_prefix: prefix.to_string(),
+            tmux_socket: Some(DEFAULT_TMUX_SOCKET.to_string()),
             self_session: None,
         }
     }
@@ -107,6 +138,7 @@ mod tests {
     fn self_session_is_excluded_even_when_prefix_matches() {
         let c = Config {
             session_prefix: DEFAULT_SESSION_PREFIX.to_string(),
+            tmux_socket: None,
             self_session: Some("bosun-mine-abc".to_string()),
         };
         assert!(!c.manages("bosun-mine-abc"));
