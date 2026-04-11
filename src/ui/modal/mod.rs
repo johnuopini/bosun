@@ -15,8 +15,10 @@
 //!   * Parent/child data passing is explicit via `ModalData` variants
 //!     so there's no `dyn Any` downcasting.
 
+pub mod confirm;
 pub mod new_session;
 pub mod recents;
+pub mod rename;
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;

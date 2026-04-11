@@ -49,6 +49,15 @@ pub trait TmuxClient: Send + Sync {
     /// subsequent `list_sessions` calls. Returns the name of the
     /// newly-created session on success.
     async fn create_session(&self, spec: &CreateSpec) -> Result<String>;
+
+    /// Kill a tmux session by its internal name. Missing sessions
+    /// are treated as success (idempotent).
+    async fn kill_session(&self, session: &str) -> Result<()>;
+
+    /// Update the `@bosun_display` per-session user option so the UI
+    /// picks up a new pretty label on the next refresh. Does not
+    /// change the internal tmux session name.
+    async fn set_display_name(&self, session: &str, display: &str) -> Result<()>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -257,6 +266,44 @@ impl TmuxClient for TokioTmuxClient {
         }
 
         Ok(spec.name.clone())
+    }
+
+    async fn kill_session(&self, session: &str) -> Result<()> {
+        let mut cmd = self.cmd();
+        cmd.arg("kill-session").arg("-t").arg(session);
+        let output = cmd.output().await.map_err(BosunError::Io)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        // If the session is already gone, treat as idempotent success.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("can't find session") || stderr.contains("no server running") {
+            return Ok(());
+        }
+        Err(BosunError::Tmux(format!(
+            "kill-session {} failed: {}",
+            session,
+            stderr.trim()
+        )))
+    }
+
+    async fn set_display_name(&self, session: &str, display: &str) -> Result<()> {
+        let mut cmd = self.cmd();
+        cmd.arg("set-option")
+            .arg("-t")
+            .arg(session)
+            .arg("@bosun_display")
+            .arg(display);
+        let output = cmd.output().await.map_err(BosunError::Io)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(BosunError::Tmux(format!(
+            "set @bosun_display on {}: {}",
+            session,
+            stderr.trim()
+        )))
     }
 }
 

@@ -1,6 +1,6 @@
 ---
 source: tests/snapshot_session_list.rs
-assertion_line: 65
+assertion_line: 66
 expression: frame
 ---
    ○  alpha  1w                                                                 
@@ -12,4 +12,4 @@ expression: frame
                                                                                 
                                                                                 
                                                                                 
- bosun  3 sessions                                  ↑/↓ nav · ↵ attach · q quit
+ bosun  3 sessions       ↑↓ nav · ↵ attach · n new · r rename · d kill · q quit

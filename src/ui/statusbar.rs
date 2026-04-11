@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         },
     ]);
 
-    let right = "↑/↓ nav · ↵ attach · q quit ";
+    let right = "↑↓ nav · ↵ attach · n new · r rename · d kill · q quit ";
     let hint_style = Style::default().fg(MUTED).bg(BG);
 
     let width = area.width as usize;

@@ -127,6 +127,59 @@ pub fn spawn(
                 Command::FocusPreview { name } => {
                     focused = Some(name);
                 }
+                Command::KillSession(internal) => {
+                    match client.kill_session(&internal).await {
+                        Ok(()) => {
+                            // If we killed the focused session, drop
+                            // the focus so the preview doesn't keep
+                            // trying to capture a dead pane.
+                            if focused.as_deref() == Some(internal.as_str()) {
+                                focused = None;
+                            }
+                            // Force a refresh so the session disappears
+                            // from the UI without a 1s wait.
+                            let _ = do_refresh(
+                                &*client,
+                                &config,
+                                &registry,
+                                &mut smoothers,
+                                focused.as_deref(),
+                                socket.as_deref(),
+                                &mut last_bar_state,
+                                &mut globals,
+                                &evt_tx,
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(AppMsg::Warn(format!("kill: {}", e))).await;
+                        }
+                    }
+                }
+                Command::RenameSession {
+                    internal,
+                    new_display,
+                } => match client.set_display_name(&internal, &new_display).await {
+                    Ok(()) => {
+                        let _ = do_refresh(
+                            &*client,
+                            &config,
+                            &registry,
+                            &mut smoothers,
+                            focused.as_deref(),
+                            socket.as_deref(),
+                            &mut last_bar_state,
+                            &mut globals,
+                            &evt_tx,
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(AppMsg::Warn(format!("rename: {}", e))).await;
+                    }
+                },
                 Command::CreateSession(spec) => {
                     // Collision-check against the CURRENT live sessions
                     // so "Bosun" auto-becomes "Bosun 2" when a session

@@ -84,6 +84,15 @@ pub enum Command {
     FocusPreview { name: String },
     /// Create a new tmux session from the new-session modal's form data.
     CreateSession(SessionSpec),
+    /// Kill a session by its internal tmux name. `tmux kill-session -t`.
+    KillSession(String),
+    /// Rename the pretty display name of a session. The internal tmux
+    /// name never changes (we only update the `@bosun_display` user
+    /// option); the UI picks up the new label on the next refresh.
+    RenameSession {
+        internal: String,
+        new_display: String,
+    },
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

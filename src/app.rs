@@ -20,7 +20,10 @@ use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
 use crate::ui;
-use crate::ui::modal::{new_session::NewSessionModal, ModalStack, StackDispatch};
+use crate::ui::modal::confirm::ConfirmModal;
+use crate::ui::modal::new_session::NewSessionModal;
+use crate::ui::modal::rename::RenameModal;
+use crate::ui::modal::{ModalStack, StackDispatch};
 
 fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
@@ -186,8 +189,30 @@ impl AppState {
                     self.pending_attach = Some(s.name().to_string());
                 }
             }
-            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                // Manual refresh. Regular refresh happens on every 1s
+                // tick, but Ctrl-R is here as an escape hatch if the
+                // user wants instant.
                 out.push(Command::ListNow);
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                if let Some(sel) = self.sessions.get(self.selected) {
+                    let internal = sel.name().to_string();
+                    let current_display = sel.display().to_string();
+                    self.modals
+                        .push(Box::new(RenameModal::new(internal, current_display)));
+                }
+            }
+            (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                if let Some(sel) = self.sessions.get(self.selected) {
+                    let internal = sel.name().to_string();
+                    let display = sel.display().to_string();
+                    let title = "Kill session?";
+                    let msg = format!("This will kill '{}' and its pane.", display);
+                    self.modals.push(Box::new(
+                        ConfirmModal::new(title, msg, Command::KillSession(internal)).destructive(),
+                    ));
+                }
             }
             (KeyCode::Char('n'), KeyModifiers::NONE) => {
                 // We can't push the modal directly here because
