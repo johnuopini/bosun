@@ -77,6 +77,10 @@ pub struct AppState {
     /// held down after a Down on the divider column). Render uses
     /// this to highlight the divider glyph.
     pub dragging_divider: bool,
+    /// User-defined session order. Internal tmux names, most recent
+    /// ordering first. When sessions refresh, the list is sorted to
+    /// match this order; sessions not in the list go at the end.
+    pub session_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,26 @@ pub enum ModalRequest {
 }
 
 impl AppState {
+    /// Snapshot the current session list order into `session_order`.
+    fn save_session_order(&mut self) {
+        self.session_order = self.sessions.iter().map(|s| s.name().to_string()).collect();
+    }
+
+    /// Sort `self.sessions` to match the saved `session_order`.
+    /// Sessions not in the order go at the end, preserving their
+    /// relative order from tmux.
+    fn apply_session_order(&mut self) {
+        if self.session_order.is_empty() {
+            return;
+        }
+        self.sessions.sort_by_key(|s| {
+            self.session_order
+                .iter()
+                .position(|n| n == s.name())
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     fn clamp_selection(&mut self) {
         if self.sessions.is_empty() {
             self.selected = 0;
@@ -115,6 +139,7 @@ impl AppState {
                     .get(self.selected)
                     .map(|v| v.name().to_string());
                 self.sessions = sessions;
+                self.apply_session_order();
                 if let Some(target) = select_after {
                     if let Some(idx) = self.sessions.iter().position(|v| v.name() == target) {
                         self.selected = idx;
@@ -216,6 +241,20 @@ impl AppState {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Char('J'), _) => {
+                if self.selected + 1 < self.sessions.len() {
+                    self.sessions.swap(self.selected, self.selected + 1);
+                    self.selected += 1;
+                    self.save_session_order();
+                }
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _) => {
+                if self.selected > 0 {
+                    self.sessions.swap(self.selected, self.selected - 1);
+                    self.selected -= 1;
+                    self.save_session_order();
+                }
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                 if !self.sessions.is_empty() {
