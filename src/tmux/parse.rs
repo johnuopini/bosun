@@ -125,14 +125,14 @@ mod tests {
 
     #[test]
     fn parses_single_session() {
-        let line = "main|||3|||1|||1712000000|||1712003600|||/home/rhuk/code";
+        let line = "main|||3|||1|||1712000000|||1712003600|||/tmp/code";
         let sessions = parse_list_sessions(line).unwrap();
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.name, "main");
         assert_eq!(s.windows, 3);
         assert!(s.attached);
-        assert_eq!(s.current_path.as_deref(), Some("/home/rhuk/code"));
+        assert_eq!(s.current_path.as_deref(), Some("/tmp/code"));
         assert!(s.created.is_some());
         assert!(s.last_activity.is_some());
     }

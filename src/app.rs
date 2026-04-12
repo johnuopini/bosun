@@ -34,6 +34,13 @@ fn term_err<E: std::fmt::Display>(e: E) -> BosunError {
     BosunError::Io(std::io::Error::other(e.to_string()))
 }
 
+/// Set the terminal window/tab title via the OSC 0 escape sequence.
+/// Works in iTerm2, Terminal.app, Alacritty, kitty, WezTerm, etc.
+fn set_terminal_title(title: &str) {
+    // OSC 0 ; <title> BEL
+    print!("\x1b]0;{title}\x07");
+}
+
 /// Everything the UI renders from. Pure data; no locks.
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -393,6 +400,8 @@ impl App {
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<()> {
+        set_terminal_title("bosun");
+
         // Initial refresh kick. Unbounded `send` is sync and can only
         // fail if the receiver has been dropped — meaning the tmux
         // actor has already exited, at which point there's nothing
@@ -478,7 +487,19 @@ impl App {
                     h.shutdown().await;
                 }
 
+                // Update the terminal title to reflect the attached session.
+                let display = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|s| s.name() == name)
+                    .map(|s| s.display().to_string())
+                    .unwrap_or_else(|| name.clone());
+                set_terminal_title(&format!("bosun — {display}"));
+
                 let attach_result = self.perform_attach(terminal, &name);
+
+                set_terminal_title("bosun");
 
                 // Respawn the input actor now that the terminal is back.
                 self.input_handle = Some(input_actor::spawn(self.evt_tx.clone()));
@@ -504,6 +525,9 @@ impl App {
         if let Some(h) = self.input_handle.take() {
             h.shutdown().await;
         }
+
+        // Clear the terminal title so the shell can set its own.
+        set_terminal_title("");
 
         Ok(())
     }

@@ -23,12 +23,13 @@ use super::recents::RecentsModal;
 use super::{center_rect, Modal, ModalData, ModalResult};
 
 const MODAL_WIDTH: u16 = 64;
-// Sized for the largest agent (claude with all options visible) plus
-// space for up to `PATH_SUGGESTION_CAP` rows of recent-path dropdown.
-// Smaller agents / no suggestions render with trailing blank space.
-const MODAL_HEIGHT: u16 = 32;
 
-const PATH_SUGGESTION_CAP: usize = 5;
+/// Maximum filesystem entries to read for completion. Keeps
+/// `read_dir` bounded in large directories.
+const PATH_SUGGESTION_CAP: usize = 50;
+
+/// Maximum visible rows in the path dropdown overlay.
+const DROPDOWN_MAX_VISIBLE: usize = 8;
 
 // --- Agent dropdown --------------------------------------------------
 
@@ -84,6 +85,11 @@ pub struct NewSessionModal {
     /// down into the filesystem dropdown. `None` means the user is
     /// typing freely (no dropdown entry highlighted).
     path_suggestion_idx: Option<usize>,
+    /// First visible row in the scrollable path dropdown.
+    path_suggestion_scroll: usize,
+    /// Whether the path dropdown overlay is showing. Dismissed by
+    /// Escape; re-activated by typing, backspace, or arrow-down.
+    path_dropdown_active: bool,
 }
 
 /// One row in the filesystem dropdown. `name` is the last path
@@ -100,7 +106,7 @@ impl NewSessionModal {
         let path = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~".to_string());
-        Self {
+        let mut modal = Self {
             name: String::new(),
             path,
             agent_idx: 0,
@@ -111,7 +117,11 @@ impl NewSessionModal {
             error: None,
             recents,
             path_suggestion_idx: None,
-        }
+            path_suggestion_scroll: 0,
+            path_dropdown_active: true,
+        };
+        modal.apply_remembered_options();
+        modal
     }
 
     /// Filesystem entries that match the current `self.path`.
@@ -138,13 +148,36 @@ impl NewSessionModal {
             new_path.push('/');
         }
         self.path = new_path;
+        self.reset_path_dropdown();
+    }
+
+    fn reset_path_dropdown(&mut self) {
         self.path_suggestion_idx = None;
+        self.path_suggestion_scroll = 0;
+        self.path_dropdown_active = true;
+    }
+
+    /// Keep the selected suggestion within the visible dropdown window.
+    fn clamp_dropdown_scroll(&mut self, count: usize) {
+        if let Some(idx) = self.path_suggestion_idx {
+            let max_vis = DROPDOWN_MAX_VISIBLE.min(count);
+            if idx < self.path_suggestion_scroll {
+                self.path_suggestion_scroll = idx;
+            } else if max_vis > 0 && idx >= self.path_suggestion_scroll + max_vis {
+                self.path_suggestion_scroll = idx + 1 - max_vis;
+            }
+        } else {
+            self.path_suggestion_scroll = 0;
+        }
     }
 
     /// Shell-style Tab completion. Returns true if the path was
     /// extended (caller should stay on the Path field); false means
     /// "nothing to do, advance to next field".
     fn tab_complete_path(&mut self) -> bool {
+        if !self.path_dropdown_active {
+            return false;
+        }
         let suggestions = self.path_suggestions_all();
         if suggestions.is_empty() {
             return false;
@@ -159,14 +192,15 @@ impl NewSessionModal {
         }
 
         // Many matches: extend to the longest common prefix.
+        // If the prefix is already at the LCP, stay on the field so
+        // the user can arrow through the visible dropdown.
         let names: Vec<&str> = suggestions.iter().map(|e| e.name.as_str()).collect();
         let lcp = longest_common_prefix(&names);
         if lcp.chars().count() > prefix.chars().count() {
             self.path = format!("{}{}", dir, lcp);
-            self.path_suggestion_idx = None;
-            return true;
+            self.reset_path_dropdown();
         }
-        false
+        true
     }
 
     /// Overwrite all form fields from a selected recent. Called by
@@ -193,12 +227,18 @@ impl NewSessionModal {
         let visible = Field::visible_for(self.agent());
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + 1) % visible.len()];
+        if self.field == Field::Path {
+            self.path_dropdown_active = true;
+        }
     }
 
     fn prev_field(&mut self) {
         let visible = Field::visible_for(self.agent());
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + visible.len() - 1) % visible.len()];
+        if self.field == Field::Path {
+            self.path_dropdown_active = true;
+        }
     }
 
     /// When the agent changes, snap the focused field to something
@@ -212,6 +252,57 @@ impl NewSessionModal {
         if !visible.contains(&self.field) {
             self.field = Field::Agent;
         }
+    }
+
+    /// Pre-fill agent-specific options from the most recently used
+    /// session of the same agent type. Recents are ordered by
+    /// `last_used_at DESC`, so the first match is the freshest.
+    fn apply_remembered_options(&mut self) {
+        match self.agent() {
+            "claude" => {
+                if let Some(r) = self.recents.iter().find(|r| r.agent == "claude") {
+                    self.claude = r.claude.clone();
+                }
+            }
+            "codex" => {
+                if let Some(r) = self.recents.iter().find(|r| r.agent == "codex") {
+                    self.codex = r.codex.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Combined handler when the agent dropdown changes: clamp the
+    /// focused field and restore the last-used options for the new
+    /// agent.
+    fn on_agent_changed(&mut self) {
+        self.clamp_field_for_agent();
+        self.apply_remembered_options();
+    }
+
+    /// Compute the modal height based on the current agent and state.
+    /// Path suggestions are rendered as a floating overlay and do not
+    /// affect the modal height.
+    fn modal_height(&self) -> u16 {
+        // Base: title, blank, name label+input, blank, path label+input,
+        //       blank, agent label+line, blank, args label+input = 13
+        let mut h: u16 = 13;
+
+        // Agent-specific options.
+        match self.agent() {
+            "claude" => h += 4, // blank + header + radio + checkbox
+            "codex" => h += 3,  // blank + header + checkbox
+            _ => {}
+        }
+
+        // Validation error.
+        if self.error.is_some() {
+            h += 2; // blank + error line
+        }
+
+        // Padding: 1 top + 1 bottom from inner rect inset.
+        h + 2
     }
 
     fn build_spec(&self) -> Result<SessionSpec, String> {
@@ -270,7 +361,16 @@ impl Modal for NewSessionModal {
         }
 
         match key.code {
-            KeyCode::Esc => ModalResult::Close(None),
+            KeyCode::Esc => {
+                // If the path dropdown is visible, Escape dismisses it
+                // instead of closing the modal, so Tab can advance.
+                if self.field == Field::Path && self.path_dropdown_active {
+                    self.path_dropdown_active = false;
+                    self.path_suggestion_idx = None;
+                    return ModalResult::Consumed;
+                }
+                ModalResult::Close(None)
+            }
             KeyCode::Tab => {
                 if self.field == Field::Path {
                     // 1. If the user arrowed into the dropdown, Tab
@@ -326,7 +426,7 @@ impl Modal for NewSessionModal {
                 match self.field {
                     Field::Agent => {
                         self.agent_idx = (self.agent_idx + AGENTS.len() - 1) % AGENTS.len();
-                        self.clamp_field_for_agent();
+                        self.on_agent_changed();
                     }
                     Field::ClaudeSession => {
                         self.claude.session_mode = self.claude.session_mode.prev();
@@ -339,7 +439,7 @@ impl Modal for NewSessionModal {
                 match self.field {
                     Field::Agent => {
                         self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
-                        self.clamp_field_for_agent();
+                        self.on_agent_changed();
                     }
                     Field::ClaudeSession => {
                         self.claude.session_mode = self.claude.session_mode.next();
@@ -350,12 +450,15 @@ impl Modal for NewSessionModal {
             }
             KeyCode::Down if self.field == Field::Path => {
                 let suggestions = self.path_suggestions();
+                let count = suggestions.len();
                 if !suggestions.is_empty() {
+                    self.path_dropdown_active = true;
                     self.path_suggestion_idx = Some(match self.path_suggestion_idx {
                         None => 0,
-                        Some(i) if i + 1 < suggestions.len() => i + 1,
+                        Some(i) if i + 1 < count => i + 1,
                         Some(i) => i,
                     });
+                    self.clamp_dropdown_scroll(count);
                 }
                 ModalResult::Consumed
             }
@@ -364,6 +467,8 @@ impl Modal for NewSessionModal {
                     None | Some(0) => None,
                     Some(i) => Some(i - 1),
                 };
+                let count = self.path_suggestions().len();
+                self.clamp_dropdown_scroll(count);
                 ModalResult::Consumed
             }
             KeyCode::Backspace => {
@@ -374,7 +479,7 @@ impl Modal for NewSessionModal {
                     }
                     Field::Path => {
                         self.path.pop();
-                        self.path_suggestion_idx = None;
+                        self.reset_path_dropdown();
                     }
                     Field::Args => {
                         self.args.pop();
@@ -392,12 +497,12 @@ impl Modal for NewSessionModal {
                     Field::Name => self.name.push(' '),
                     Field::Path => {
                         self.path.push(' ');
-                        self.path_suggestion_idx = None;
+                        self.reset_path_dropdown();
                     }
                     Field::Args => self.args.push(' '),
                     Field::Agent => {
                         self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
-                        self.clamp_field_for_agent();
+                        self.on_agent_changed();
                     }
                     Field::ClaudeSkipPerm => {
                         self.claude.skip_permissions = !self.claude.skip_permissions;
@@ -418,7 +523,7 @@ impl Modal for NewSessionModal {
                     Field::Name => self.name.push(c),
                     Field::Path => {
                         self.path.push(c);
-                        self.path_suggestion_idx = None;
+                        self.reset_path_dropdown();
                     }
                     Field::Args => self.args.push(c),
                     _ => {}
@@ -435,7 +540,7 @@ impl Modal for NewSessionModal {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let rect = center_rect(area, MODAL_WIDTH, self.modal_height());
         let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
@@ -500,16 +605,6 @@ impl Modal for NewSessionModal {
             input_line(&self.path, self.field == Field::Path, inner.width, theme),
         ];
 
-        // Filesystem dropdown — visible when the Path field is
-        // focused and the current directory has matching entries.
-        if self.field == Field::Path {
-            let suggestions = self.path_suggestions();
-            for (i, entry) in suggestions.iter().enumerate() {
-                let highlighted = self.path_suggestion_idx == Some(i);
-                lines.push(path_suggestion_line(entry, highlighted, inner.width, theme));
-            }
-        }
-
         lines.extend([
             Line::from(""),
             label_line("agent", self.field == Field::Agent, theme),
@@ -560,6 +655,97 @@ impl Modal for NewSessionModal {
         Paragraph::new(lines)
             .style(Style::default().bg(body_bg))
             .render(inner, frame.buffer_mut());
+
+        // --- Path dropdown overlay ---
+        // Rendered after the main content so it paints on top of the
+        // agent/args/options fields below the path input. Only shown
+        // when the dropdown hasn't been dismissed with Escape.
+        if self.field == Field::Path && self.path_dropdown_active {
+            let suggestions = self.path_suggestions();
+            if !suggestions.is_empty() {
+                // Path input is line 6 in the content; dropdown starts
+                // immediately below it.
+                let dropdown_y = inner.y + 7;
+                let dropdown_x = inner.x;
+                let avail = area.bottom().saturating_sub(dropdown_y) as usize;
+                let visible = suggestions.len().min(DROPDOWN_MAX_VISIBLE).min(avail);
+
+                if visible > 0 {
+                    let scroll = self.path_suggestion_scroll;
+                    let has_above = scroll > 0;
+                    let has_below = scroll + visible < suggestions.len();
+                    let buf = frame.buffer_mut();
+
+                    for vi in 0..visible {
+                        let si = scroll + vi;
+                        let y = dropdown_y + vi as u16;
+                        if y >= area.bottom() {
+                            break;
+                        }
+
+                        let entry = &suggestions[si];
+                        let highlighted = self.path_suggestion_idx == Some(si);
+                        let bg = if highlighted {
+                            theme.selection_bg
+                        } else {
+                            theme.bg
+                        };
+                        let fg = if highlighted {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        };
+                        let marker = if highlighted { "▸" } else { " " };
+                        let suffix = if entry.is_dir { "/" } else { "" };
+
+                        let text = format!(" {} {}{}", marker, entry.name, suffix);
+                        let field_w = inner.width.saturating_sub(3) as usize;
+
+                        // Left margin: keep the modal body bg for the
+                        // 3-char indent, then fill the entry area.
+                        let margin_style = Style::default().bg(body_bg);
+                        for x in dropdown_x..dropdown_x.saturating_add(3).min(area.right()) {
+                            let cell = &mut buf[(x, y)];
+                            cell.set_char(' ');
+                            cell.set_style(margin_style);
+                        }
+
+                        let entry_style = Style::default().fg(fg).bg(bg);
+                        let entry_x = dropdown_x + 3;
+                        // Fill the entry background, then write text.
+                        for x in entry_x
+                            ..(entry_x + inner.width.saturating_sub(3)).min(area.right())
+                        {
+                            let cell = &mut buf[(x, y)];
+                            cell.set_char(' ');
+                            cell.set_style(entry_style);
+                        }
+                        buf.set_string(entry_x, y, &text, entry_style);
+
+                        // Scroll indicators at the right edge.
+                        let ind_x = entry_x + field_w as u16 - 2;
+                        if ind_x < area.right() {
+                            if vi == 0 && has_above {
+                                buf.set_string(
+                                    ind_x,
+                                    y,
+                                    "▴",
+                                    Style::default().fg(theme.text_muted).bg(bg),
+                                );
+                            }
+                            if vi == visible - 1 && has_below {
+                                buf.set_string(
+                                    ind_x,
+                                    y,
+                                    "▾",
+                                    Style::default().fg(theme.text_muted).bg(bg),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -576,41 +762,6 @@ fn label_line(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {} ", marker), label_style),
         Span::styled(label.to_string(), label_style),
-    ])
-}
-
-/// One row in the filesystem dropdown. Directories get a trailing
-/// slash so they're visually distinct from files. Highlighted rows
-/// get the accent background and a ▸ marker.
-fn path_suggestion_line(
-    entry: &PathEntry,
-    highlighted: bool,
-    width: u16,
-    theme: &Theme,
-) -> Line<'static> {
-    let bg = if highlighted {
-        theme.selection_bg
-    } else {
-        theme.bg
-    };
-    let fg = if highlighted {
-        theme.text
-    } else {
-        theme.text_muted
-    };
-    let marker = if highlighted { "▸" } else { " " };
-    let suffix = if entry.is_dir { "/" } else { "" };
-
-    let full = format!(" {} {}{}", marker, entry.name, suffix);
-    let field_width = width.saturating_sub(3) as usize;
-    let mut padded = full;
-    while padded.chars().count() < field_width {
-        padded.push(' ');
-    }
-
-    Line::from(vec![
-        Span::styled("   ", Style::default().bg(theme.panel_alt)),
-        Span::styled(padded, Style::default().fg(fg).bg(bg)),
     ])
 }
 
@@ -1109,12 +1260,12 @@ mod tests {
     #[test]
     fn split_path_handles_absolute_and_relative() {
         assert_eq!(
-            split_path("/home/rhuk/proj"),
-            ("/home/rhuk/".to_string(), "proj".to_string())
+            split_path("/tmp/user/proj"),
+            ("/tmp/user/".to_string(), "proj".to_string())
         );
         assert_eq!(
-            split_path("/home/rhuk/"),
-            ("/home/rhuk/".to_string(), "".to_string())
+            split_path("/tmp/user/"),
+            ("/tmp/user/".to_string(), "".to_string())
         );
         assert_eq!(split_path("proj"), ("".to_string(), "proj".to_string()));
         assert_eq!(split_path(""), ("".to_string(), "".to_string()));

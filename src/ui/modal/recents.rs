@@ -366,8 +366,8 @@ mod tests {
     #[test]
     fn typing_filters_by_substring_across_name_agent_path() {
         let mut m = RecentsModal::new(vec![
-            rec("work", "claude", "/home/rhuk/proj"),
-            rec("play", "codex", "/home/rhuk/play"),
+            rec("work", "claude", "/tmp/user/proj"),
+            rec("play", "codex", "/tmp/user/play"),
             rec("api", "claude", "/srv/api"),
         ]);
         // "cod" matches only the codex entry by agent

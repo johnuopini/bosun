@@ -30,7 +30,7 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
             agent: Some("claude".into()),
             // `/tmp/work` is chosen deliberately: the session_list meta
             // line runs `shorten_path` which replaces a `$HOME` prefix
-            // with `~`. Any path under `/Users/rhuk/...` would become
+            // with `~`. Any path under a real home dir would become
             // `~/...` on the dev machine and stay literal on CI, so the
             // snapshot would drift across machines. `/tmp` can never be
             // anyone's HOME, so both environments render identically.
