@@ -1,13 +1,16 @@
 [package]
 name = "bosun"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Andy Miller <hello@skulkworks.dev>"]
 description = "Tmux-native orchestrator for AI agent sessions"
 license = "MIT"
 repository = "https://github.com/yetidevworks/bosun"
+homepage = "https://github.com/yetidevworks/bosun"
 readme = "README.md"
+keywords = ["tmux", "tui", "ai", "claude", "terminal"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.30"
