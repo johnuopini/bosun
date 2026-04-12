@@ -425,8 +425,10 @@ impl App {
         );
         let input_handle = input_actor::spawn(evt_tx.clone());
 
-        let mut state = AppState::default();
-        state.divider_x = config.divider_x;
+        let state = AppState {
+            divider_x: config.divider_x,
+            ..Default::default()
+        };
 
         Self {
             state,
