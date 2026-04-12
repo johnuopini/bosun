@@ -1,5 +1,7 @@
 # Bosun
 
+![Bosun Screenshot](screenshot.png)
+
 Tmux-native orchestrator for AI agent sessions. Written in Rust with
 [ratatui](https://ratatui.rs/).
 
@@ -80,6 +82,7 @@ BOSUN_LOG=info cargo run    # tracing to stderr
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` / `k` / `j` | Move selection |
+| `Shift+↑` / `Shift+↓` / `K` / `J` | Reorder selected session |
 | `Enter` | Attach to selected session |
 | `n` | New session |
 | `r` | Rename selected session |
