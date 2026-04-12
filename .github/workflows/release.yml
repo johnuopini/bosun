@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  TAP_REPO: yetidevworks/homebrew-bosun
 
 permissions:
   contents: write
@@ -93,3 +94,153 @@ jobs:
           draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  update-formula:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      FORMULA_PATH: Formula/bosun.rb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Compute SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          hash() { sha256sum "$1" | awk '{print $1}'; }
+
+          f=$(find /tmp/artifacts -name '*darwin-aarch64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "darwin_arm64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*darwin-x86_64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "darwin_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-x86_64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+          f=$(find /tmp/artifacts -name '*linux-aarch64.tar.gz' -print -quit)
+          [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
+
+      - name: Read version from Cargo.toml
+        id: cargo
+        run: |
+          set -euo pipefail
+          VERSION=$(awk '
+            /^\[package\]/ {pkg=1; next}
+            /^\[/ && $0 !~ /^\[package\]/ {pkg=0}
+            pkg && $1 == "version" && $2 == "=" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION='${{ steps.cargo.outputs.version }}'
+          if [[ "${TAG_VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "Tag version (${TAG_VERSION}) does not match Cargo version (${CARGO_VERSION})." >&2
+            exit 1
+          fi
+
+      - name: Write formula and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          VER: ${{ steps.cargo.outputs.version }}
+          DARWIN_ARM64_SHA: ${{ steps.shas.outputs.darwin_arm64_sha }}
+          DARWIN_X86_64_SHA: ${{ steps.shas.outputs.darwin_x86_64_sha }}
+          LINUX_X86_64_SHA: ${{ steps.shas.outputs.linux_x86_64_sha }}
+          LINUX_AARCH64_SHA: ${{ steps.shas.outputs.linux_aarch64_sha }}
+        run: |
+          set -euo pipefail
+          TAP_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          if [[ -z "${DARWIN_ARM64_SHA}" || -z "${DARWIN_X86_64_SHA}" || -z "${LINUX_X86_64_SHA}" || -z "${LINUX_AARCH64_SHA}" ]]; then
+            echo "Missing required SHAs for Homebrew formula." >&2
+            exit 1
+          fi
+
+          # Use gh CLI for authentication
+          gh repo clone "${TAP_REPO}" tap || git init tap
+
+          cd tap
+          mkdir -p "$(dirname "${FORMULA_PATH}")"
+
+          # Write formula using printf to avoid YAML parsing issues with heredoc
+          printf '%s\n' \
+            "class Bosun < Formula" \
+            "  desc \"Tmux-native orchestrator for AI agent sessions\"" \
+            "  homepage \"https://github.com/${GITHUB_REPOSITORY}\"" \
+            "  license \"MIT\"" \
+            "  version \"${VER}\"" \
+            "" \
+            "  on_macos do" \
+            "    on_arm do" \
+            "      url \"${TAP_URL}/bosun-darwin-aarch64.tar.gz\"" \
+            "      sha256 \"${DARWIN_ARM64_SHA}\"" \
+            "    end" \
+            "    on_intel do" \
+            "      url \"${TAP_URL}/bosun-darwin-x86_64.tar.gz\"" \
+            "      sha256 \"${DARWIN_X86_64_SHA}\"" \
+            "    end" \
+            "  end" \
+            "" \
+            "  on_linux do" \
+            "    on_intel do" \
+            "      url \"${TAP_URL}/bosun-linux-x86_64.tar.gz\"" \
+            "      sha256 \"${LINUX_X86_64_SHA}\"" \
+            "    end" \
+            "    on_arm do" \
+            "      url \"${TAP_URL}/bosun-linux-aarch64.tar.gz\"" \
+            "      sha256 \"${LINUX_AARCH64_SHA}\"" \
+            "    end" \
+            "  end" \
+            "" \
+            "  def install" \
+            "    bin.install \"bosun\"" \
+            "  end" \
+            "" \
+            "  test do" \
+            "    assert_match \"bosun\", shell_output(\"#{bin}/bosun --version\")" \
+            "  end" \
+            "end" > "${FORMULA_PATH}"
+
+          git config user.name "bosun-bot"
+          git config user.email "bosun-bot@users.noreply.github.com"
+          git add "${FORMULA_PATH}"
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git commit -m "bosun ${VER}: update Homebrew formula"
+
+          # Push using gh CLI
+          git remote set-url origin "https://github.com/${TAP_REPO}.git" || git remote add origin "https://github.com/${TAP_REPO}.git"
+          gh auth setup-git
+          git push origin HEAD:main

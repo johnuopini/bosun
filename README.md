@@ -55,25 +55,31 @@ architecture, designed around a few rules that keep it simple and robust:
 - tmux 3.x (tested against 3.6)
 - macOS or Linux (Windows is not supported)
 
-## Install
+## Installation
 
-```sh
-make install                # builds release and copies to ~/.local/bin/bosun
+### Homebrew (recommended)
+
+```bash
+brew install yetidevworks/bosun/bosun
 ```
 
-Or build manually:
+### From crates.io
 
-```sh
-cargo build --release
-./target/release/bosun
+```bash
+cargo install bosun
 ```
 
-During development:
+### From source
 
-```sh
-cargo run
-BOSUN_LOG=info cargo run    # tracing to stderr
+```bash
+git clone https://github.com/yetidevworks/bosun
+cd bosun
+cargo install --path .
 ```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/yetidevworks/bosun/releases).
 
 ## Key bindings
 
@@ -221,6 +227,8 @@ server owned by the bosun process. Two reasons:
 ## Development
 
 ```sh
+cargo run
+BOSUN_LOG=info cargo run                       # tracing to stderr
 cargo test                                     # unit + snapshot tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
