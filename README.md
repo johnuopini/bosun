@@ -66,8 +66,10 @@ brew install yetidevworks/bosun/bosun
 ### From crates.io
 
 ```bash
-cargo install bosun
+cargo install bosun-tmux
 ```
+
+(The crate is published as `bosun-tmux` because `bosun` is reserved on crates.io; the installed binary is still `bosun`.)
 
 ### From source
 

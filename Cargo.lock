@@ -105,8 +105,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "bosun"
-version = "0.2.3"
+name = "bosun-tmux"
+version = "0.2.4"
 dependencies = [
  "ansi-to-tui",
  "anyhow",

@@ -1,6 +1,6 @@
 [package]
-name = "bosun"
-version = "0.2.3"
+name = "bosun-tmux"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Andy Miller <hello@skulkworks.dev>"]
@@ -11,6 +11,14 @@ homepage = "https://github.com/yetidevworks/bosun"
 readme = "README.md"
 keywords = ["tmux", "tui", "ai", "claude", "terminal"]
 categories = ["command-line-utilities"]
+
+[lib]
+name = "bosun"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bosun"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30"
