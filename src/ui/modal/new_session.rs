@@ -713,8 +713,8 @@ impl Modal for NewSessionModal {
                         let entry_style = Style::default().fg(fg).bg(bg);
                         let entry_x = dropdown_x + 3;
                         // Fill the entry background, then write text.
-                        for x in entry_x
-                            ..(entry_x + inner.width.saturating_sub(3)).min(area.right())
+                        for x in
+                            entry_x..(entry_x + inner.width.saturating_sub(3)).min(area.right())
                         {
                             let cell = &mut buf[(x, y)];
                             cell.set_char(' ');
