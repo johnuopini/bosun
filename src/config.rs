@@ -59,6 +59,9 @@ pub struct Config {
     /// Theme name. Resolved against user themes first, then
     /// built-ins (`opencode`, `tokyonight`), then a hard-fallback.
     pub theme: String,
+    /// Persisted divider position (absolute terminal column). `None`
+    /// means use the default 38% split.
+    pub divider_x: Option<u16>,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             tmux_socket: Some(DEFAULT_TMUX_SOCKET.to_string()),
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
+            divider_x: None,
         }
     }
 }
@@ -84,6 +88,8 @@ struct ConfigFile {
     tmux_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    divider_x: Option<u16>,
 }
 
 impl Config {
@@ -122,11 +128,14 @@ impl Config {
             None
         };
 
+        let divider_x = file.divider_x;
+
         Self {
             session_prefix,
             tmux_socket,
             self_session,
             theme,
+            divider_x,
         }
     }
 
@@ -202,6 +211,29 @@ pub fn write_theme(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the divider position to `config.toml`. Same
+/// read-modify-write approach as `write_theme`.
+pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.divider_x = x;
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// If `$TMUX` is set, ask tmux for the current session name. Used to
 /// exclude bosun's own session from its list.
 fn detect_self_session() -> Option<String> {
@@ -233,6 +265,7 @@ mod tests {
             tmux_socket: Some(DEFAULT_TMUX_SOCKET.to_string()),
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
+            divider_x: None,
         }
     }
 
@@ -266,6 +299,7 @@ mod tests {
             tmux_socket: None,
             self_session: Some("bosun-mine-abc".to_string()),
             theme: DEFAULT_THEME.to_string(),
+            divider_x: None,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

@@ -158,7 +158,7 @@ impl AppState {
                 // Mouse events are only used by the draggable divider
                 // between the session list and preview pane. No modal
                 // dispatching — modals don't react to mouse yet.
-                self.handle_mouse(m);
+                self.handle_mouse(m, &mut out);
             }
             AppMsg::Resize(w, h) => {
                 // Keep a cached terminal size for mouse handling —
@@ -307,7 +307,7 @@ impl AppState {
     ///
     /// Non-left-button events and any event while `term_size` is
     /// unset (pre-first-draw) are ignored.
-    fn handle_mouse(&mut self, m: MouseEvent) {
+    fn handle_mouse(&mut self, m: MouseEvent, out: &mut Vec<Command>) {
         if self.term_size.0 == 0 {
             return;
         }
@@ -325,9 +325,11 @@ impl AppState {
                 // allowed range (MIN_LIST_WIDTH..body - MIN_PREVIEW_WIDTH - 1).
                 self.divider_x = Some(m.column);
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Up(MouseButton::Left) if self.dragging_divider => {
                 self.dragging_divider = false;
+                out.push(Command::SaveDivider(self.divider_x));
             }
+            MouseEventKind::Up(MouseButton::Left) => {}
             _ => {}
         }
     }
@@ -384,8 +386,11 @@ impl App {
         );
         let input_handle = input_actor::spawn(evt_tx.clone());
 
+        let mut state = AppState::default();
+        state.divider_x = config.divider_x;
+
         Self {
-            state: AppState::default(),
+            state,
             cmd_tx,
             evt_rx,
             evt_tx,
@@ -439,6 +444,11 @@ impl App {
                             if let Err(e) = crate::config::write_theme(&name) {
                                 self.state.warning = Some(format!("theme: failed to save: {e}"));
                             }
+                        }
+                    }
+                    Command::SaveDivider(x) => {
+                        if let Err(e) = crate::config::write_divider_x(x) {
+                            self.state.warning = Some(format!("divider: failed to save: {e}"));
                         }
                     }
                     other => {

@@ -8,6 +8,7 @@
 //! reaches the UI.
 
 pub mod claude;
+pub mod codex;
 pub mod generic;
 
 use std::time::{Duration, SystemTime};
@@ -111,11 +112,11 @@ impl DetectorRegistry {
         self
     }
 
-    /// Build the default registry: claude + generic. User-configurable
-    /// regex detectors are added in Phase 5.
+    /// Build the default registry: claude + codex + generic.
     pub fn default_stack() -> Self {
         Self::new()
             .register(Box::new(claude::ClaudeDetector))
+            .register(Box::new(codex::CodexDetector))
             .register(Box::new(generic::GenericDetector))
     }
 

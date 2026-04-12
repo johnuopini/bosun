@@ -9,9 +9,10 @@ was built as a from-scratch reimagining of
 [agent-deck](https://github.com/yetidevworks/agent-deck) — same workflow, new
 architecture, designed around a few rules that keep it simple and robust:
 
-- **Tmux is the source of truth.** Bosun polls `tmux list-sessions` every
-  tick. No shared database state to race on; multi-instance coexistence is
-  trivial because every bosun reads the same tmux server.
+- **Tmux is the source of truth.** Bosun receives push notifications from
+  tmux via control mode (`tmux -C`). No shared database state to race on;
+  multi-instance coexistence is trivial because every bosun reads the same
+  tmux server.
 - **Actor pattern, single-writer app state.** One task owns tmux I/O, one
   task owns `AppState`. No nested mutexes, no `Arc<Mutex<...>>` scattered
   across the render path.
@@ -52,7 +53,13 @@ architecture, designed around a few rules that keep it simple and robust:
 - tmux 3.x (tested against 3.6)
 - macOS or Linux (Windows is not supported)
 
-## Build
+## Install
+
+```sh
+make install                # builds release and copies to ~/.local/bin/bosun
+```
+
+Or build manually:
 
 ```sh
 cargo build --release
@@ -100,7 +107,8 @@ working.
 | `Tab` / `Shift-Tab` | Next / previous field |
 | `Ctrl+R` | Open recents picker and pre-fill from a past session |
 | `Tab` (in path field) | Filesystem completion — 1 match commits, N matches extend to longest common prefix |
-| `↑` / `↓` (in path field) | Navigate filesystem dropdown |
+| `↑` / `↓` (in path field) | Navigate filesystem dropdown (scrollable) |
+| `Esc` (in path field) | Dismiss dropdown so Tab advances |
 | `Space` (on checkbox) | Toggle option |
 | `Enter` | Create session |
 | `Esc` | Cancel |
@@ -166,6 +174,7 @@ Example `config.toml`:
 theme          = "tokyonight"
 session_prefix = "bosun-"        # bosun only manages sessions with this prefix
 tmux_socket    = "bosun"         # dedicated tmux -L socket; "default" uses your shared socket
+divider_x      = 50              # saved automatically when you drag the list/preview divider
 ```
 
 Environment overrides:
@@ -237,11 +246,11 @@ src/
     parse.rs                 pure parsers for tmux CLI output
     attach.rs                Ctrl-Q keytable + panic safety
     status_bar.rs            per-session status line management
-    detector.rs              status detection (Running/Waiting/Idle/Error)
+    detector/                status detection (Claude, Codex, generic fallback)
     session.rs
   actors/
     tmux_actor.rs            owns TmuxClient, handles Commands
-    poller.rs                periodic tick pump
+    control_client.rs        tmux -C push notifications
     input_actor.rs           crossterm event stream -> AppMsg
   ui/
     mod.rs                   draw(frame, state, theme)
