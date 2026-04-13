@@ -20,6 +20,11 @@ use bosun::tmux::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("bosun {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     init_tracing();
 
     let config = Config::from_env();
