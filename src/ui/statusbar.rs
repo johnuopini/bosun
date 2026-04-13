@@ -13,7 +13,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     let bg = theme.panel_alt;
     let left = Line::from(vec![
         Span::styled(" bosun ", Style::default().fg(theme.text).bg(theme.accent)),
-        Span::styled(" ", Style::default().bg(bg)),
+        Span::styled(
+            format!(" v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.text_muted).bg(bg),
+        ),
         if let Some(w) = &state.warning {
             Span::styled(w.clone(), Style::default().fg(theme.status_waiting).bg(bg))
         } else {
