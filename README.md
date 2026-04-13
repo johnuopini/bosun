@@ -25,10 +25,11 @@ architecture, designed around a few rules that keep it simple and robust:
   `set-option -t <session>`, never globally, so non-bosun sessions on the
   same server are untouched.
 - **Opencode aesthetic.** Borderless, subtly shaded panels, bold accents,
-  modal dialogs with left accent bars and drop shadow. Ten built-in themes
-  to pick from (opencode, tokyonight, dracula, catppuccin-mocha,
-  one-dark-pro, ayu-mirage, nord, gruvbox-dark, rose-pine, github-dark),
-  switched live with `t`.
+  modal dialogs with left accent bars and drop shadow. Fifteen built-in
+  themes — ten dark (opencode, tokyonight, dracula, catppuccin-mocha,
+  one-dark-pro, ayu-mirage, nord, gruvbox-dark, rose-pine, github-dark)
+  and five light (github-light, one-light, solarized-light, ayu-light,
+  quiet-light) — switched live with `t`.
 
 ## Features
 
@@ -42,7 +43,7 @@ architecture, designed around a few rules that keep it simple and robust:
 - Recent sessions picker (`Ctrl+R` from the new-session modal) backed by
   SQLite, with live substring filter and delete-from-list
 - Session lifecycle: attach (`Enter`), rename (`r`), restart (`R`), kill (`d`)
-- Ten built-in themes plus user themes from
+- Fifteen built-in themes (10 dark + 5 light) plus user themes from
   `$XDG_CONFIG_HOME/bosun/themes/*.toml`; live preview picker on `t`
 - Config file at `$XDG_CONFIG_HOME/bosun/config.toml` with `theme`,
   `session_prefix`, `tmux_socket` knobs (env vars still override)
@@ -126,11 +127,12 @@ working.
 
 ## Themes
 
-Ten themes ship built in. Press `t` on the main list to open the picker —
-arrow keys live-preview the whole UI including the modal itself, `Enter`
-applies and writes the choice to `config.toml`, `Esc` reverts.
+Fifteen themes ship built in (ten dark, five light). Press `t` on the main
+list to open the picker — arrow keys live-preview the whole UI including
+the modal itself, `Enter` applies and writes the choice to `config.toml`,
+`Esc` reverts.
 
-Built-ins:
+Dark:
 
 - `opencode` (default)
 - `tokyonight`
@@ -142,6 +144,14 @@ Built-ins:
 - `gruvbox-dark`
 - `rose-pine`
 - `github-dark`
+
+Light:
+
+- `github-light`
+- `one-light`
+- `solarized-light`
+- `ayu-light`
+- `quiet-light`
 
 ### Custom themes
 
@@ -279,7 +289,7 @@ src/
       rename.rs
       confirm.rs
       theme.rs               theme picker with live preview
-themes/                      10 built-in theme .toml files (embedded via include_str!)
+themes/                      15 built-in theme .toml files (embedded via include_str!)
 tests/
   snapshot_session_list.rs
   integration_*.rs           real-tmux integration tests (feature = tmux-it)

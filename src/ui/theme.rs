@@ -99,6 +99,11 @@ impl Theme {
             "gruvbox-dark" => include_str!("../../themes/gruvbox-dark.toml"),
             "rose-pine" => include_str!("../../themes/rose-pine.toml"),
             "github-dark" => include_str!("../../themes/github-dark.toml"),
+            "github-light" => include_str!("../../themes/github-light.toml"),
+            "one-light" => include_str!("../../themes/one-light.toml"),
+            "solarized-light" => include_str!("../../themes/solarized-light.toml"),
+            "ayu-light" => include_str!("../../themes/ayu-light.toml"),
+            "quiet-light" => include_str!("../../themes/quiet-light.toml"),
             _ => return None,
         };
         match toml::from_str::<Theme>(src) {
@@ -125,6 +130,11 @@ impl Theme {
             "gruvbox-dark",
             "rose-pine",
             "github-dark",
+            "github-light",
+            "one-light",
+            "solarized-light",
+            "ayu-light",
+            "quiet-light",
         ]
     }
 
