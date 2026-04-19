@@ -86,6 +86,13 @@ pub struct AppState {
     /// (dead sessions dropped, new sessions appended to `ungrouped`).
     /// Persisted to `config.toml` via `Command::SaveSidebar`.
     pub sidebar: SidebarModel,
+    /// Map from display name → last-known section name. Updated
+    /// whenever the user moves a session into/out of a section.
+    /// Used to auto-place a newly-appearing session (e.g. after a
+    /// restart or when opened from recents) back into the same
+    /// section, as long as a section with that name still exists.
+    /// Persisted via `Command::SaveSessionHistory`.
+    pub session_history: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +163,65 @@ impl AppState {
         self.sessions.iter().find(|v| v.name() == name)
     }
 
+    /// Update `session_history` from a single moved session. Looks up
+    /// the session's display name from `self.sessions` and stores the
+    /// current section it lives in (or clears the entry for ungrouped).
+    /// No-op if the session isn't currently live.
+    fn update_history_for(&mut self, internal: &str) -> bool {
+        let display = match self.sessions.iter().find(|v| v.name() == internal) {
+            Some(v) => v.display().to_string(),
+            None => return false,
+        };
+        // In a section?
+        for sec in &self.sidebar.sections {
+            if sec.members.iter().any(|n| n == internal) {
+                let prev = self.session_history.insert(display, sec.name.clone());
+                return prev.as_deref() != Some(sec.name.as_str());
+            }
+        }
+        // Otherwise ungrouped → drop the history entry.
+        self.session_history.remove(&display).is_some()
+    }
+
+    /// Walk `ungrouped` and move each session with a matching
+    /// `session_history` entry into the section of that name, if such a
+    /// section exists. Returns true if the sidebar was mutated.
+    fn restore_from_history(&mut self) -> bool {
+        let mut changed = false;
+        // Iterate over a snapshot of ungrouped so we can mutate during the loop.
+        let ungrouped = self.sidebar.ungrouped.clone();
+        for internal in ungrouped {
+            let display = match self.sessions.iter().find(|v| v.name() == internal) {
+                Some(v) => v.display().to_string(),
+                None => continue,
+            };
+            let section_name = match self.session_history.get(&display).cloned() {
+                Some(n) => n,
+                None => continue,
+            };
+            let si = match self
+                .sidebar
+                .sections
+                .iter()
+                .position(|s| s.name == section_name)
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            if let Some(pos) = self.sidebar.ungrouped.iter().position(|n| n == &internal) {
+                let n = self.sidebar.ungrouped.remove(pos);
+                self.sidebar.sections[si].members.push(n);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Emit a `SaveSessionHistory` command with the current history.
+    fn save_session_history(&self, out: &mut Vec<Command>) {
+        out.push(Command::SaveSessionHistory(self.session_history.clone()));
+    }
+
     /// Pure reducer. Returns a list of Commands the caller should dispatch.
     pub fn apply(&mut self, msg: AppMsg) -> Vec<Command> {
         let mut out = Vec::new();
@@ -180,6 +246,14 @@ impl AppState {
                 let live: Vec<String> =
                     self.sessions.iter().map(|v| v.name().to_string()).collect();
                 self.sidebar.reconcile(&live);
+
+                // Auto-place new sessions into their last-known
+                // section by display-name match. Handles both
+                // restart (same display name, new internal name)
+                // and recents (same display name, fresh internal).
+                if self.restore_from_history() {
+                    self.save_sidebar(&mut out);
+                }
 
                 if let Some(target) = select_after {
                     if let Some(idx) = self.sidebar.find_identity(&target) {
@@ -331,10 +405,19 @@ impl AppState {
                 Some(Location::Header(si)) => {
                     // Delete the section header; its members flow
                     // back into ungrouped. No confirm — trivial to
-                    // re-add with `g`.
+                    // re-add with `g`. Also drop any session_history
+                    // entries that pointed at this section name so a
+                    // later recreate doesn't re-place them into a
+                    // section the user just tore down.
+                    let gone_name = self.sidebar.sections[si].name.clone();
                     self.sidebar.delete_section_at(si);
                     self.clamp_selection();
                     self.save_sidebar(out);
+                    let before = self.session_history.len();
+                    self.session_history.retain(|_, v| v != &gone_name);
+                    if self.session_history.len() != before {
+                        self.save_session_history(out);
+                    }
                 }
                 Some(_) => {
                     if let Some(sel) = self.selected_session() {
@@ -485,6 +568,7 @@ impl AppState {
                 self.sidebar.sections[si].members.remove(mi)
             }
         };
+        let moved = name.clone();
         match target {
             None => {
                 self.sidebar.ungrouped.push(name);
@@ -498,6 +582,9 @@ impl AppState {
             }
         }
         self.save_sidebar(out);
+        if self.update_history_for(&moved) {
+            self.save_session_history(out);
+        }
     }
 
     /// Shift-Right. Move a session one bucket forward: ungrouped →
@@ -509,26 +596,34 @@ impl AppState {
             Some(l) => l,
             None => return,
         };
-        match loc {
+        let moved = match loc {
             Location::Ungrouped(i) => {
                 if self.sidebar.sections.is_empty() {
                     return;
                 }
                 let name = self.sidebar.ungrouped.remove(i);
+                let m = name.clone();
                 self.sidebar.sections[0].members.insert(0, name);
                 self.selected = self.sidebar.flat_index(Location::Member(0, 0));
-                self.save_sidebar(out);
+                Some(m)
             }
             Location::Member(si, mi) => {
                 if si + 1 >= self.sidebar.sections.len() {
                     return;
                 }
                 let name = self.sidebar.sections[si].members.remove(mi);
+                let m = name.clone();
                 self.sidebar.sections[si + 1].members.insert(0, name);
                 self.selected = self.sidebar.flat_index(Location::Member(si + 1, 0));
-                self.save_sidebar(out);
+                Some(m)
             }
-            Location::Header(_) => {}
+            Location::Header(_) => None,
+        };
+        if let Some(name) = moved {
+            self.save_sidebar(out);
+            if self.update_history_for(&name) {
+                self.save_session_history(out);
+            }
         }
     }
 
@@ -541,10 +636,11 @@ impl AppState {
             Some(l) => l,
             None => return,
         };
-        match loc {
-            Location::Ungrouped(_) => {} // already at leftmost bucket
+        let moved = match loc {
+            Location::Ungrouped(_) => None, // already at leftmost bucket
             Location::Member(si, mi) => {
                 let name = self.sidebar.sections[si].members.remove(mi);
+                let m = name.clone();
                 if si == 0 {
                     // Out of group 0 → ungrouped (end).
                     self.sidebar.ungrouped.push(name);
@@ -556,9 +652,15 @@ impl AppState {
                     let new_mi = self.sidebar.sections[target].members.len() - 1;
                     self.selected = self.sidebar.flat_index(Location::Member(target, new_mi));
                 }
-                self.save_sidebar(out);
+                Some(m)
             }
-            Location::Header(_) => {}
+            Location::Header(_) => None,
+        };
+        if let Some(name) = moved {
+            self.save_sidebar(out);
+            if self.update_history_for(&name) {
+                self.save_session_history(out);
+            }
         }
     }
 
@@ -574,9 +676,33 @@ impl AppState {
     }
 
     /// Rename an existing section by id. No-op if the id isn't found.
+    /// Also rewrites matching `session_history` entries so members keep
+    /// their auto-restore association through the rename.
     pub fn rename_section(&mut self, id: &str, new_name: String, out: &mut Vec<Command>) {
-        if self.sidebar.rename_section(id, new_name) {
+        // Look up the old name before the rename so we can migrate
+        // history entries from old → new.
+        let old_name = self
+            .sidebar
+            .sections
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone());
+        if self.sidebar.rename_section(id, new_name.clone()) {
             self.save_sidebar(out);
+            if let Some(old) = old_name {
+                if old != new_name {
+                    let mut changed = false;
+                    for val in self.session_history.values_mut() {
+                        if *val == old {
+                            *val = new_name.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.save_session_history(out);
+                    }
+                }
+            }
         }
     }
 
@@ -674,6 +800,7 @@ impl App {
         let state = AppState {
             divider_x: config.divider_x,
             sidebar: config.sidebar.clone(),
+            session_history: config.session_history.clone(),
             ..Default::default()
         };
 
@@ -743,6 +870,11 @@ impl App {
                     Command::SaveSidebar(entries) => {
                         if let Err(e) = crate::config::write_sidebar(&entries) {
                             self.state.warning = Some(format!("sidebar: failed to save: {e}"));
+                        }
+                    }
+                    Command::SaveSessionHistory(history) => {
+                        if let Err(e) = crate::config::write_session_history(&history) {
+                            self.state.warning = Some(format!("history: failed to save: {e}"));
                         }
                     }
                     Command::InsertSection { name } => {
@@ -1376,5 +1508,79 @@ mod tests {
             Some("bosun".to_string()),
             "cursor should track bosun into YETI"
         );
+    }
+
+    /// Moving a session into a section records its display name in
+    /// `session_history`.
+    #[test]
+    fn move_into_section_updates_history() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("bosun-abc")];
+        s.sidebar = model(&["bosun-abc"], vec![section("g1", "Work", &[])]);
+        s.selected = 0;
+
+        // `1` jumps ungrouped bosun-abc into "Work".
+        s.apply(AppMsg::Key(key(KeyCode::Char('1'))));
+
+        // `sessions[0].display()` falls back to the internal name when no
+        // display is set, so we check against that.
+        assert_eq!(
+            s.session_history.get("bosun-abc"),
+            Some(&"Work".to_string())
+        );
+    }
+
+    /// After a restart, a new session with the same display name as
+    /// the old one lands back in its original section.
+    #[test]
+    fn restart_restores_section_via_history() {
+        let mut s = AppState::default();
+        // Simulate the post-restart `SessionsRefreshed`: the old
+        // bosun-abc is gone, a new bosun-def appears with the same
+        // display name. History already says "bosun-abc" was in "Work".
+        s.session_history
+            .insert("bosun-abc".to_string(), "Work".to_string());
+        s.sidebar = model(&[], vec![section("g1", "Work", &[])]);
+
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-abc")],
+            select_after: Some("bosun-abc".to_string()),
+        });
+
+        assert!(s.sidebar.ungrouped.is_empty());
+        assert_eq!(s.sidebar.sections[0].members, vec!["bosun-abc".to_string()]);
+    }
+
+    /// Renaming a section rewrites matching history entries so the
+    /// auto-restore association survives the rename.
+    #[test]
+    fn section_rename_migrates_history_entries() {
+        let mut s = AppState::default();
+        s.sidebar = model(&[], vec![section("g1", "Work", &[])]);
+        s.session_history
+            .insert("bosun-abc".to_string(), "Work".to_string());
+
+        let mut out = Vec::new();
+        s.rename_section("g1", "WorkStuff".to_string(), &mut out);
+
+        assert_eq!(
+            s.session_history.get("bosun-abc"),
+            Some(&"WorkStuff".to_string())
+        );
+    }
+
+    /// Deleting a section drops matching history entries (so a later
+    /// recreate doesn't try to put them into a non-existent section).
+    #[test]
+    fn section_delete_drops_history_entries() {
+        let mut s = AppState::default();
+        s.sidebar = model(&[], vec![section("g1", "Work", &[])]);
+        s.session_history
+            .insert("bosun-abc".to_string(), "Work".to_string());
+        s.selected = 0;
+
+        s.apply(AppMsg::Key(key(KeyCode::Char('d'))));
+
+        assert!(s.session_history.is_empty());
     }
 }

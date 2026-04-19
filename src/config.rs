@@ -102,6 +102,11 @@ pub struct Config {
     /// `[sidebar]` table in `config.toml` so ordering and group
     /// structure survive bosun restarts.
     pub sidebar: SidebarModel,
+    /// Map from session display name → last-known section name.
+    /// When a session is killed/restarted or a recent is opened,
+    /// the new session is placed back into that section if one with
+    /// the same name still exists. Persisted as `[session_history]`.
+    pub session_history: std::collections::HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -113,6 +118,7 @@ impl Default for Config {
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
             sidebar: SidebarModel::default(),
+            session_history: std::collections::HashMap::new(),
         }
     }
 }
@@ -137,6 +143,10 @@ struct ConfigFile {
     /// before this field is deserialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar: Option<SidebarModel>,
+    /// Last-known section name per display name. Used to restore
+    /// group membership across kill/restart/recents flows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_history: Option<std::collections::HashMap<String, String>>,
     /// Legacy pre-0.2.8 flat list of internal names. Read-only for
     /// migration; never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +205,8 @@ impl Config {
             }
         };
 
+        let session_history = file.session_history.unwrap_or_default();
+
         Self {
             session_prefix,
             tmux_socket,
@@ -202,6 +214,7 @@ impl Config {
             theme,
             divider_x,
             sidebar,
+            session_history,
         }
     }
 
@@ -339,6 +352,32 @@ pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the session-history map (display_name → section_name) to
+/// `config.toml`. An empty map clears the field.
+pub fn write_session_history(
+    history: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = read_config_file().unwrap_or_default();
+    file.session_history = if history.is_empty() {
+        None
+    } else {
+        Some(history.clone())
+    };
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Persist the user-defined sidebar (explicit-membership model) to
 /// `config.toml`. Same read-modify-write approach as `write_theme`.
 /// An empty model clears the field from the file. Also drops the
@@ -402,6 +441,7 @@ mod tests {
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
             sidebar: SidebarModel::default(),
+            session_history: std::collections::HashMap::new(),
         }
     }
 
@@ -437,6 +477,7 @@ mod tests {
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
             sidebar: SidebarModel::default(),
+            session_history: std::collections::HashMap::new(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

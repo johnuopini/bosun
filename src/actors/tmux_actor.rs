@@ -390,6 +390,7 @@ pub fn spawn(
                 Command::SetTheme { .. }
                 | Command::SaveDivider(_)
                 | Command::SaveSidebar(_)
+                | Command::SaveSessionHistory(_)
                 | Command::InsertSection { .. }
                 | Command::RenameSection { .. } => {
                     // Pure UI state — the app loop intercepts these

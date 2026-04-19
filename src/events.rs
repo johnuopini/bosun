@@ -107,6 +107,9 @@ pub enum Command {
     /// config.toml. Intercepted by the app loop — never forwarded to
     /// the tmux actor.
     SaveSidebar(crate::sidebar::SidebarModel),
+    /// Persist the display_name → section_name history to config.toml.
+    /// Intercepted by the app loop — never forwarded to the tmux actor.
+    SaveSessionHistory(std::collections::HashMap<String, String>),
     /// Insert a new section header above the cursor with the given name.
     /// Intercepted by the app loop — never forwarded to the tmux actor.
     InsertSection { name: String },
