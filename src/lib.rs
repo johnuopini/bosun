@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod sidebar;
 pub mod store;
 pub mod tmux;
 pub mod ui;

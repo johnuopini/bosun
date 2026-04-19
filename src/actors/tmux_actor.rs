@@ -389,7 +389,9 @@ pub fn spawn(
                 }
                 Command::SetTheme { .. }
                 | Command::SaveDivider(_)
-                | Command::SaveSessionOrder(_) => {
+                | Command::SaveSidebar(_)
+                | Command::InsertSection { .. }
+                | Command::RenameSection { .. } => {
                     // Pure UI state — the app loop intercepts these
                     // before forwarding. If one makes it here the
                     // intercept path is broken.

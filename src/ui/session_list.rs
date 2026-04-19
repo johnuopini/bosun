@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::AppState;
+use crate::sidebar::SidebarEntry;
 use crate::tmux::detector::Status;
 use crate::tmux::session::SessionView;
 use crate::ui::Theme;
@@ -14,7 +15,7 @@ use crate::ui::Theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let block = Block::default().style(Style::default().bg(theme.bg));
 
-    let lines: Vec<Line<'_>> = if state.sessions.is_empty() {
+    let lines: Vec<Line<'_>> = if state.sidebar_entries.is_empty() {
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -22,27 +23,96 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 Style::default().fg(theme.text_muted),
             )),
             Line::from(Span::styled(
-                "  (press r to refresh)",
+                "  (press n to create · g for a section)",
                 Style::default().fg(theme.text_muted),
             )),
         ]
     } else {
-        // Each session produces two lines: the primary row (marker +
-        // status glyph + display name + window count + attached flag)
-        // and a secondary meta row ("agent · path", muted). Both lines
-        // share the same row background so the selection highlight is
-        // one contiguous block.
-        let mut out: Vec<Line<'_>> = Vec::with_capacity(state.sessions.len() * 2);
-        for (i, v) in state.sessions.iter().enumerate() {
+        // Section headers render as a single bold accent line.
+        // Sessions render as two lines (primary + meta) — same as
+        // before. The selection index is into sidebar_entries, not
+        // into lines, so one entry can produce 1 or 2 lines without
+        // breaking selection math.
+        let mut out: Vec<Line<'_>> = Vec::with_capacity(state.sidebar_entries.len() * 2);
+        for (i, entry) in state.sidebar_entries.iter().enumerate() {
             let selected = i == state.selected;
-            out.push(render_primary_line(v, selected, area.width, theme));
-            out.push(render_meta_line(v, selected, area.width, theme));
+            match entry {
+                SidebarEntry::Section { name, .. } => {
+                    out.push(render_section_line(name, selected, area.width, theme));
+                }
+                SidebarEntry::Session { internal } => {
+                    // Look up the live view; if tmux's list just
+                    // raced ahead of reconcile, render a placeholder
+                    // row so the layout stays stable.
+                    match state.session_by_name(internal) {
+                        Some(v) => {
+                            out.push(render_primary_line(v, selected, area.width, theme));
+                            out.push(render_meta_line(v, selected, area.width, theme));
+                        }
+                        None => {
+                            out.push(render_missing_line(internal, selected, area.width, theme));
+                        }
+                    }
+                }
+            }
         }
         out
     };
 
     let p = Paragraph::new(lines).block(block);
     frame.render_widget(p, area);
+}
+
+fn render_section_line(
+    name: &str,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = row_bg(selected, theme);
+    let marker = if selected { "▌" } else { " " };
+    let marker_style = if selected {
+        Style::default().fg(theme.accent).bg(bg)
+    } else {
+        Style::default().fg(bg).bg(bg)
+    };
+    let title_style = Style::default()
+        .fg(theme.accent)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+
+    // Upper-case the name so it reads as a header even at small sizes.
+    // Render as `▸ NAME` so it's visually distinct from session rows.
+    let label = format!("▸ {}", name.to_uppercase());
+    let used = 3 + label.chars().count();
+    let pad = (width as usize).saturating_sub(used);
+
+    Line::from(vec![
+        Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled(label, title_style),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+    ])
+}
+
+fn render_missing_line(
+    internal: &str,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    // Fallback for the brief window where sidebar_entries references
+    // a session that hasn't yet been observed by a refresh. Keeps
+    // the row count predictable so selection math doesn't skew.
+    let bg = row_bg(selected, theme);
+    let used = 4 + internal.chars().count();
+    let pad = (width as usize).saturating_sub(used);
+    Line::from(vec![
+        Span::styled(
+            format!("  ? {}", internal),
+            Style::default().fg(theme.text_muted).bg(bg),
+        ),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+    ])
 }
 
 fn status_color(status: Status, theme: &Theme) -> Color {

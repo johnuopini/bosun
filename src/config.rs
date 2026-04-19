@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::sidebar::SidebarEntry;
+
 /// The default prefix that bosun considers "managed". Only tmux
 /// sessions whose name starts with this prefix appear in bosun's UI
 /// and get the bosun status bar applied. Set `BOSUN_PREFIX=` (empty)
@@ -62,11 +64,10 @@ pub struct Config {
     /// Persisted divider position (absolute terminal column). `None`
     /// means use the default 38% split.
     pub divider_x: Option<u16>,
-    /// User-defined session ordering, as internal tmux names. Sessions
-    /// not in this list are rendered at the end in tmux's natural order.
-    /// Updated live when the user reorders with Shift-J/K; persisted to
-    /// `config.toml` so ordering survives bosun restarts.
-    pub session_order: Vec<String>,
+    /// User-defined sidebar ordering with sections + sessions.
+    /// Empty on first launch. Persisted to `config.toml` so ordering
+    /// and group structure survive bosun restarts.
+    pub sidebar: Vec<SidebarEntry>,
 }
 
 impl Default for Config {
@@ -77,7 +78,7 @@ impl Default for Config {
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            session_order: Vec::new(),
+            sidebar: Vec::new(),
         }
     }
 }
@@ -96,6 +97,12 @@ struct ConfigFile {
     theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     divider_x: Option<u16>,
+    /// New sidebar format — headers + sessions interleaved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidebar: Option<Vec<SidebarEntry>>,
+    /// Legacy field (pre-0.2.8). Read-only for migration; never written
+    /// back. If present and `sidebar` is absent, the session names are
+    /// promoted to ungrouped Session entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_order: Option<Vec<String>>,
 }
@@ -137,7 +144,17 @@ impl Config {
         };
 
         let divider_x = file.divider_x;
-        let session_order = file.session_order.unwrap_or_default();
+        // Prefer the new `sidebar` field; fall back to migrating the
+        // legacy flat `session_order` list of internal names.
+        let sidebar = match file.sidebar {
+            Some(s) => s,
+            None => file
+                .session_order
+                .unwrap_or_default()
+                .into_iter()
+                .map(SidebarEntry::session)
+                .collect(),
+        };
 
         Self {
             session_prefix,
@@ -145,7 +162,7 @@ impl Config {
             self_session,
             theme,
             divider_x,
-            session_order,
+            sidebar,
         }
     }
 
@@ -244,10 +261,12 @@ pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Persist the user-defined session order to `config.toml`. Same
-/// read-modify-write approach as `write_theme`. An empty slice clears
-/// the field from the file.
-pub fn write_session_order(order: &[String]) -> std::io::Result<()> {
+/// Persist the user-defined sidebar (headers + session order) to
+/// `config.toml`. Same read-modify-write approach as `write_theme`.
+/// An empty slice clears the field from the file. Also clears the
+/// legacy `session_order` field so the config converges on the new
+/// shape after the first save.
+pub fn write_sidebar(entries: &[SidebarEntry]) -> std::io::Result<()> {
     let dir =
         config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
     std::fs::create_dir_all(&dir)?;
@@ -257,11 +276,14 @@ pub fn write_session_order(order: &[String]) -> std::io::Result<()> {
         Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
         Err(_) => ConfigFile::default(),
     };
-    file.session_order = if order.is_empty() {
+    file.sidebar = if entries.is_empty() {
         None
     } else {
-        Some(order.to_vec())
+        Some(entries.to_vec())
     };
+    // Post-migration, drop any legacy field so we don't keep two
+    // sources of truth in the file.
+    file.session_order = None;
 
     let body = toml::to_string(&file)
         .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
@@ -304,7 +326,7 @@ mod tests {
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            session_order: Vec::new(),
+            sidebar: Vec::new(),
         }
     }
 
@@ -339,7 +361,7 @@ mod tests {
             self_session: Some("bosun-mine-abc".to_string()),
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            session_order: Vec::new(),
+            sidebar: Vec::new(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

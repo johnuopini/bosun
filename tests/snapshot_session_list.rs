@@ -6,12 +6,28 @@
 use std::time::SystemTime;
 
 use bosun::app::AppState;
+use bosun::sidebar::SidebarEntry;
 use bosun::tmux::detector::Status;
 use bosun::tmux::session::SessionView;
 use bosun::tmux::TmuxSession;
 use bosun::ui::Theme;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+
+/// Build an AppState where the sidebar ordering mirrors the given
+/// sessions (each as a `Session` entry, no headers). For snapshot
+/// tests that only care about pre-grouping rendering.
+fn state_with(sessions: Vec<SessionView>) -> AppState {
+    let sidebar_entries: Vec<SidebarEntry> = sessions
+        .iter()
+        .map(|s| SidebarEntry::session(s.name()))
+        .collect();
+    AppState {
+        sessions,
+        sidebar_entries,
+        ..Default::default()
+    }
+}
 
 fn ses(name: &str, attached: bool) -> SessionView {
     ses_with_status(name, attached, Status::Idle)
@@ -69,38 +85,57 @@ fn empty_session_list() {
 
 #[test]
 fn three_sessions_with_middle_selected() {
-    let state = AppState {
-        sessions: vec![ses("alpha", false), ses("beta", true), ses("gamma", false)],
-        selected: 1,
-        ..Default::default()
-    };
+    let mut state = state_with(vec![
+        ses("alpha", false),
+        ses("beta", true),
+        ses("gamma", false),
+    ]);
+    state.selected = 1;
     let frame = render(&state, 80, 10);
     insta::assert_snapshot!("three_sessions_middle_selected", frame);
 }
 
 #[test]
 fn warning_shows_in_statusbar() {
-    let state = AppState {
-        sessions: vec![ses("alpha", false)],
-        warning: Some("list: tmux not running".to_string()),
-        ..Default::default()
-    };
+    let mut state = state_with(vec![ses("alpha", false)]);
+    state.warning = Some("list: tmux not running".to_string());
     let frame = render(&state, 80, 6);
     insta::assert_snapshot!("warning_in_statusbar", frame);
 }
 
 #[test]
 fn mixed_statuses_render_glyphs() {
-    let state = AppState {
-        sessions: vec![
-            ses_with_status("build", false, Status::Running),
-            ses_with_status("review", true, Status::Waiting),
-            ses_with_status("shell", false, Status::Idle),
-            ses_with_status("crashed", false, Status::Error),
-        ],
-        selected: 1,
-        ..Default::default()
-    };
+    let mut state = state_with(vec![
+        ses_with_status("build", false, Status::Running),
+        ses_with_status("review", true, Status::Waiting),
+        ses_with_status("shell", false, Status::Idle),
+        ses_with_status("crashed", false, Status::Error),
+    ]);
+    state.selected = 1;
     let frame = render(&state, 80, 10);
     insta::assert_snapshot!("mixed_statuses", frame);
+}
+
+#[test]
+fn sections_group_sessions() {
+    let mut state = AppState {
+        sessions: vec![
+            ses("alpha", false),
+            ses("beta", false),
+            ses("gamma", true),
+        ],
+        selected: 1, // on the section header
+        ..Default::default()
+    };
+    state.sidebar_entries = vec![
+        SidebarEntry::session("alpha"),
+        SidebarEntry::Section {
+            id: "g1".into(),
+            name: "Premium Products".into(),
+        },
+        SidebarEntry::session("beta"),
+        SidebarEntry::session("gamma"),
+    ];
+    let frame = render(&state, 80, 12);
+    insta::assert_snapshot!("sections_group_sessions", frame);
 }

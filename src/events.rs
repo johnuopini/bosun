@@ -103,9 +103,16 @@ pub enum Command {
     /// Persist the divider position to config.toml. Intercepted by
     /// the app loop — never forwarded to the tmux actor.
     SaveDivider(Option<u16>),
-    /// Persist the user-defined session order to config.toml.
+    /// Persist the user-defined sidebar (sections + session order) to
+    /// config.toml. Intercepted by the app loop — never forwarded to
+    /// the tmux actor.
+    SaveSidebar(Vec<crate::sidebar::SidebarEntry>),
+    /// Insert a new section header above the cursor with the given name.
     /// Intercepted by the app loop — never forwarded to the tmux actor.
-    SaveSessionOrder(Vec<String>),
+    InsertSection { name: String },
+    /// Rename a section header by its id.
+    /// Intercepted by the app loop — never forwarded to the tmux actor.
+    RenameSection { id: String, new_name: String },
     /// Set the active theme. Intercepted by the app loop — this
     /// command is NEVER forwarded to the tmux actor (it's a pure UI
     /// state change). `persist=false` is a transient live preview
