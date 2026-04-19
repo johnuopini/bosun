@@ -134,7 +134,10 @@ impl AppState {
     /// on a session (ungrouped or a member). `None` for section headers.
     pub fn selected_session_name(&self) -> Option<String> {
         let visible = self.sidebar.visible();
-        visible.get(self.selected)?.session_name().map(|s| s.to_string())
+        visible
+            .get(self.selected)?
+            .session_name()
+            .map(|s| s.to_string())
     }
 
     /// Look up the `SessionView` under the cursor (if it's a session).
@@ -908,6 +911,7 @@ impl App {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::tmux::detector::Status;
@@ -1175,7 +1179,10 @@ mod tests {
         s.apply(AppMsg::Key(shift_j));
 
         // b didn't move — it's at the end of ungrouped.
-        assert_eq!(s.sidebar, model(&["a", "b"], vec![section("g1", "First", &["c"])]));
+        assert_eq!(
+            s.sidebar,
+            model(&["a", "b"], vec![section("g1", "First", &["c"])])
+        );
     }
 
     /// Shift-Right moves an ungrouped session into the first section
@@ -1212,7 +1219,10 @@ mod tests {
         let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
         s.apply(AppMsg::Key(shift_left));
 
-        assert_eq!(s.sidebar, model(&["a", "b"], vec![section("g1", "First", &[])]));
+        assert_eq!(
+            s.sidebar,
+            model(&["a", "b"], vec![section("g1", "First", &[])])
+        );
         // b is now ungrouped at index 1.
         assert_eq!(s.selected, 1);
     }

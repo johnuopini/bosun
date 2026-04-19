@@ -221,6 +221,7 @@ impl SidebarModel {
     /// - Dedupes sessions that appear in multiple buckets (keeps the
     ///   first occurrence in visible order — ungrouped > section 0 > ...).
     /// - Appends any live session not already present to `ungrouped`.
+    ///
     /// Sections are preserved even if they end up empty.
     pub fn reconcile(&mut self, live: &[String]) {
         // 1. Drop dead sessions.
@@ -342,7 +343,10 @@ mod tests {
     fn delete_section_moves_members_to_ungrouped() {
         let mut m = model(&["a"], vec![sec("g1", "W", &["b", "c"])]);
         m.delete_section_at(0);
-        assert_eq!(m.ungrouped, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            m.ungrouped,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         assert!(m.sections.is_empty());
     }
 

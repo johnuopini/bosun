@@ -264,10 +264,7 @@ fn read_config_file() -> Option<ConfigFile> {
                                 table.insert("sidebar".to_string(), v);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "failed to serialize migrated sidebar: {}",
-                                    e
-                                );
+                                tracing::warn!("failed to serialize migrated sidebar: {}", e);
                                 table.remove("sidebar");
                             }
                         }

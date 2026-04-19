@@ -119,11 +119,7 @@ fn mixed_statuses_render_glyphs() {
 #[test]
 fn sections_group_sessions() {
     let mut state = AppState {
-        sessions: vec![
-            ses("alpha", false),
-            ses("beta", false),
-            ses("gamma", true),
-        ],
+        sessions: vec![ses("alpha", false), ses("beta", false), ses("gamma", true)],
         selected: 1, // on the section header
         ..Default::default()
     };

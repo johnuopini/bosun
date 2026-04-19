@@ -56,7 +56,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     } else {
                         None
                     };
-                    out.push(render_section_line(s, selected, jump_key, area.width, theme));
+                    out.push(render_section_line(
+                        s, selected, jump_key, area.width, theme,
+                    ));
                     section_idx += 1;
                 }
                 VisibleEntry::SectionMember { internal, .. } => {
@@ -126,8 +128,7 @@ fn render_section_line(
     let count_style = Style::default().fg(theme.text_muted).bg(bg);
 
     let label = format!("▸ {}", section.name.to_uppercase());
-    let used =
-        3 + key_prefix.chars().count() + label.chars().count() + count_label.chars().count();
+    let used = 3 + key_prefix.chars().count() + label.chars().count() + count_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
 
     Line::from(vec![
