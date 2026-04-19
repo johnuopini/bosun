@@ -17,7 +17,7 @@ use crate::actors::{input_actor, tmux_actor};
 use crate::config::Config;
 use crate::error::{BosunError, Result};
 use crate::events::{AppMsg, Command};
-use crate::sidebar::{reconcile as reconcile_sidebar, SidebarEntry};
+use crate::sidebar::{Location, SidebarModel, VisibleKind};
 use crate::store::Store;
 use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
@@ -79,11 +79,13 @@ pub struct AppState {
     /// held down after a Down on the divider column). Render uses
     /// this to highlight the divider glyph.
     pub dragging_divider: bool,
-    /// The ordered sidebar: section headers and session references
-    /// interleaved. `selected` indexes into this list. Reconciled on
-    /// every `SessionsRefreshed` (dead sessions dropped, new sessions
-    /// appended). Persisted to `config.toml` via `Command::SaveSidebar`.
-    pub sidebar_entries: Vec<SidebarEntry>,
+    /// The sidebar state: explicit `ungrouped` bucket + ordered
+    /// `sections` list with per-section `members`. `selected` indexes
+    /// into the flattened visible list (`sidebar.visible()`), not
+    /// into any one bucket. Reconciled on every `SessionsRefreshed`
+    /// (dead sessions dropped, new sessions appended to `ungrouped`).
+    /// Persisted to `config.toml` via `Command::SaveSidebar`.
+    pub sidebar: SidebarModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,38 +104,46 @@ pub enum ModalRequest {
 }
 
 impl AppState {
-    /// Emit a `SaveSidebar` command with the current entries. Called
+    /// Emit a `SaveSidebar` command with the current model. Called
     /// whenever the sidebar is mutated (reorder, add section, rename,
     /// delete).
     fn save_sidebar(&self, out: &mut Vec<Command>) {
-        out.push(Command::SaveSidebar(self.sidebar_entries.clone()));
+        out.push(Command::SaveSidebar(self.sidebar.clone()));
     }
 
     fn clamp_selection(&mut self) {
-        if self.sidebar_entries.is_empty() {
+        let len = self.sidebar.len();
+        if len == 0 {
             self.selected = 0;
-        } else if self.selected >= self.sidebar_entries.len() {
-            self.selected = self.sidebar_entries.len() - 1;
+        } else if self.selected >= len {
+            self.selected = len - 1;
         }
     }
 
-    /// The entry under the cursor, if any.
-    pub fn selected_entry(&self) -> Option<&SidebarEntry> {
-        self.sidebar_entries.get(self.selected)
+    /// The location in the model under the cursor, if any.
+    pub fn selected_location(&self) -> Option<Location> {
+        self.sidebar.locate(self.selected)
     }
 
-    /// Look up the `SessionView` for the selected entry, if it's a session.
+    /// The kind of entry under the cursor, if any.
+    pub fn selected_kind(&self) -> Option<VisibleKind> {
+        self.sidebar.visible().get(self.selected).map(|v| v.kind())
+    }
+
+    /// The internal session name under the cursor, if the cursor is
+    /// on a session (ungrouped or a member). `None` for section headers.
+    pub fn selected_session_name(&self) -> Option<String> {
+        let visible = self.sidebar.visible();
+        visible.get(self.selected)?.session_name().map(|s| s.to_string())
+    }
+
+    /// Look up the `SessionView` under the cursor (if it's a session).
     pub fn selected_session(&self) -> Option<&SessionView> {
-        let entry = self.selected_entry()?;
-        let internal = match entry {
-            SidebarEntry::Session { internal } => internal,
-            SidebarEntry::Section { .. } => return None,
-        };
-        self.sessions.iter().find(|v| v.name() == internal)
+        let name = self.selected_session_name()?;
+        self.sessions.iter().find(|v| v.name() == name)
     }
 
-    /// The preview buffer for the currently selected session, if the
-    /// cursor is on a session (not a section header).
+    /// Preview buffer for the currently selected session, if any.
     pub fn selected_preview(&self) -> Option<&[u8]> {
         self.selected_session().and_then(|v| v.preview.as_deref())
     }
@@ -141,20 +151,6 @@ impl AppState {
     /// Look up the SessionView for a given internal name.
     pub fn session_by_name(&self, name: &str) -> Option<&SessionView> {
         self.sessions.iter().find(|v| v.name() == name)
-    }
-
-    /// Find the end index of the group starting at `header_idx` — i.e.
-    /// one past the last entry that belongs to this section (next header
-    /// or list end). `header_idx` must point at a `Section` entry.
-    fn group_end(&self, header_idx: usize) -> usize {
-        let mut i = header_idx + 1;
-        while i < self.sidebar_entries.len() {
-            if self.sidebar_entries[i].is_section() {
-                break;
-            }
-            i += 1;
-        }
-        i
     }
 
     /// Pure reducer. Returns a list of Commands the caller should dispatch.
@@ -165,50 +161,38 @@ impl AppState {
                 sessions,
                 select_after,
             } => {
-                // Preserve selection by entry identity (section id or
-                // session internal name) across refreshes — unless
-                // `select_after` is Some, in which case the refresh was
-                // triggered by a create and the app should jump to the
-                // newly-created session.
+                // Preserve selection by entry identity across
+                // refreshes — section id if a header was selected,
+                // internal name if a session was selected. Unless
+                // `select_after` is set (fresh create), in which
+                // case jump to the new session.
                 let prior_identity = self
-                    .sidebar_entries
+                    .sidebar
+                    .visible()
                     .get(self.selected)
-                    .map(|e| e.identity().to_string());
+                    .map(|v| v.identity().to_string());
 
                 self.sessions = sessions;
 
-                // Reconcile the sidebar with the live session set:
-                // drop Session entries for killed sessions, append
-                // Session entries for new ones. Section entries are
-                // untouched.
-                let live: Vec<String> = self.sessions.iter().map(|v| v.name().to_string()).collect();
-                reconcile_sidebar(&mut self.sidebar_entries, &live);
+                let live: Vec<String> =
+                    self.sessions.iter().map(|v| v.name().to_string()).collect();
+                self.sidebar.reconcile(&live);
 
                 if let Some(target) = select_after {
-                    if let Some(idx) = self
-                        .sidebar_entries
-                        .iter()
-                        .position(|e| matches!(e, SidebarEntry::Session { internal } if internal == &target))
-                    {
+                    if let Some(idx) = self.sidebar.find_identity(&target) {
                         self.selected = idx;
                     }
                 } else if let Some(id) = prior_identity {
-                    if let Some(idx) = self
-                        .sidebar_entries
-                        .iter()
-                        .position(|e| e.identity() == id)
-                    {
+                    if let Some(idx) = self.sidebar.find_identity(&id) {
                         self.selected = idx;
                     }
                 }
                 self.clamp_selection();
-                // A successful refresh clears any stale list warning.
                 if let Some(w) = &self.warning {
                     if w.starts_with("list:") {
                         self.warning = None;
                     }
                 }
-                // Make sure the actor has the right focused session.
                 self.sync_focus(&mut out);
             }
             AppMsg::Key(k) => {
@@ -287,59 +271,72 @@ impl AppState {
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
+            // Shift+Down / Shift+J: reorder within bucket (session)
+            // or move whole group (section header).
             (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Char('J'), _) => {
-                self.move_down(out);
+                self.move_down_within(out);
             }
             (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _) => {
-                self.move_up(out);
+                self.move_up_within(out);
+            }
+            // Shift+Right / Shift+Left: cross-bucket moves. Only
+            // meaningful on session rows.
+            (KeyCode::Right, KeyModifiers::SHIFT) => {
+                self.move_to_next_bucket(out);
+            }
+            (KeyCode::Left, KeyModifiers::SHIFT) => {
+                self.move_to_prev_bucket(out);
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                if !self.sidebar_entries.is_empty() {
-                    self.selected = (self.selected + 1).min(self.sidebar_entries.len() - 1);
+                let len = self.sidebar.len();
+                if len > 0 {
+                    self.selected = (self.selected + 1).min(len - 1);
                 }
             }
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            (KeyCode::Enter, _) => {
-                // Enter attaches — only meaningful on a session row.
+            // Enter OR plain Right = attach the selected session.
+            (KeyCode::Enter, _) | (KeyCode::Right, KeyModifiers::NONE) => {
                 if let Some(s) = self.selected_session() {
                     self.pending_attach = Some(s.name().to_string());
                 }
             }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                // Manual refresh. Regular refresh happens on every 1s
-                // tick, but Ctrl-R is here as an escape hatch if the
-                // user wants instant.
                 out.push(Command::ListNow);
             }
-            (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                match self.selected_entry().cloned() {
-                    Some(SidebarEntry::Session { internal }) => {
-                        let display = self
-                            .session_by_name(&internal)
-                            .map(|s| s.display().to_string())
-                            .unwrap_or_else(|| internal.clone());
+            (KeyCode::Char('r'), KeyModifiers::NONE) => match self.selected_location() {
+                Some(Location::Header(si)) => {
+                    let s = &self.sidebar.sections[si];
+                    if self.modals.top_id() != Some("section") {
+                        self.pending_modal = Some(ModalRequest::Section {
+                            editing: Some((s.id.clone(), s.name.clone())),
+                        });
+                    }
+                }
+                Some(_) => {
+                    if let Some(sel) = self.selected_session() {
+                        let internal = sel.name().to_string();
+                        let display = sel.display().to_string();
                         self.modals
                             .push(Box::new(RenameModal::new(internal, display)));
                     }
-                    Some(SidebarEntry::Section { id, name }) => {
-                        if self.modals.top_id() != Some("section") {
-                            self.pending_modal = Some(ModalRequest::Section {
-                                editing: Some((id, name)),
-                            });
-                        }
-                    }
-                    None => {}
                 }
-            }
-            (KeyCode::Char('d'), KeyModifiers::NONE) => {
-                match self.selected_entry().cloned() {
-                    Some(SidebarEntry::Session { internal }) => {
-                        let display = self
-                            .session_by_name(&internal)
-                            .map(|s| s.display().to_string())
-                            .unwrap_or_else(|| internal.clone());
+                None => {}
+            },
+            (KeyCode::Char('d'), KeyModifiers::NONE) => match self.selected_location() {
+                Some(Location::Header(si)) => {
+                    // Delete the section header; its members flow
+                    // back into ungrouped. No confirm — trivial to
+                    // re-add with `g`.
+                    self.sidebar.delete_section_at(si);
+                    self.clamp_selection();
+                    self.save_sidebar(out);
+                }
+                Some(_) => {
+                    if let Some(sel) = self.selected_session() {
+                        let internal = sel.name().to_string();
+                        let display = sel.display().to_string();
                         let title = "Kill session?";
                         let msg = format!("This will kill '{}' and its pane.", display);
                         self.modals.push(Box::new(
@@ -347,22 +344,10 @@ impl AppState {
                                 .destructive(),
                         ));
                     }
-                    Some(SidebarEntry::Section { .. }) => {
-                        // Delete the section header in place. Its
-                        // members fall through into the group above
-                        // (or become ungrouped if none). No confirm —
-                        // trivial to re-add with `g`.
-                        self.sidebar_entries.remove(self.selected);
-                        self.clamp_selection();
-                        self.save_sidebar(out);
-                    }
-                    None => {}
                 }
-            }
+                None => {}
+            },
             (KeyCode::Char('R'), _) => {
-                // Shift-R restarts: kill + recreate the selected
-                // session using the metadata persisted to @bosun_*
-                // tmux options at create time.
                 if let Some(sel) = self.selected_session() {
                     let internal = sel.name().to_string();
                     let display = sel.display().to_string();
@@ -379,24 +364,16 @@ impl AppState {
                 }
             }
             (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                // We can't push the modal directly here because
-                // AppState doesn't hold the store — signal the app
-                // loop via pending_modal and it'll load recents +
-                // push.
                 if self.modals.top_id() != Some("new_session") {
                     self.pending_modal = Some(ModalRequest::NewSession);
                 }
             }
             (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                // Insert a new section header above the cursor.
                 if self.modals.top_id() != Some("section") {
                     self.pending_modal = Some(ModalRequest::Section { editing: None });
                 }
             }
             (KeyCode::Char('t'), KeyModifiers::NONE) => {
-                // Same reason as NewSession: AppState can't read the
-                // filesystem to build the theme list, so we signal
-                // the app loop to do it.
                 if self.modals.top_id() != Some("theme") {
                     self.pending_modal = Some(ModalRequest::Theme);
                 }
@@ -405,96 +382,148 @@ impl AppState {
         }
     }
 
-    /// Shift-J: move the selected entry down by one. For a Session,
-    /// it's a single-item swap (crossing a Section header naturally
-    /// moves the session into the next group). For a Section, the
-    /// whole group (header + following sessions up to the next
-    /// header) moves as a block, swapping places with the block below.
-    fn move_down(&mut self, out: &mut Vec<Command>) {
-        let len = self.sidebar_entries.len();
-        if len < 2 || self.selected >= len {
-            return;
-        }
-        let entry = self.sidebar_entries[self.selected].clone();
-        match entry {
-            SidebarEntry::Session { .. } => {
-                if self.selected + 1 < len {
-                    self.sidebar_entries.swap(self.selected, self.selected + 1);
-                    self.selected += 1;
+    /// Shift-J / Shift-Down. Sessions reorder within their own
+    /// bucket only (ungrouped or a specific section). Sections move
+    /// as a block (header + all members) among the sections list.
+    fn move_down_within(&mut self, out: &mut Vec<Command>) {
+        let loc = match self.selected_location() {
+            Some(l) => l,
+            None => return,
+        };
+        match loc {
+            Location::Ungrouped(i) => {
+                if i + 1 < self.sidebar.ungrouped.len() {
+                    self.sidebar.ungrouped.swap(i, i + 1);
+                    self.selected = self.sidebar.flat_index(Location::Ungrouped(i + 1));
                     self.save_sidebar(out);
                 }
             }
-            SidebarEntry::Section { .. } => {
-                let start = self.selected;
-                let mid = self.group_end(start); // first idx of next block
-                if mid >= len {
-                    return; // already last group
+            Location::Member(si, mi) => {
+                let members = &mut self.sidebar.sections[si].members;
+                if mi + 1 < members.len() {
+                    members.swap(mi, mi + 1);
+                    self.selected = self.sidebar.flat_index(Location::Member(si, mi + 1));
+                    self.save_sidebar(out);
                 }
-                let end = self.group_end(mid); // one past next block
-                // Rotate [start..end) so the second block comes first.
-                self.sidebar_entries[start..end].rotate_left(mid - start);
-                self.selected = start + (end - mid);
-                self.save_sidebar(out);
+            }
+            Location::Header(si) => {
+                if si + 1 < self.sidebar.sections.len() {
+                    self.sidebar.sections.swap(si, si + 1);
+                    self.selected = self.sidebar.flat_index(Location::Header(si + 1));
+                    self.save_sidebar(out);
+                }
             }
         }
     }
 
-    /// Shift-K: mirror of `move_down`.
-    fn move_up(&mut self, out: &mut Vec<Command>) {
-        if self.selected == 0 || self.sidebar_entries.is_empty() {
-            return;
-        }
-        let entry = self.sidebar_entries[self.selected].clone();
-        match entry {
-            SidebarEntry::Session { .. } => {
-                self.sidebar_entries.swap(self.selected, self.selected - 1);
-                self.selected -= 1;
-                self.save_sidebar(out);
-            }
-            SidebarEntry::Section { .. } => {
-                // Find the start of the block above by walking back
-                // until we hit another section header (or index 0).
-                let cur = self.selected;
-                let mut prev_start = cur;
-                while prev_start > 0 {
-                    prev_start -= 1;
-                    if self.sidebar_entries[prev_start].is_section() {
-                        break;
-                    }
+    /// Shift-K / Shift-Up. Mirror of `move_down_within`.
+    fn move_up_within(&mut self, out: &mut Vec<Command>) {
+        let loc = match self.selected_location() {
+            Some(l) => l,
+            None => return,
+        };
+        match loc {
+            Location::Ungrouped(i) => {
+                if i > 0 {
+                    self.sidebar.ungrouped.swap(i, i - 1);
+                    self.selected = self.sidebar.flat_index(Location::Ungrouped(i - 1));
+                    self.save_sidebar(out);
                 }
-                // `prev_start` now points at the header of the block
-                // above — unless there's no header above (i.e. the
-                // block above is the ungrouped head of the list), in
-                // which case prev_start is 0 and the entry at 0 is
-                // a Session.
-                let end = self.group_end(cur);
-                self.sidebar_entries[prev_start..end].rotate_right(end - cur);
-                self.selected = prev_start;
-                self.save_sidebar(out);
+            }
+            Location::Member(si, mi) => {
+                if mi > 0 {
+                    self.sidebar.sections[si].members.swap(mi, mi - 1);
+                    self.selected = self.sidebar.flat_index(Location::Member(si, mi - 1));
+                    self.save_sidebar(out);
+                }
+            }
+            Location::Header(si) => {
+                if si > 0 {
+                    self.sidebar.sections.swap(si, si - 1);
+                    self.selected = self.sidebar.flat_index(Location::Header(si - 1));
+                    self.save_sidebar(out);
+                }
             }
         }
     }
 
-    /// Insert a new section header above the cursor with the given name.
-    /// Called by the app loop after the SectionModal submits.
+    /// Shift-Right. Move a session one bucket forward: ungrouped →
+    /// first section → next section → …. Inserts at the START of the
+    /// target bucket (nearest edge). No-op on section headers or at
+    /// the last bucket.
+    fn move_to_next_bucket(&mut self, out: &mut Vec<Command>) {
+        let loc = match self.selected_location() {
+            Some(l) => l,
+            None => return,
+        };
+        match loc {
+            Location::Ungrouped(i) => {
+                if self.sidebar.sections.is_empty() {
+                    return;
+                }
+                let name = self.sidebar.ungrouped.remove(i);
+                self.sidebar.sections[0].members.insert(0, name);
+                self.selected = self.sidebar.flat_index(Location::Member(0, 0));
+                self.save_sidebar(out);
+            }
+            Location::Member(si, mi) => {
+                if si + 1 >= self.sidebar.sections.len() {
+                    return;
+                }
+                let name = self.sidebar.sections[si].members.remove(mi);
+                self.sidebar.sections[si + 1].members.insert(0, name);
+                self.selected = self.sidebar.flat_index(Location::Member(si + 1, 0));
+                self.save_sidebar(out);
+            }
+            Location::Header(_) => {}
+        }
+    }
+
+    /// Shift-Left. Mirror of `move_to_next_bucket`: last section →
+    /// previous section → … → ungrouped. Inserts at the END of the
+    /// target bucket (nearest edge). No-op on section headers or at
+    /// the first bucket.
+    fn move_to_prev_bucket(&mut self, out: &mut Vec<Command>) {
+        let loc = match self.selected_location() {
+            Some(l) => l,
+            None => return,
+        };
+        match loc {
+            Location::Ungrouped(_) => {} // already at leftmost bucket
+            Location::Member(si, mi) => {
+                let name = self.sidebar.sections[si].members.remove(mi);
+                if si == 0 {
+                    // Out of group 0 → ungrouped (end).
+                    self.sidebar.ungrouped.push(name);
+                    let new_idx = self.sidebar.ungrouped.len() - 1;
+                    self.selected = self.sidebar.flat_index(Location::Ungrouped(new_idx));
+                } else {
+                    let target = si - 1;
+                    self.sidebar.sections[target].members.push(name);
+                    let new_mi = self.sidebar.sections[target].members.len() - 1;
+                    self.selected = self.sidebar.flat_index(Location::Member(target, new_mi));
+                }
+                self.save_sidebar(out);
+            }
+            Location::Header(_) => {}
+        }
+    }
+
+    /// Insert a new empty section at the end of the sections list.
+    /// Called by the app loop after the SectionModal submits. Cursor
+    /// jumps to the new header.
     pub fn insert_section(&mut self, name: String, out: &mut Vec<Command>) {
-        let entry = SidebarEntry::new_section(name);
-        let idx = self.selected.min(self.sidebar_entries.len());
-        self.sidebar_entries.insert(idx, entry);
-        self.selected = idx;
+        let id = self.sidebar.insert_section_at_end(name);
+        if let Some(idx) = self.sidebar.find_identity(&id) {
+            self.selected = idx;
+        }
         self.save_sidebar(out);
     }
 
     /// Rename an existing section by id. No-op if the id isn't found.
     pub fn rename_section(&mut self, id: &str, new_name: String, out: &mut Vec<Command>) {
-        for e in self.sidebar_entries.iter_mut() {
-            if let SidebarEntry::Section { id: eid, name } = e {
-                if eid == id {
-                    *name = new_name;
-                    self.save_sidebar(out);
-                    return;
-                }
-            }
+        if self.sidebar.rename_section(id, new_name) {
+            self.save_sidebar(out);
         }
     }
 
@@ -591,7 +620,7 @@ impl App {
 
         let state = AppState {
             divider_x: config.divider_x,
-            sidebar_entries: config.sidebar.clone(),
+            sidebar: config.sidebar.clone(),
             ..Default::default()
         };
 
@@ -850,14 +879,14 @@ mod tests {
     }
 
     fn state_with(sessions: Vec<SessionView>, selected: usize) -> AppState {
-        let sidebar_entries: Vec<SidebarEntry> = sessions
-            .iter()
-            .map(|s| SidebarEntry::session(s.name()))
-            .collect();
+        let ungrouped = sessions.iter().map(|s| s.name().to_string()).collect();
         AppState {
             sessions,
             selected,
-            sidebar_entries,
+            sidebar: SidebarModel {
+                ungrouped,
+                sections: Vec::new(),
+            },
             ..Default::default()
         }
     }
@@ -1027,127 +1056,142 @@ mod tests {
         assert!(!s.dragging_divider);
     }
 
-    fn sec(id: &str, name: &str) -> SidebarEntry {
-        SidebarEntry::Section {
+    use crate::sidebar::Section;
+
+    fn section(id: &str, name: &str, members: &[&str]) -> Section {
+        Section {
             id: id.into(),
             name: name.into(),
+            members: members.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    fn ses_entry(name: &str) -> SidebarEntry {
-        SidebarEntry::session(name)
+    fn model(ungrouped: &[&str], sections: Vec<Section>) -> SidebarModel {
+        SidebarModel {
+            ungrouped: ungrouped.iter().map(|s| s.to_string()).collect(),
+            sections,
+        }
     }
 
-    /// Shift-J on a section header moves the whole group as a block,
-    /// swapping positions with the group below it.
+    /// Shift-J on a section header moves only that section among the
+    /// sections list (its members come along because they're owned by
+    /// the section struct).
     #[test]
     fn shift_j_on_section_moves_whole_group() {
         let mut s = AppState::default();
         s.sessions = vec![ses("a"), ses("b"), ses("c"), ses("d")];
-        s.sidebar_entries = vec![
-            sec("g1", "First"),
-            ses_entry("a"),
-            ses_entry("b"),
-            sec("g2", "Second"),
-            ses_entry("c"),
-            ses_entry("d"),
-        ];
-        s.selected = 0; // on "First" header
+        s.sidebar = model(
+            &[],
+            vec![
+                section("g1", "First", &["a", "b"]),
+                section("g2", "Second", &["c", "d"]),
+            ],
+        );
+        // Flat index of g1 header: ungrouped(0) + 0 = 0
+        s.selected = 0;
 
         let shift_j = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
         s.apply(AppMsg::Key(shift_j));
 
         assert_eq!(
-            s.sidebar_entries,
-            vec![
-                sec("g2", "Second"),
-                ses_entry("c"),
-                ses_entry("d"),
-                sec("g1", "First"),
-                ses_entry("a"),
-                ses_entry("b"),
-            ]
+            s.sidebar,
+            model(
+                &[],
+                vec![
+                    section("g2", "Second", &["c", "d"]),
+                    section("g1", "First", &["a", "b"]),
+                ],
+            )
         );
-        // Cursor follows the moved header.
+        // g1 is now the second section; its header flat index = 3
+        // (0..=2 are g2 header + its two members).
         assert_eq!(s.selected, 3);
     }
 
-    /// Shift-K on a section header moves it above the previous group.
+    /// Shift-J on an ungrouped session swaps within the ungrouped
+    /// bucket. Hits a floor at the end — does NOT fall into a section.
     #[test]
-    fn shift_k_on_section_moves_whole_group_up() {
+    fn shift_j_on_ungrouped_floors_at_bucket_end() {
         let mut s = AppState::default();
-        s.sessions = vec![ses("a"), ses("b"), ses("c"), ses("d")];
-        s.sidebar_entries = vec![
-            sec("g1", "First"),
-            ses_entry("a"),
-            ses_entry("b"),
-            sec("g2", "Second"),
-            ses_entry("c"),
-            ses_entry("d"),
-        ];
-        s.selected = 3; // on "Second" header
-
-        let shift_k = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
-        s.apply(AppMsg::Key(shift_k));
-
-        assert_eq!(
-            s.sidebar_entries,
-            vec![
-                sec("g2", "Second"),
-                ses_entry("c"),
-                ses_entry("d"),
-                sec("g1", "First"),
-                ses_entry("a"),
-                ses_entry("b"),
-            ]
-        );
-        assert_eq!(s.selected, 0);
-    }
-
-    /// Shift-J on a session moves it by one — crossing a section
-    /// header naturally re-parents it into the next group.
-    #[test]
-    fn shift_j_on_session_crosses_section_boundary() {
-        let mut s = AppState::default();
-        s.sessions = vec![ses("a"), ses("b")];
-        s.sidebar_entries = vec![
-            sec("g1", "First"),
-            ses_entry("a"),
-            sec("g2", "Second"),
-            ses_entry("b"),
-        ];
-        s.selected = 1; // on session "a" inside First
+        s.sessions = vec![ses("a"), ses("b"), ses("c")];
+        s.sidebar = model(&["a", "b"], vec![section("g1", "First", &["c"])]);
+        s.selected = 1; // ungrouped b
 
         let shift_j = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
         s.apply(AppMsg::Key(shift_j));
 
-        // "a" hopped past the "Second" header — now it's inside Second.
+        // b didn't move — it's at the end of ungrouped.
+        assert_eq!(s.sidebar, model(&["a", "b"], vec![section("g1", "First", &["c"])]));
+    }
+
+    /// Shift-Right moves an ungrouped session into the first section
+    /// (start of that section's members).
+    #[test]
+    fn shift_right_moves_ungrouped_into_first_section() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("a"), ses("b"), ses("c")];
+        s.sidebar = model(&["a", "b"], vec![section("g1", "First", &["c"])]);
+        s.selected = 0; // ungrouped a
+
+        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        s.apply(AppMsg::Key(shift_right));
+
         assert_eq!(
-            s.sidebar_entries,
-            vec![
-                sec("g1", "First"),
-                sec("g2", "Second"),
-                ses_entry("a"),
-                ses_entry("b"),
-            ]
+            s.sidebar,
+            model(&["b"], vec![section("g1", "First", &["a", "c"])])
         );
+        // cursor follows to new member index: ungrouped has 1 entry,
+        // then header, then a at member index 0 → flat index 2.
         assert_eq!(s.selected, 2);
     }
 
-    /// `d` on a section header deletes it without confirm — members
-    /// fall through into the previous group.
+    /// Shift-Left moves a session out of its section back to the
+    /// end of the previous bucket (ungrouped if it was in section 0).
     #[test]
-    fn d_on_section_deletes_header() {
+    fn shift_left_moves_out_of_first_section_to_ungrouped() {
         let mut s = AppState::default();
-        s.sessions = vec![ses("a")];
-        s.sidebar_entries = vec![sec("g1", "Work"), ses_entry("a")];
+        s.sessions = vec![ses("a"), ses("b")];
+        s.sidebar = model(&["a"], vec![section("g1", "First", &["b"])]);
+        // flat: 0=a, 1=g1 header, 2=b
+        s.selected = 2;
+
+        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        s.apply(AppMsg::Key(shift_left));
+
+        assert_eq!(s.sidebar, model(&["a", "b"], vec![section("g1", "First", &[])]));
+        // b is now ungrouped at index 1.
+        assert_eq!(s.selected, 1);
+    }
+
+    /// Creating a new section does NOT claim any sessions — it's empty.
+    #[test]
+    fn new_section_is_empty() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("a"), ses("b")];
+        s.sidebar = model(&["a", "b"], vec![]);
         s.selected = 0;
+
+        let mut out = Vec::new();
+        s.insert_section("Work".to_string(), &mut out);
+
+        assert_eq!(s.sidebar.ungrouped, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(s.sidebar.sections.len(), 1);
+        assert_eq!(s.sidebar.sections[0].name, "Work");
+        assert!(s.sidebar.sections[0].members.is_empty());
+    }
+
+    /// `d` on a section header dissolves it — members go to ungrouped.
+    #[test]
+    fn d_on_section_dissolves_members_to_ungrouped() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("a"), ses("b")];
+        s.sidebar = model(&["a"], vec![section("g1", "Work", &["b"])]);
+        s.selected = 1; // g1 header
 
         s.apply(AppMsg::Key(key(KeyCode::Char('d'))));
 
-        assert_eq!(s.sidebar_entries, vec![ses_entry("a")]);
-        assert_eq!(s.selected, 0);
-        // No ConfirmModal should have opened.
+        assert_eq!(s.sidebar, model(&["a", "b"], vec![]));
+        assert_eq!(s.selected, 1); // stays at the old header position (now b)
         assert!(s.modals.is_empty());
     }
 
@@ -1166,7 +1210,7 @@ mod tests {
     #[test]
     fn r_on_section_requests_rename() {
         let mut s = AppState::default();
-        s.sidebar_entries = vec![sec("g1", "Work")];
+        s.sidebar = model(&[], vec![section("g1", "Work", &[])]);
         s.selected = 0;
         s.apply(AppMsg::Key(key(KeyCode::Char('r'))));
         match &s.pending_modal {
@@ -1178,5 +1222,14 @@ mod tests {
             }
             other => panic!("expected Section editing modal, got {:?}", other),
         }
+    }
+
+    /// Right arrow (no shift) attaches the selected session.
+    #[test]
+    fn right_arrow_attaches_session() {
+        let mut s = state_with(vec![ses("main")], 0);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        s.apply(AppMsg::Key(right));
+        assert_eq!(s.pending_attach.as_deref(), Some("main"));
     }
 }

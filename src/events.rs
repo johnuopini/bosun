@@ -106,7 +106,7 @@ pub enum Command {
     /// Persist the user-defined sidebar (sections + session order) to
     /// config.toml. Intercepted by the app loop — never forwarded to
     /// the tmux actor.
-    SaveSidebar(Vec<crate::sidebar::SidebarEntry>),
+    SaveSidebar(crate::sidebar::SidebarModel),
     /// Insert a new section header above the cursor with the given name.
     /// Intercepted by the app loop — never forwarded to the tmux actor.
     InsertSection { name: String },

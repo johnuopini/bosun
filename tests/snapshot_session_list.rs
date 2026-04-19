@@ -6,7 +6,7 @@
 use std::time::SystemTime;
 
 use bosun::app::AppState;
-use bosun::sidebar::SidebarEntry;
+use bosun::sidebar::{Section, SidebarModel};
 use bosun::tmux::detector::Status;
 use bosun::tmux::session::SessionView;
 use bosun::tmux::TmuxSession;
@@ -14,17 +14,17 @@ use bosun::ui::Theme;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-/// Build an AppState where the sidebar ordering mirrors the given
-/// sessions (each as a `Session` entry, no headers). For snapshot
-/// tests that only care about pre-grouping rendering.
+/// Build an AppState where every session sits in the `ungrouped`
+/// bucket (no sections). For snapshot tests that only care about
+/// flat-list rendering.
 fn state_with(sessions: Vec<SessionView>) -> AppState {
-    let sidebar_entries: Vec<SidebarEntry> = sessions
-        .iter()
-        .map(|s| SidebarEntry::session(s.name()))
-        .collect();
+    let ungrouped = sessions.iter().map(|s| s.name().to_string()).collect();
     AppState {
         sessions,
-        sidebar_entries,
+        sidebar: SidebarModel {
+            ungrouped,
+            sections: Vec::new(),
+        },
         ..Default::default()
     }
 }
@@ -127,15 +127,14 @@ fn sections_group_sessions() {
         selected: 1, // on the section header
         ..Default::default()
     };
-    state.sidebar_entries = vec![
-        SidebarEntry::session("alpha"),
-        SidebarEntry::Section {
+    state.sidebar = SidebarModel {
+        ungrouped: vec!["alpha".to_string()],
+        sections: vec![Section {
             id: "g1".into(),
             name: "Premium Products".into(),
-        },
-        SidebarEntry::session("beta"),
-        SidebarEntry::session("gamma"),
-    ];
+            members: vec!["beta".to_string(), "gamma".to_string()],
+        }],
+    };
     let frame = render(&state, 80, 12);
     insta::assert_snapshot!("sections_group_sessions", frame);
 }

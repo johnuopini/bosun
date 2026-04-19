@@ -27,7 +27,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
         },
     ]);
 
-    let right = "↵ attach · n new · r ren · R rst · d kill · t theme · q quit ";
+    let right = "↵ attach · n new · g group · r ren · d kill · t theme · q quit ";
     let hint_style = Style::default().fg(theme.text_muted).bg(bg);
 
     let width = area.width as usize;

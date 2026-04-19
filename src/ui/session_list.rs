@@ -1,4 +1,6 @@
-//! Session list panel. Phase 2: status glyphs + color-coded per state.
+//! Session list panel. Walks the explicit-membership `SidebarModel`,
+//! emitting one row per visible entry (ungrouped session, section
+//! header, or section member).
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -7,7 +9,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::AppState;
-use crate::sidebar::SidebarEntry;
+use crate::sidebar::{Section, VisibleEntry};
 use crate::tmux::detector::Status;
 use crate::tmux::session::SessionView;
 use crate::ui::Theme;
@@ -15,7 +17,9 @@ use crate::ui::Theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let block = Block::default().style(Style::default().bg(theme.bg));
 
-    let lines: Vec<Line<'_>> = if state.sidebar_entries.is_empty() {
+    let visible = state.sidebar.visible();
+
+    let lines: Vec<Line<'_>> = if visible.is_empty() {
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -28,29 +32,32 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
             )),
         ]
     } else {
-        // Section headers render as a single bold accent line.
-        // Sessions render as two lines (primary + meta) — same as
-        // before. The selection index is into sidebar_entries, not
-        // into lines, so one entry can produce 1 or 2 lines without
-        // breaking selection math.
-        let mut out: Vec<Line<'_>> = Vec::with_capacity(state.sidebar_entries.len() * 2);
-        for (i, entry) in state.sidebar_entries.iter().enumerate() {
+        let mut out: Vec<Line<'_>> = Vec::with_capacity(visible.len() * 2);
+        for (i, entry) in visible.iter().enumerate() {
             let selected = i == state.selected;
             match entry {
-                SidebarEntry::Section { name, .. } => {
-                    out.push(render_section_line(name, selected, area.width, theme));
+                VisibleEntry::UngroupedSession(n) => match state.session_by_name(n) {
+                    Some(v) => {
+                        out.push(render_primary_line(v, selected, false, area.width, theme));
+                        out.push(render_meta_line(v, selected, false, area.width, theme));
+                    }
+                    None => {
+                        out.push(render_missing_line(n, selected, false, area.width, theme));
+                    }
+                },
+                VisibleEntry::SectionHeader(s) => {
+                    out.push(render_section_line(s, selected, area.width, theme));
                 }
-                SidebarEntry::Session { internal } => {
-                    // Look up the live view; if tmux's list just
-                    // raced ahead of reconcile, render a placeholder
-                    // row so the layout stays stable.
+                VisibleEntry::SectionMember { internal, .. } => {
                     match state.session_by_name(internal) {
                         Some(v) => {
-                            out.push(render_primary_line(v, selected, area.width, theme));
-                            out.push(render_meta_line(v, selected, area.width, theme));
+                            out.push(render_primary_line(v, selected, true, area.width, theme));
+                            out.push(render_meta_line(v, selected, true, area.width, theme));
                         }
                         None => {
-                            out.push(render_missing_line(internal, selected, area.width, theme));
+                            out.push(render_missing_line(
+                                internal, selected, true, area.width, theme,
+                            ));
                         }
                     }
                 }
@@ -61,58 +68,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
 
     let p = Paragraph::new(lines).block(block);
     frame.render_widget(p, area);
-}
-
-fn render_section_line(
-    name: &str,
-    selected: bool,
-    width: u16,
-    theme: &Theme,
-) -> Line<'static> {
-    let bg = row_bg(selected, theme);
-    let marker = if selected { "▌" } else { " " };
-    let marker_style = if selected {
-        Style::default().fg(theme.accent).bg(bg)
-    } else {
-        Style::default().fg(bg).bg(bg)
-    };
-    let title_style = Style::default()
-        .fg(theme.accent)
-        .bg(bg)
-        .add_modifier(Modifier::BOLD);
-
-    // Upper-case the name so it reads as a header even at small sizes.
-    // Render as `▸ NAME` so it's visually distinct from session rows.
-    let label = format!("▸ {}", name.to_uppercase());
-    let used = 3 + label.chars().count();
-    let pad = (width as usize).saturating_sub(used);
-
-    Line::from(vec![
-        Span::styled(format!(" {} ", marker), marker_style),
-        Span::styled(label, title_style),
-        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-    ])
-}
-
-fn render_missing_line(
-    internal: &str,
-    selected: bool,
-    width: u16,
-    theme: &Theme,
-) -> Line<'static> {
-    // Fallback for the brief window where sidebar_entries references
-    // a session that hasn't yet been observed by a refresh. Keeps
-    // the row count predictable so selection math doesn't skew.
-    let bg = row_bg(selected, theme);
-    let used = 4 + internal.chars().count();
-    let pad = (width as usize).saturating_sub(used);
-    Line::from(vec![
-        Span::styled(
-            format!("  ? {}", internal),
-            Style::default().fg(theme.text_muted).bg(bg),
-        ),
-        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-    ])
 }
 
 fn status_color(status: Status, theme: &Theme) -> Color {
@@ -132,9 +87,43 @@ fn row_bg(selected: bool, theme: &Theme) -> Color {
     }
 }
 
+fn render_section_line(
+    section: &Section,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = row_bg(selected, theme);
+    let marker = if selected { "▌" } else { " " };
+    let marker_style = if selected {
+        Style::default().fg(theme.accent).bg(bg)
+    } else {
+        Style::default().fg(bg).bg(bg)
+    };
+    let title_style = Style::default()
+        .fg(theme.accent)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+
+    let count_label = format!("  ({})", section.members.len());
+    let count_style = Style::default().fg(theme.text_muted).bg(bg);
+
+    let label = format!("▸ {}", section.name.to_uppercase());
+    let used = 3 + label.chars().count() + count_label.chars().count();
+    let pad = (width as usize).saturating_sub(used);
+
+    Line::from(vec![
+        Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled(label, title_style),
+        Span::styled(count_label, count_style),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+    ])
+}
+
 fn render_primary_line(
     view: &SessionView,
     selected: bool,
+    indented: bool,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -164,10 +153,10 @@ fn render_primary_line(
     } else {
         ""
     };
+    let indent = if indented { "  " } else { "" };
 
-    // Width consumed: " ▌ " (3) + glyph (1) + "  " (2) + name + "  Nw"
-    // [+ "  •attached"]. Trailing pad extends row_bg to the right edge.
     let used = 3
+        + indent.chars().count()
         + glyph.chars().count()
         + 2
         + name.chars().count()
@@ -177,6 +166,7 @@ fn render_primary_line(
 
     let mut spans = vec![
         Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled(indent, Style::default().bg(bg)),
         Span::styled(glyph, status_style),
         Span::styled("  ", Style::default().bg(bg)),
         Span::styled(name, name_style),
@@ -196,15 +186,17 @@ fn render_primary_line(
 fn render_meta_line(
     view: &SessionView,
     selected: bool,
+    indented: bool,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
     let bg = row_bg(selected, theme);
     let meta_style = Style::default().fg(theme.text_muted).bg(bg);
 
-    // Indent to align under the session name — matches the primary
-    // line's " ▌  ○  " prefix (3 + 1 + 2 = 6 cols).
-    const INDENT: &str = "       ";
+    // Base indent aligns under the session name ("  ▌  ○  " = 3+1+2=6 cols
+    // of leading padding after the marker); indented rows add 2 more.
+    let base_indent: &str = "       ";
+    let extra = if indented { "  " } else { "" };
 
     let agent = view.session.agent.as_deref();
     let path = view.session.best_path();
@@ -213,31 +205,43 @@ fn render_meta_line(
         (Some(a), Some(p)) => format!("{a} · {}", shorten_path(p)),
         (Some(a), None) => a.to_string(),
         (None, Some(p)) => shorten_path(p),
-        // Non-bosun session with no cwd info — keep the row shape but
-        // leave the meta line blank so the selection highlight still
-        // spans both rows.
         (None, None) => String::new(),
     };
 
-    // Truncate body if it'd overflow the panel. Reserve the INDENT
-    // columns and 1 trailing column so the selection bg stays clean.
-    let max_body = (width as usize)
-        .saturating_sub(INDENT.chars().count())
-        .saturating_sub(1);
+    let lead = base_indent.chars().count() + extra.chars().count();
+    let max_body = (width as usize).saturating_sub(lead).saturating_sub(1);
     let body = truncate_to(&body, max_body);
 
-    let used = INDENT.chars().count() + body.chars().count();
+    let used = lead + body.chars().count();
     let pad = (width as usize).saturating_sub(used);
 
     Line::from(vec![
-        Span::styled(INDENT, Style::default().bg(bg)),
+        Span::styled(base_indent, Style::default().bg(bg)),
+        Span::styled(extra, Style::default().bg(bg)),
         Span::styled(body, meta_style),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
     ])
 }
 
-/// Replace `$HOME` with `~` for display. No-op if HOME isn't set or
-/// isn't a prefix of `p`.
+fn render_missing_line(
+    internal: &str,
+    selected: bool,
+    indented: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = row_bg(selected, theme);
+    let extra = if indented { "  " } else { "" };
+    let body = format!("  ? {}", internal);
+    let used = extra.chars().count() + body.chars().count();
+    let pad = (width as usize).saturating_sub(used);
+    Line::from(vec![
+        Span::styled(extra, Style::default().bg(bg)),
+        Span::styled(body, Style::default().fg(theme.text_muted).bg(bg)),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+    ])
+}
+
 fn shorten_path(p: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() && p.starts_with(&home) {
@@ -247,8 +251,6 @@ fn shorten_path(p: &str) -> String {
     }
 }
 
-/// Truncate to `max` chars with a leading ellipsis if clipped, so the
-/// tail of the path (most informative part) stays visible.
 fn truncate_to(s: &str, max: usize) -> String {
     let len = s.chars().count();
     if len <= max {

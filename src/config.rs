@@ -18,7 +18,40 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::sidebar::SidebarEntry;
+use crate::sidebar::{Section, SidebarModel};
+
+/// Legacy Vec<SidebarEntry> shape from v0.2.8. Read-only, used for
+/// one-time migration to the new explicit-membership `SidebarModel`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum LegacySidebarEntry {
+    Section { id: String, name: String },
+    Session { internal: String },
+}
+
+fn migrate_legacy_sidebar(old: Vec<LegacySidebarEntry>) -> SidebarModel {
+    // Pre-0.2.9 membership was implicit (session belongs to the
+    // nearest section above). The new model is explicit — creating a
+    // section claims no one. Safest upgrade: put every session in
+    // ungrouped and preserve section headers as empty. The user can
+    // then populate them with Shift-Right.
+    let mut model = SidebarModel::default();
+    for e in old {
+        match e {
+            LegacySidebarEntry::Section { id, name } => {
+                model.sections.push(Section {
+                    id,
+                    name,
+                    members: Vec::new(),
+                });
+            }
+            LegacySidebarEntry::Session { internal } => {
+                model.ungrouped.push(internal);
+            }
+        }
+    }
+    model
+}
 
 /// The default prefix that bosun considers "managed". Only tmux
 /// sessions whose name starts with this prefix appear in bosun's UI
@@ -64,10 +97,11 @@ pub struct Config {
     /// Persisted divider position (absolute terminal column). `None`
     /// means use the default 38% split.
     pub divider_x: Option<u16>,
-    /// User-defined sidebar ordering with sections + sessions.
-    /// Empty on first launch. Persisted to `config.toml` so ordering
-    /// and group structure survive bosun restarts.
-    pub sidebar: Vec<SidebarEntry>,
+    /// User-defined sidebar ordering with explicit section
+    /// membership. Empty on first launch. Persisted as the
+    /// `[sidebar]` table in `config.toml` so ordering and group
+    /// structure survive bosun restarts.
+    pub sidebar: SidebarModel,
 }
 
 impl Default for Config {
@@ -78,7 +112,7 @@ impl Default for Config {
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            sidebar: Vec::new(),
+            sidebar: SidebarModel::default(),
         }
     }
 }
@@ -97,12 +131,14 @@ struct ConfigFile {
     theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     divider_x: Option<u16>,
-    /// New sidebar format — headers + sessions interleaved.
+    /// Explicit-membership sidebar (v0.2.9+). Tables + arrays.
+    /// `read_config_file` preprocesses the raw TOML so a legacy v0.2.8
+    /// `sidebar = [...]` array is migrated in-place to the new shape
+    /// before this field is deserialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    sidebar: Option<Vec<SidebarEntry>>,
-    /// Legacy field (pre-0.2.8). Read-only for migration; never written
-    /// back. If present and `sidebar` is absent, the session names are
-    /// promoted to ungrouped Session entries.
+    sidebar: Option<SidebarModel>,
+    /// Legacy pre-0.2.8 flat list of internal names. Read-only for
+    /// migration; never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_order: Option<Vec<String>>,
 }
@@ -144,16 +180,19 @@ impl Config {
         };
 
         let divider_x = file.divider_x;
-        // Prefer the new `sidebar` field; fall back to migrating the
-        // legacy flat `session_order` list of internal names.
+        // Prefer the new `sidebar` field (explicit-membership model).
+        // If absent, migrate the pre-0.2.8 flat `session_order` list.
+        // Legacy v0.2.8 `sidebar = [...]` arrays are migrated by
+        // `read_config_file` before we get here.
         let sidebar = match file.sidebar {
             Some(s) => s,
-            None => file
-                .session_order
-                .unwrap_or_default()
-                .into_iter()
-                .map(SidebarEntry::session)
-                .collect(),
+            None => {
+                let ungrouped = file.session_order.unwrap_or_default();
+                SidebarModel {
+                    ungrouped,
+                    sections: Vec::new(),
+                }
+            }
         };
 
         Self {
@@ -200,10 +239,52 @@ pub fn user_themes_dir() -> Option<PathBuf> {
 fn read_config_file() -> Option<ConfigFile> {
     let path = config_dir()?.join("config.toml");
     let s = std::fs::read_to_string(&path).ok()?;
-    match toml::from_str::<ConfigFile>(&s) {
-        Ok(f) => Some(f),
+
+    // Parse as a generic Value first so we can detect + migrate the
+    // legacy v0.2.8 `sidebar = [...]` array shape. The v0.2.9 shape
+    // is a `[sidebar]` table, so a sidebar Value that's an Array is
+    // unambiguously the old form.
+    let mut value: toml::Value = match toml::from_str(&s) {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!("failed to parse {:?}: {}", path, e);
+            return None;
+        }
+    };
+
+    if let Some(table) = value.as_table_mut() {
+        if let Some(sidebar) = table.get("sidebar") {
+            if sidebar.is_array() {
+                let cloned = sidebar.clone();
+                match cloned.try_into::<Vec<LegacySidebarEntry>>() {
+                    Ok(legacy) => {
+                        let migrated = migrate_legacy_sidebar(legacy);
+                        match toml::Value::try_from(&migrated) {
+                            Ok(v) => {
+                                table.insert("sidebar".to_string(), v);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to serialize migrated sidebar: {}",
+                                    e
+                                );
+                                table.remove("sidebar");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to parse legacy sidebar: {}", e);
+                        table.remove("sidebar");
+                    }
+                }
+            }
+        }
+    }
+
+    match value.try_into::<ConfigFile>() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("failed to deserialize {:?}: {}", path, e);
             None
         }
     }
@@ -261,28 +342,25 @@ pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Persist the user-defined sidebar (headers + session order) to
+/// Persist the user-defined sidebar (explicit-membership model) to
 /// `config.toml`. Same read-modify-write approach as `write_theme`.
-/// An empty slice clears the field from the file. Also clears the
-/// legacy `session_order` field so the config converges on the new
-/// shape after the first save.
-pub fn write_sidebar(entries: &[SidebarEntry]) -> std::io::Result<()> {
+/// An empty model clears the field from the file. Also drops the
+/// legacy `session_order` so the config converges on the new shape.
+pub fn write_sidebar(model: &SidebarModel) -> std::io::Result<()> {
     let dir =
         config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("config.toml");
 
-    let mut file = match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
-        Err(_) => ConfigFile::default(),
-    };
-    file.sidebar = if entries.is_empty() {
+    // Read via the migrating reader so a pre-existing legacy sidebar
+    // is converted before we overwrite it. Otherwise the first save
+    // after a legacy read-through would wipe the user's groups.
+    let mut file = read_config_file().unwrap_or_default();
+    file.sidebar = if model.ungrouped.is_empty() && model.sections.is_empty() {
         None
     } else {
-        Some(entries.to_vec())
+        Some(model.clone())
     };
-    // Post-migration, drop any legacy field so we don't keep two
-    // sources of truth in the file.
     file.session_order = None;
 
     let body = toml::to_string(&file)
@@ -326,7 +404,7 @@ mod tests {
             self_session: None,
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            sidebar: Vec::new(),
+            sidebar: SidebarModel::default(),
         }
     }
 
@@ -361,7 +439,7 @@ mod tests {
             self_session: Some("bosun-mine-abc".to_string()),
             theme: DEFAULT_THEME.to_string(),
             divider_x: None,
-            sidebar: Vec::new(),
+            sidebar: SidebarModel::default(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
