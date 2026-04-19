@@ -94,9 +94,12 @@ pub enum ModalRequest {
 }
 
 impl AppState {
-    /// Snapshot the current session list order into `session_order`.
-    fn save_session_order(&mut self) {
+    /// Snapshot the current session list order into `session_order`
+    /// and emit a `SaveSessionOrder` command so the app loop persists
+    /// it to `config.toml`.
+    fn save_session_order(&mut self, out: &mut Vec<Command>) {
         self.session_order = self.sessions.iter().map(|s| s.name().to_string()).collect();
+        out.push(Command::SaveSessionOrder(self.session_order.clone()));
     }
 
     /// Sort `self.sessions` to match the saved `session_order`.
@@ -246,14 +249,14 @@ impl AppState {
                 if self.selected + 1 < self.sessions.len() {
                     self.sessions.swap(self.selected, self.selected + 1);
                     self.selected += 1;
-                    self.save_session_order();
+                    self.save_session_order(out);
                 }
             }
             (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _) => {
                 if self.selected > 0 {
                     self.sessions.swap(self.selected, self.selected - 1);
                     self.selected -= 1;
-                    self.save_session_order();
+                    self.save_session_order(out);
                 }
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
@@ -427,6 +430,7 @@ impl App {
 
         let state = AppState {
             divider_x: config.divider_x,
+            session_order: config.session_order.clone(),
             ..Default::default()
         };
 
@@ -490,6 +494,11 @@ impl App {
                     Command::SaveDivider(x) => {
                         if let Err(e) = crate::config::write_divider_x(x) {
                             self.state.warning = Some(format!("divider: failed to save: {e}"));
+                        }
+                    }
+                    Command::SaveSessionOrder(order) => {
+                        if let Err(e) = crate::config::write_session_order(&order) {
+                            self.state.warning = Some(format!("order: failed to save: {e}"));
                         }
                     }
                     other => {

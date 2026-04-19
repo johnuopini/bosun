@@ -387,7 +387,9 @@ pub fn spawn(
                 Command::Attach { .. } => {
                     tracing::warn!("tmux_actor received Attach — ignored; app task handles attach");
                 }
-                Command::SetTheme { .. } | Command::SaveDivider(_) => {
+                Command::SetTheme { .. }
+                | Command::SaveDivider(_)
+                | Command::SaveSessionOrder(_) => {
                     // Pure UI state — the app loop intercepts these
                     // before forwarding. If one makes it here the
                     // intercept path is broken.

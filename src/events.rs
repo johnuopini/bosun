@@ -103,6 +103,9 @@ pub enum Command {
     /// Persist the divider position to config.toml. Intercepted by
     /// the app loop — never forwarded to the tmux actor.
     SaveDivider(Option<u16>),
+    /// Persist the user-defined session order to config.toml.
+    /// Intercepted by the app loop — never forwarded to the tmux actor.
+    SaveSessionOrder(Vec<String>),
     /// Set the active theme. Intercepted by the app loop — this
     /// command is NEVER forwarded to the tmux actor (it's a pure UI
     /// state change). `persist=false` is a transient live preview
