@@ -366,20 +366,16 @@ impl AppState {
                     )));
                 }
             }
-            (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                if self.modals.top_id() != Some("new_session") {
-                    self.pending_modal = Some(ModalRequest::NewSession);
-                }
+            (KeyCode::Char('n'), KeyModifiers::NONE)
+                if self.modals.top_id() != Some("new_session") =>
+            {
+                self.pending_modal = Some(ModalRequest::NewSession);
             }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                if self.modals.top_id() != Some("section") {
-                    self.pending_modal = Some(ModalRequest::Section { editing: None });
-                }
+            (KeyCode::Char('g'), KeyModifiers::NONE) if self.modals.top_id() != Some("section") => {
+                self.pending_modal = Some(ModalRequest::Section { editing: None });
             }
-            (KeyCode::Char('t'), KeyModifiers::NONE) => {
-                if self.modals.top_id() != Some("theme") {
-                    self.pending_modal = Some(ModalRequest::Theme);
-                }
+            (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
+                self.pending_modal = Some(ModalRequest::Theme);
             }
             // Direct-jump: 0 → ungrouped, 1..=9 → sections[0..=8]. Only
             // meaningful when the cursor is on a session; the move
@@ -604,10 +600,10 @@ impl AppState {
         let layouts = layout::compute(area, self.divider_x);
 
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if layout::is_divider_col(&layouts, m.column) {
-                    self.dragging_divider = true;
-                }
+            MouseEventKind::Down(MouseButton::Left)
+                if layout::is_divider_col(&layouts, m.column) =>
+            {
+                self.dragging_divider = true;
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
                 // Raw column — `layout::compute` clamps it to the
