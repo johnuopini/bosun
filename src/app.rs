@@ -555,6 +555,28 @@ impl App {
                 // Respawn the input actor now that the terminal is back.
                 self.input_handle = Some(input_actor::spawn(self.evt_tx.clone()));
 
+                // While we were blocked in attach, the tmux actor's 1Hz
+                // preview_tick kept queuing SessionsRefreshed messages
+                // into `evt_rx` (one per second of attach). If we didn't
+                // drain them here, the main loop would process each one
+                // — redrawing the preview for every stale capture — and
+                // the user would see a "flipbook" scroll while new key
+                // events sat at the tail of the backlog, unprocessed.
+                // Non-refresh messages (Warn, Fatal, etc) are preserved
+                // by re-sending them via evt_tx so they're still seen.
+                use tokio::sync::mpsc::error::TryRecvError;
+                let mut preserved: Vec<AppMsg> = Vec::new();
+                loop {
+                    match self.evt_rx.try_recv() {
+                        Ok(AppMsg::SessionsRefreshed { .. }) => {}
+                        Ok(other) => preserved.push(other),
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for m in preserved {
+                    let _ = self.evt_tx.send(m);
+                }
+
                 attach_result?;
                 // After return, kick a refresh — the session may have been killed.
                 let _ = self.cmd_tx.send(Command::ListNow);

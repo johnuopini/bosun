@@ -4,14 +4,14 @@
 //! `bind-key -T root C-q` in a user's tmux server, their Ctrl-Q is hijacked
 //! until they manually unbind or restart the server. So: actually spawn a
 //! throwaway tmux server, install the binding, check list-keys shows it,
-//! uninstall, confirm it's gone. Twice, to check refcount semantics.
+//! clear it, confirm it's gone.
 
 #![cfg(feature = "tmux-it")]
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bosun::tmux::attach::install_detach_key_for_test;
+use bosun::tmux::attach::{clear_ctrl_q_bound, ensure_ctrl_q_bound};
 
 fn unique_socket(tag: &str) -> String {
     let nanos = SystemTime::now()
@@ -45,7 +45,7 @@ fn kill_server(socket: &str) {
 }
 
 #[test]
-fn install_then_release_leaves_no_binding() {
+fn ensure_then_clear_leaves_no_binding() {
     let sock = unique_socket("solo");
     // Need a server to bind against — new-session -d starts one and a session.
     tmux(&sock, &["new-session", "-d", "-s", "dummy"]);
@@ -53,44 +53,43 @@ fn install_then_release_leaves_no_binding() {
     let before = count_ctrl_q_bindings(&sock);
     assert_eq!(before, 0, "expected no C-q binding before test");
 
-    let guard = install_detach_key_for_test(Some(&sock)).expect("install ok");
+    ensure_ctrl_q_bound(Some(&sock));
     assert!(
         count_ctrl_q_bindings(&sock) >= 1,
         "expected C-q binding to be installed, got: {}",
         list_keys_root(&sock)
     );
 
-    guard.release().expect("release ok");
+    clear_ctrl_q_bound(Some(&sock));
     assert_eq!(
         count_ctrl_q_bindings(&sock),
         0,
-        "expected C-q binding gone after release, got:\n{}",
+        "expected C-q binding gone after clear, got:\n{}",
         list_keys_root(&sock)
     );
 
     kill_server(&sock);
 }
 
-// Phase 5 TODO: add a refcount-based test for multi-instance safety
-// when we reintroduce `@bosun_attach_refcount`. Phase 1 uses a single
-// bind/unbind per attach for lower latency.
-
 #[test]
-fn drop_without_release_still_unbinds() {
-    let sock = unique_socket("drop");
+fn ensure_is_idempotent() {
+    let sock = unique_socket("idem");
     tmux(&sock, &["new-session", "-d", "-s", "dummy"]);
 
-    {
-        let _g = install_detach_key_for_test(Some(&sock)).expect("install ok");
-        assert!(count_ctrl_q_bindings(&sock) >= 1);
-        // _g dropped here — Drop impl must unbind.
+    // Re-asserting the binding repeatedly (as the refresh tick does)
+    // must stay at exactly one binding — tmux's bind-key overwrites.
+    for _ in 0..5 {
+        ensure_ctrl_q_bound(Some(&sock));
     }
     assert_eq!(
         count_ctrl_q_bindings(&sock),
-        0,
-        "Drop didn't clean up binding; list-keys:\n{}",
+        1,
+        "repeated ensure_ctrl_q_bound should produce exactly 1 binding, got:\n{}",
         list_keys_root(&sock)
     );
+
+    clear_ctrl_q_bound(Some(&sock));
+    assert_eq!(count_ctrl_q_bindings(&sock), 0);
 
     kill_server(&sock);
 }

@@ -44,6 +44,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::config::Config;
 use crate::events::{AppMsg, ClaudeSessionMode, Command, SessionSpec, SpecOptions};
 use crate::store::Store;
+use crate::tmux::attach::{clear_ctrl_q_bound, ensure_ctrl_q_bound};
 use crate::tmux::control::Notification;
 use crate::tmux::control_client::ControlClient;
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
@@ -54,18 +55,23 @@ use crate::util::collision::resolve_name_collision;
 use crate::util::hysteresis::Smoother;
 
 /// RAII cleanup for globals installed by the status bar (prefix-1..9
-/// bindings). Per-session status-* options are left in place when the
-/// actor exits — they die with their sessions, and leaving them means
-/// a restarting bosun can reuse them without a reinit flash.
+/// bindings) and the C-q detach binding. Per-session status-* options
+/// are left in place when the actor exits — they die with their
+/// sessions, and leaving them means a restarting bosun can reuse them
+/// without a reinit flash.
 struct GlobalsGuard {
     socket: Option<String>,
     installed: bool,
+    cq_installed: bool,
 }
 
 impl Drop for GlobalsGuard {
     fn drop(&mut self) {
         if self.installed {
             status_bar::uninstall_globals(self.socket.as_deref());
+        }
+        if self.cq_installed {
+            clear_ctrl_q_bound(self.socket.as_deref());
         }
     }
 }
@@ -86,7 +92,15 @@ pub fn spawn(
         let mut globals = GlobalsGuard {
             socket: socket.clone(),
             installed: false,
+            cq_installed: false,
         };
+
+        // Install the C-q detach binding up-front so it's live even
+        // before the first tmux notification arrives. `do_refresh`
+        // re-asserts it on every tick — cheap, and guards against
+        // anything that clobbers the root key table mid-session.
+        ensure_ctrl_q_bound(socket.as_deref());
+        globals.cq_installed = true;
 
         // Start the control-mode monitor subprocess. The guard is
         // held for the lifetime of the actor — dropping it on exit
@@ -653,6 +667,12 @@ async fn do_refresh(
     evt_tx: &mpsc::UnboundedSender<AppMsg>,
     select_after: Option<String>,
 ) -> crate::error::Result<()> {
+    // Re-assert the Ctrl-Q detach binding on every refresh. `bind-key`
+    // is idempotent, but running it once per tick means the binding
+    // self-heals if anything clobbers the root key table during a
+    // long-running session (source-file, another tool's hook, etc).
+    ensure_ctrl_q_bound(socket);
+
     let views = refresh_all(client, config, registry, smoothers, focused).await?;
     smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));
 
