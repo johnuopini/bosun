@@ -32,6 +32,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
             )),
         ]
     } else {
+        // Track the section-index (0-based) as we walk the visible
+        // list so section headers can show their numeric jump key.
+        let mut section_idx: usize = 0;
         let mut out: Vec<Line<'_>> = Vec::with_capacity(visible.len() * 2);
         for (i, entry) in visible.iter().enumerate() {
             let selected = i == state.selected;
@@ -46,7 +49,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     }
                 },
                 VisibleEntry::SectionHeader(s) => {
-                    out.push(render_section_line(s, selected, area.width, theme));
+                    // Jump key: 1..9 for the first nine sections, blank for any
+                    // extras. Matches the digit bindings in app::handle_key.
+                    let jump_key = if section_idx < 9 {
+                        Some((section_idx as u8 + b'1') as char)
+                    } else {
+                        None
+                    };
+                    out.push(render_section_line(s, selected, jump_key, area.width, theme));
+                    section_idx += 1;
                 }
                 VisibleEntry::SectionMember { internal, .. } => {
                     match state.session_by_name(internal) {
@@ -90,6 +101,7 @@ fn row_bg(selected: bool, theme: &Theme) -> Color {
 fn render_section_line(
     section: &Section,
     selected: bool,
+    jump_key: Option<char>,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -104,16 +116,23 @@ fn render_section_line(
         .fg(theme.accent)
         .bg(bg)
         .add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(theme.text_muted).bg(bg);
 
+    let key_prefix = match jump_key {
+        Some(k) => format!("{} ", k),
+        None => "  ".to_string(),
+    };
     let count_label = format!("  ({})", section.members.len());
     let count_style = Style::default().fg(theme.text_muted).bg(bg);
 
     let label = format!("▸ {}", section.name.to_uppercase());
-    let used = 3 + label.chars().count() + count_label.chars().count();
+    let used =
+        3 + key_prefix.chars().count() + label.chars().count() + count_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
 
     Line::from(vec![
         Span::styled(format!(" {} ", marker), marker_style),
+        Span::styled(key_prefix, key_style),
         Span::styled(label, title_style),
         Span::styled(count_label, count_style),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),

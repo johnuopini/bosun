@@ -378,6 +378,17 @@ impl AppState {
                     self.pending_modal = Some(ModalRequest::Theme);
                 }
             }
+            // Direct-jump: 0 → ungrouped, 1..=9 → sections[0..=8]. Only
+            // meaningful when the cursor is on a session; the move
+            // helper no-ops on section headers and out-of-range targets.
+            (KeyCode::Char(c @ '0'..='9'), KeyModifiers::NONE) => {
+                let target = if c == '0' {
+                    None
+                } else {
+                    Some((c as u8 - b'1') as usize)
+                };
+                self.move_session_to_bucket(target, out);
+            }
             _ => {}
         }
     }
@@ -445,6 +456,49 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Move the selected session directly into a named bucket.
+    /// `target = None` → ungrouped; `target = Some(si)` → sections[si].
+    /// Inserts at the END of the target. No-op if cursor isn't on a
+    /// session or the target is the session's current bucket.
+    pub fn move_session_to_bucket(&mut self, target: Option<usize>, out: &mut Vec<Command>) {
+        let loc = match self.selected_location() {
+            Some(l) => l,
+            None => return,
+        };
+        // Resolve target, bail if out of range or same bucket.
+        let name = match (loc, target) {
+            (Location::Ungrouped(_), None) => return,
+            (Location::Member(cur, _), Some(t)) if cur == t => return,
+            (Location::Header(_), _) => return,
+            (Location::Ungrouped(i), Some(t)) => {
+                if t >= self.sidebar.sections.len() {
+                    return;
+                }
+                self.sidebar.ungrouped.remove(i)
+            }
+            (Location::Member(si, mi), None) => self.sidebar.sections[si].members.remove(mi),
+            (Location::Member(si, mi), Some(t)) => {
+                if t >= self.sidebar.sections.len() {
+                    return;
+                }
+                self.sidebar.sections[si].members.remove(mi)
+            }
+        };
+        match target {
+            None => {
+                self.sidebar.ungrouped.push(name);
+                let new_idx = self.sidebar.ungrouped.len() - 1;
+                self.selected = self.sidebar.flat_index(Location::Ungrouped(new_idx));
+            }
+            Some(si) => {
+                self.sidebar.sections[si].members.push(name);
+                let new_mi = self.sidebar.sections[si].members.len() - 1;
+                self.selected = self.sidebar.flat_index(Location::Member(si, new_mi));
+            }
+        }
+        self.save_sidebar(out);
     }
 
     /// Shift-Right. Move a session one bucket forward: ungrouped →
@@ -1231,5 +1285,90 @@ mod tests {
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         s.apply(AppMsg::Key(right));
         assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    /// Pressing `2` on an ungrouped session jumps it directly to
+    /// sections[1] — no cycling required.
+    #[test]
+    fn digit_jumps_session_directly_to_section() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("bosun")];
+        s.sidebar = model(
+            &["bosun"],
+            vec![section("g1", "SKULK", &[]), section("g2", "YETI", &[])],
+        );
+        s.selected = 0;
+
+        s.apply(AppMsg::Key(key(KeyCode::Char('2'))));
+
+        assert!(s.sidebar.ungrouped.is_empty());
+        assert!(s.sidebar.sections[0].members.is_empty());
+        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            s.selected_session().map(|v| v.name().to_string()),
+            Some("bosun".to_string())
+        );
+    }
+
+    /// Pressing `0` sends the session back to ungrouped.
+    #[test]
+    fn digit_zero_returns_session_to_ungrouped() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("bosun")];
+        s.sidebar = model(&[], vec![section("g1", "W", &["bosun"])]);
+        // flat: 0=header, 1=bosun
+        s.selected = 1;
+
+        s.apply(AppMsg::Key(key(KeyCode::Char('0'))));
+
+        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+        assert!(s.sidebar.sections[0].members.is_empty());
+    }
+
+    /// Digit for a nonexistent section is a no-op (doesn't move).
+    #[test]
+    fn digit_out_of_range_is_noop() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("bosun")];
+        s.sidebar = model(&["bosun"], vec![section("g1", "W", &[])]);
+        s.selected = 0;
+
+        // Only one section → `2` is out of range.
+        s.apply(AppMsg::Key(key(KeyCode::Char('2'))));
+        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+    }
+
+    /// Shift-Right cycles through sections: pressing it again after
+    /// a move jumps from section 0 to section 1, etc.
+    #[test]
+    fn shift_right_cycles_to_further_sections() {
+        let mut s = AppState::default();
+        s.sessions = vec![ses("bosun")];
+        s.sidebar = model(
+            &["bosun"],
+            vec![section("g1", "SKULK", &[]), section("g2", "YETI", &[])],
+        );
+        s.selected = 0; // bosun in ungrouped
+
+        let sr = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+
+        s.apply(AppMsg::Key(sr));
+        assert!(s.sidebar.ungrouped.is_empty());
+        assert_eq!(s.sidebar.sections[0].members, vec!["bosun".to_string()]);
+        assert!(s.sidebar.sections[1].members.is_empty());
+        assert_eq!(
+            s.selected_session().map(|v| v.name().to_string()),
+            Some("bosun".to_string()),
+            "cursor should track bosun into SKULK"
+        );
+
+        s.apply(AppMsg::Key(sr));
+        assert!(s.sidebar.sections[0].members.is_empty());
+        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            s.selected_session().map(|v| v.name().to_string()),
+            Some("bosun".to_string()),
+            "cursor should track bosun into YETI"
+        );
     }
 }
