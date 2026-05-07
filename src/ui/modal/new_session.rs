@@ -103,9 +103,18 @@ struct PathEntry {
 
 impl NewSessionModal {
     pub fn new(recents: Vec<Recent>) -> Self {
-        let path = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~".to_string());
+        // Default the path to the most-recently-used session's path so
+        // the modal "remembers" where you last worked across restarts.
+        // Falls back to cwd (and then to ~) when there are no recents.
+        let path = recents
+            .first()
+            .map(|r| r.path.clone())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            })
+            .unwrap_or_else(|| "~".to_string());
         let mut modal = Self {
             name: String::new(),
             path,

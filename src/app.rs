@@ -93,6 +93,12 @@ pub struct AppState {
     /// section, as long as a section with that name still exists.
     /// Persisted via `Command::SaveSessionHistory`.
     pub session_history: std::collections::HashMap<String, String>,
+    /// Captured when the user opens the new-session modal: the section
+    /// the cursor was on (or in). When the resulting session lands in
+    /// the next refresh, it gets placed in this section instead of
+    /// the default ungrouped bucket. Cleared on consume; overwritten
+    /// each time the modal is opened.
+    pub pending_new_session_section: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +167,18 @@ impl AppState {
     /// Look up the SessionView for a given internal name.
     pub fn session_by_name(&self, name: &str) -> Option<&SessionView> {
         self.sessions.iter().find(|v| v.name() == name)
+    }
+
+    /// If the cursor is on a section header or one of its members,
+    /// return that section's name. Otherwise (ungrouped or empty), None.
+    /// Used to remember which group a new session should land in.
+    fn current_section_name(&self) -> Option<String> {
+        match self.selected_location()? {
+            Location::Header(si) | Location::Member(si, _) => {
+                self.sidebar.sections.get(si).map(|s| s.name.clone())
+            }
+            Location::Ungrouped(_) => None,
+        }
     }
 
     /// Update `session_history` from a single moved session. Looks up
@@ -247,6 +265,27 @@ impl AppState {
                     self.sessions.iter().map(|v| v.name().to_string()).collect();
                 self.sidebar.reconcile(&live);
 
+                // If this refresh is the result of a session create
+                // and the user opened the new-session modal while
+                // their cursor was on a section, seed the history
+                // map so `restore_from_history` places the new
+                // session there instead of leaving it in ungrouped.
+                if let Some(target) = select_after.as_deref() {
+                    if let Some(section_name) = self.pending_new_session_section.take() {
+                        if self.sidebar.sections.iter().any(|s| s.name == section_name) {
+                            if let Some(display) = self
+                                .sessions
+                                .iter()
+                                .find(|v| v.name() == target)
+                                .map(|v| v.display().to_string())
+                            {
+                                self.session_history.insert(display, section_name);
+                                self.save_session_history(&mut out);
+                            }
+                        }
+                    }
+                }
+
                 // Auto-place new sessions into their last-known
                 // section by display-name match. Handles both
                 // restart (same display name, new internal name)
@@ -282,10 +321,18 @@ impl AppState {
                         StackDispatch::PassThrough => self.handle_key(k, &mut out),
                         StackDispatch::Closed(cmd) => {
                             if let Some(c) = cmd {
+                                if matches!(c, Command::CreateSession(_)) {
+                                    self.pending_new_session_section = self.current_section_name();
+                                }
                                 out.push(c);
                             }
                         }
-                        StackDispatch::Emit(cmd) => out.push(cmd),
+                        StackDispatch::Emit(cmd) => {
+                            if matches!(cmd, Command::CreateSession(_)) {
+                                self.pending_new_session_section = self.current_section_name();
+                            }
+                            out.push(cmd);
+                        }
                     }
                 } else {
                     self.handle_key(k, &mut out);
@@ -899,7 +946,7 @@ impl App {
             if let Some(req) = self.state.pending_modal.take() {
                 match req {
                     ModalRequest::NewSession => {
-                        let recents = self.store.list_recents(8).unwrap_or_default();
+                        let recents = self.store.list_recents(50).unwrap_or_default();
                         self.state
                             .modals
                             .push(Box::new(NewSessionModal::new(recents)));

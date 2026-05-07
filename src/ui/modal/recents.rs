@@ -20,7 +20,18 @@ use crate::ui::Theme;
 use super::{center_rect, Modal, ModalData, ModalResult};
 
 const MODAL_WIDTH: u16 = 74;
-const MODAL_HEIGHT: u16 = 18;
+/// Floor height (chrome + a couple of rows) when the recents list is
+/// nearly empty. Real height is computed in `render` so a long list
+/// gets a tall modal — clamped to the available terminal area.
+const MODAL_MIN_HEIGHT: u16 = 12;
+/// Hard cap so the modal never tries to fill a giant terminal end-to-
+/// end; leaves a margin for the underlying new-session modal to peek
+/// through and keeps focus on the visible window.
+const MODAL_MAX_HEIGHT: u16 = 40;
+/// Fixed chrome rows: title, blank, filter, blank, plus the 2-row
+/// inset baked into `inner`. Subtracted from modal height to get the
+/// number of list rows that fit.
+const MODAL_CHROME_ROWS: u16 = 6;
 
 pub struct RecentsModal {
     recents: Vec<Recent>,
@@ -144,7 +155,11 @@ impl Modal for RecentsModal {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let desired = (self.recents.len() as u16).saturating_add(MODAL_CHROME_ROWS);
+        let height = desired
+            .clamp(MODAL_MIN_HEIGHT, MODAL_MAX_HEIGHT)
+            .min(area.height.saturating_sub(2).max(MODAL_MIN_HEIGHT));
+        let rect = center_rect(area, MODAL_WIDTH, height);
         let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
