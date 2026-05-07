@@ -19,8 +19,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
 
     let visible = state.sidebar.visible();
 
-    let lines: Vec<Line<'_>> = if visible.is_empty() {
-        vec![
+    if visible.is_empty() {
+        let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  no tmux sessions",
@@ -30,56 +30,90 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 "  (press n to create · g for a section)",
                 Style::default().fg(theme.text_muted),
             )),
-        ]
-    } else {
-        // Track the section-index (0-based) as we walk the visible
-        // list so section headers can show their numeric jump key.
-        let mut section_idx: usize = 0;
-        let mut out: Vec<Line<'_>> = Vec::with_capacity(visible.len() * 2);
-        for (i, entry) in visible.iter().enumerate() {
-            let selected = i == state.selected;
-            match entry {
-                VisibleEntry::UngroupedSession(n) => match state.session_by_name(n) {
-                    Some(v) => {
-                        out.push(render_primary_line(v, selected, false, area.width, theme));
-                        out.push(render_meta_line(v, selected, false, area.width, theme));
-                    }
-                    None => {
-                        out.push(render_missing_line(n, selected, false, area.width, theme));
-                    }
-                },
-                VisibleEntry::SectionHeader(s) => {
-                    // Jump key: 1..9 for the first nine sections, blank for any
-                    // extras. Matches the digit bindings in app::handle_key.
-                    let jump_key = if section_idx < 9 {
-                        Some((section_idx as u8 + b'1') as char)
-                    } else {
-                        None
-                    };
-                    out.push(render_section_line(
-                        s, selected, jump_key, area.width, theme,
-                    ));
-                    section_idx += 1;
+        ];
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    // Track the section-index (0-based) as we walk the visible list so
+    // section headers can show their numeric jump key.
+    let mut section_idx: usize = 0;
+    let mut out: Vec<Line<'_>> = Vec::with_capacity(visible.len() * 2);
+    // For each entry, record the first/last line index it produced.
+    // Used after the build to compute a scroll offset that keeps the
+    // selected entry fully visible — without this, on small screens
+    // (mobile / mosh / phone) the list never scrolls and entries past
+    // the viewport bottom are unreachable.
+    let mut entry_first_line: Vec<usize> = Vec::with_capacity(visible.len());
+    let mut entry_last_line: Vec<usize> = Vec::with_capacity(visible.len());
+    for (i, entry) in visible.iter().enumerate() {
+        let selected = i == state.selected;
+        let start = out.len();
+        match entry {
+            VisibleEntry::UngroupedSession(n) => match state.session_by_name(n) {
+                Some(v) => {
+                    out.push(render_primary_line(v, selected, false, area.width, theme));
+                    out.push(render_meta_line(v, selected, false, area.width, theme));
                 }
-                VisibleEntry::SectionMember { internal, .. } => {
-                    match state.session_by_name(internal) {
-                        Some(v) => {
-                            out.push(render_primary_line(v, selected, true, area.width, theme));
-                            out.push(render_meta_line(v, selected, true, area.width, theme));
-                        }
-                        None => {
-                            out.push(render_missing_line(
-                                internal, selected, true, area.width, theme,
-                            ));
-                        }
-                    }
+                None => {
+                    out.push(render_missing_line(n, selected, false, area.width, theme));
                 }
+            },
+            VisibleEntry::SectionHeader(s) => {
+                let jump_key = if section_idx < 9 {
+                    Some((section_idx as u8 + b'1') as char)
+                } else {
+                    None
+                };
+                out.push(render_section_line(
+                    s, selected, jump_key, area.width, theme,
+                ));
+                section_idx += 1;
             }
+            VisibleEntry::SectionMember { internal, .. } => match state.session_by_name(internal) {
+                Some(v) => {
+                    out.push(render_primary_line(v, selected, true, area.width, theme));
+                    out.push(render_meta_line(v, selected, true, area.width, theme));
+                }
+                None => {
+                    out.push(render_missing_line(
+                        internal, selected, true, area.width, theme,
+                    ));
+                }
+            },
         }
-        out
+        entry_first_line.push(start);
+        entry_last_line.push(out.len().saturating_sub(1));
+    }
+
+    let total_lines = out.len();
+    let viewport = area.height as usize;
+    // Compute a scroll offset that keeps the selected entry fully
+    // visible. No persistent scroll state — derive every frame from
+    // the current selection so j/k, jump keys, and section toggles
+    // all stay consistent without sync logic. Without this, on small
+    // screens (mobile / mosh) entries past the viewport bottom were
+    // unreachable.
+    let scroll: u16 = if total_lines <= viewport || viewport == 0 {
+        0
+    } else {
+        let sel = state.selected.min(entry_first_line.len().saturating_sub(1));
+        let first = entry_first_line[sel];
+        let last = entry_last_line[sel];
+        let max_scroll = total_lines.saturating_sub(viewport);
+        // Center-ish: aim for the selection at ~1/3 from the top so
+        // there's context above and below as the user navigates.
+        let target = viewport / 3;
+        let mut s = first.saturating_sub(target);
+        // Always keep the entry's last line on-screen — matters for
+        // 2-line session entries near the bottom of the list.
+        if last >= s + viewport {
+            s = (last + 1).saturating_sub(viewport);
+        }
+        s.min(max_scroll) as u16
     };
 
-    let p = Paragraph::new(lines).block(block);
+    let p = Paragraph::new(out).block(block).scroll((scroll, 0));
     frame.render_widget(p, area);
 }
 
@@ -127,7 +161,15 @@ fn render_section_line(
     let count_label = format!("  ({})", section.members.len());
     let count_style = Style::default().fg(theme.text_muted).bg(bg);
 
-    let label = format!("▸ {}", section.name.to_uppercase());
+    // Disclosure glyph follows the standard tree convention: ▸ when
+    // the section is closed (members hidden), ▾ when open. An empty
+    // section always shows ▸ since there's nothing to collapse.
+    let glyph = if section.collapsed || section.members.is_empty() {
+        "▸"
+    } else {
+        "▾"
+    };
+    let label = format!("{glyph} {}", section.name.to_uppercase());
     let used = 3 + key_prefix.chars().count() + label.chars().count() + count_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
 

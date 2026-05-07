@@ -21,7 +21,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::app::AppState;
-use crate::ui::Theme;
+use crate::sidebar::{Location, VisibleKind};
+use crate::ui::{banner, section_preview, Theme};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     // Reset every cell in the preview area to Color::Reset before drawing
@@ -29,9 +30,47 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     // text) doesn't bleed through into a later TUI capture.
     reset_area(frame.buffer_mut(), area);
 
+    // Empty state (no managed sessions): paint the Bosun splash —
+    // banner + version — instead of leaving the pane silent. Lets the
+    // user cycle the global font even before they have any sessions.
+    if state.sessions.is_empty() && state.sidebar.is_empty() {
+        let font = banner::canonical(&state.banner_font);
+        section_preview::render_empty(frame.buffer_mut(), area, font, theme);
+        return;
+    }
+
+    // Section header selected: render banner + per-section table.
+    // The cursor location tells us which section, regardless of how
+    // many sessions live elsewhere.
+    if let Some(VisibleKind::Header) = state.selected_kind() {
+        if let Some(Location::Header(si)) = state.selected_location() {
+            if let Some(sec) = state.sidebar.sections.get(si) {
+                let font = sec
+                    .banner_font
+                    .as_deref()
+                    .map(banner::canonical)
+                    .unwrap_or_else(|| banner::canonical(&state.banner_font));
+                let members: Vec<&crate::tmux::session::SessionView> = sec
+                    .members
+                    .iter()
+                    .filter_map(|n| state.session_by_name(n))
+                    .collect();
+                section_preview::render_section(
+                    frame.buffer_mut(),
+                    area,
+                    sec,
+                    &members,
+                    font,
+                    theme,
+                );
+                return;
+            }
+        }
+    }
+
     let text: Text<'_> = if state.sessions.is_empty() {
-        // Nothing to preview if there are no managed sessions at all.
-        // Stay quiet rather than saying "capturing…" which is misleading.
+        // Sidebar has sections but no live sessions yet — stay quiet
+        // rather than saying "capturing…" which is misleading.
         placeholder("", theme)
     } else {
         match state.selected_preview() {

@@ -1,0 +1,310 @@
+//! TheDraw / TDF font banner rendering for section headers and the
+//! empty-state Bosun splash.
+//!
+//! Eight TDFs ship in `themes/banners/`, embedded via `include_bytes!`
+//! so the binary is self-contained. `Font` instances are parsed lazily
+//! on first use and cached in `OnceLock`. TDFs encode color per cell;
+//! we map their 16-color DOS palette to ratatui RGB and paint cell-
+//! by-cell into the frame buffer (no Paragraph), since TDFs need
+//! per-cell fg/bg.
+
+use std::sync::OnceLock;
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
+use retrofont::{Cell as RetroCell, Font, FontTarget, RenderOptions};
+
+use crate::ui::Theme;
+
+/// `(name, embedded bytes)`. Order is the toggle order: pressing `f`
+/// cycles to the next entry, wrapping around at the end.
+const BANNERS: &[(&str, &[u8])] = &[
+    ("eatmex", include_bytes!("../../themes/banners/eatmex.tdf")),
+    (
+        "inspectx",
+        include_bytes!("../../themes/banners/inspectx.tdf"),
+    ),
+    (
+        "metalix",
+        include_bytes!("../../themes/banners/metalix.tdf"),
+    ),
+    ("newsx", include_bytes!("../../themes/banners/newsx.tdf")),
+    (
+        "silver2",
+        include_bytes!("../../themes/banners/silver2.tdf"),
+    ),
+    ("smallr", include_bytes!("../../themes/banners/smallr.tdf")),
+    ("thicko", include_bytes!("../../themes/banners/thicko.tdf")),
+    ("usex", include_bytes!("../../themes/banners/usex.tdf")),
+];
+
+/// VGA / DOS text-mode palette. TDFs reference these by index.
+const DOS_PALETTE: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0x00, 0x00, 0xAA),
+    (0x00, 0xAA, 0x00),
+    (0x00, 0xAA, 0xAA),
+    (0xAA, 0x00, 0x00),
+    (0xAA, 0x00, 0xAA),
+    (0xAA, 0x55, 0x00),
+    (0xAA, 0xAA, 0xAA),
+    (0x55, 0x55, 0x55),
+    (0x55, 0x55, 0xFF),
+    (0x55, 0xFF, 0x55),
+    (0x55, 0xFF, 0xFF),
+    (0xFF, 0x55, 0x55),
+    (0xFF, 0x55, 0xFF),
+    (0xFF, 0xFF, 0x55),
+    (0xFF, 0xFF, 0xFF),
+];
+
+pub fn default_name() -> &'static str {
+    BANNERS[0].0
+}
+
+pub fn names() -> impl Iterator<Item = &'static str> {
+    BANNERS.iter().map(|(n, _)| *n)
+}
+
+/// Resolve a font name to a known one, falling back to the default if
+/// the user (or config) supplied something unknown.
+pub fn canonical(name: &str) -> &'static str {
+    BANNERS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(n, _)| *n)
+        .unwrap_or_else(default_name)
+}
+
+/// Cycle to the next font in the list. Wraps around at the end.
+pub fn next(name: &str) -> &'static str {
+    let cur = canonical(name);
+    let pos = BANNERS.iter().position(|(n, _)| *n == cur).unwrap_or(0);
+    BANNERS[(pos + 1) % BANNERS.len()].0
+}
+
+/// Lazily parse a TDF and cache the `Font` for the rest of the
+/// process. Returns None if parsing fails (corrupt embed) — caller
+/// should fall back to a plain text title.
+fn font_for(name: &str) -> Option<&'static Font> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static Font>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let canonical = canonical(name);
+    {
+        let g = cache.lock().ok()?;
+        if let Some(f) = g.get(canonical) {
+            return Some(*f);
+        }
+    }
+    let bytes = BANNERS
+        .iter()
+        .find(|(n, _)| *n == canonical)
+        .map(|(_, b)| *b)?;
+    let mut fonts = Font::load(bytes).ok()?;
+    if fonts.is_empty() {
+        return None;
+    }
+    let leaked: &'static Font = Box::leak(Box::new(fonts.remove(0)));
+    let mut g = cache.lock().ok()?;
+    g.insert(canonical, leaked);
+    Some(leaked)
+}
+
+/// Accumulates per-cell output into a 2D grid as the font emits glyphs.
+/// Mirrors the approach in `retrofont-cli`'s ConsoleRenderer but stays
+/// in raw cells so the caller can map them onto a ratatui buffer.
+struct GridRenderer {
+    lines: Vec<Vec<RetroCell>>,
+    cur_x: usize,
+    cur_line: usize,
+}
+
+impl GridRenderer {
+    fn new() -> Self {
+        Self {
+            lines: vec![Vec::new()],
+            cur_x: 0,
+            cur_line: 0,
+        }
+    }
+
+    fn next_char(&mut self) {
+        self.cur_x = self.lines.iter().map(|l| l.len()).max().unwrap_or(0);
+        self.cur_line = 0;
+    }
+
+    fn into_lines(self) -> Vec<Vec<RetroCell>> {
+        self.lines
+    }
+}
+
+impl FontTarget for GridRenderer {
+    type Error = std::fmt::Error;
+
+    fn draw(&mut self, cell: RetroCell) -> std::result::Result<(), Self::Error> {
+        while self.cur_line >= self.lines.len() {
+            self.lines.push(Vec::new());
+        }
+        let row = &mut self.lines[self.cur_line];
+        while row.len() < self.cur_x {
+            row.push(RetroCell::new(' ', None, None, false));
+        }
+        row.push(cell);
+        Ok(())
+    }
+
+    fn next_line(&mut self) -> std::result::Result<(), Self::Error> {
+        self.cur_line += 1;
+        Ok(())
+    }
+}
+
+/// Render `text` into a 2D grid of cells using the chosen font.
+/// Returns None if the font failed to load or rendering errored.
+fn render_grid(text: &str, font_name: &str) -> Option<Vec<Vec<RetroCell>>> {
+    let font = font_for(font_name)?;
+    let mut renderer = GridRenderer::new();
+    let opts = RenderOptions::display();
+    for ch in text.chars() {
+        // Skip silently on missing glyphs rather than aborting the
+        // whole banner — TDFs often only carry A-Z/0-9, and `case
+        // fallback` inside retrofont already tries the opposite case.
+        let _ = font.render_glyph(&mut renderer, ch, &opts);
+        renderer.next_char();
+    }
+    Some(renderer.into_lines())
+}
+
+/// Width and height of the rendered grid (in terminal cells).
+fn grid_size(grid: &[Vec<RetroCell>]) -> (u16, u16) {
+    let h = grid.len() as u16;
+    let w = grid.iter().map(|r| r.len()).max().unwrap_or(0) as u16;
+    (w, h)
+}
+
+/// Resolve a `Color` to concrete RGB. Named ANSI variants don't carry
+/// RGB by themselves so we approximate with a neutral mid-grey — every
+/// shipped theme uses `Color::Rgb` for `accent`, so this fallback is
+/// only here to keep the function total.
+fn rgb_of(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (192, 192, 192),
+    }
+}
+
+/// Map a DOS palette index to a tint of `tint`. The original DOS color
+/// is reduced to a brightness factor (0..1) using the largest channel
+/// — TDFs tend to use saturated colors, so max-channel tracks "how lit
+/// is this cell" better than RGB-luminance, and the result is a clean
+/// gradient from black (off) to full accent (on). Matches the
+/// behaviour the user asked for: every banner reads as a tint of the
+/// theme's accent regardless of which DOS colors the source font used.
+fn tinted_color(idx: u8, tint: Color) -> Color {
+    let (sr, sg, sb) = DOS_PALETTE[idx as usize % 16];
+    let lum = sr.max(sg).max(sb) as f32 / 255.0;
+    let (tr, tg, tb) = rgb_of(tint);
+    let scale = |c: u8| -> u8 { ((c as f32) * lum).round().clamp(0.0, 255.0) as u8 };
+    Color::Rgb(scale(tr), scale(tg), scale(tb))
+}
+
+/// Padding (in cell rows / cols) around the banner inside its area.
+/// Keeps the glyphs from sitting flush against the pane edges.
+const PAD_TOP: u16 = 1;
+const PAD_BOTTOM: u16 = 1;
+const PAD_LEFT: u16 = 3;
+const PAD_RIGHT: u16 = 2;
+
+/// Paint a banner into `area` with breathing room on all sides.
+/// Returns the total rows consumed (banner glyph rows + top + bottom
+/// padding) so callers can lay out content immediately underneath.
+///
+/// If the rendered banner is wider than the available width, paints
+/// what fits and stops at the right edge — TDF glyphs are blocky so a
+/// hard clip looks fine.
+pub fn paint(buf: &mut Buffer, area: Rect, text: &str, font_name: &str, theme: &Theme) -> u16 {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let Some(grid) = render_grid(text, font_name) else {
+        return 0;
+    };
+    let (_, gh) = grid_size(&grid);
+    // Reserve top+bottom padding before we ask the grid how many rows
+    // it can paint. PAD_BOTTOM is the gap between the banner and the
+    // caption row underneath.
+    let avail_rows = area.height.saturating_sub(PAD_TOP + PAD_BOTTOM);
+    let rows = gh.min(avail_rows);
+    let max_cols = (area.width as usize).saturating_sub((PAD_LEFT + PAD_RIGHT) as usize);
+    for (r, row) in grid.iter().enumerate().take(rows as usize) {
+        let y = area.y + PAD_TOP + r as u16;
+        for (c, cell) in row.iter().enumerate().take(max_cols) {
+            let x = area.x + PAD_LEFT + c as u16;
+            if x >= area.x + area.width || y >= area.y + area.height {
+                break;
+            }
+            let mut style = Style::default();
+            if let Some(fg) = cell.fg {
+                style = style.fg(tinted_color(fg, theme.accent));
+            }
+            // Treat DOS-palette black (index 0) as transparent. TDFs
+            // designed against a black DOS terminal use bg=0 for the
+            // "empty" parts of each glyph; rendering that as solid
+            // black inside bosun's panel reads as a hard rectangle
+            // around the banner. Skipping the explicit bg lets the
+            // pane's reset color show through, so the banner floats
+            // on whatever theme background is active.
+            if let Some(bg) = cell.bg {
+                if bg != 0 {
+                    style = style.bg(tinted_color(bg, theme.accent));
+                }
+            }
+            let target = &mut buf[(x, y)];
+            target.set_char(cell.ch);
+            target.set_style(style);
+        }
+    }
+    // Caller positions the caption below the bottom padding row, so
+    // include all the padding we reserved.
+    PAD_TOP + rows + PAD_BOTTOM
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_has_eatmex_first() {
+        assert_eq!(default_name(), "eatmex");
+        assert!(names().any(|n| n == "metalix"));
+    }
+
+    #[test]
+    fn next_wraps_around() {
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = default_name();
+        for _ in 0..BANNERS.len() {
+            assert!(seen.insert(cur), "cycle revisits {cur} early");
+            cur = next(cur);
+        }
+        // After one full revolution, we should be back to the start.
+        assert_eq!(cur, default_name());
+    }
+
+    #[test]
+    fn canonical_falls_back_for_unknown() {
+        assert_eq!(canonical("nope-not-a-font"), default_name());
+    }
+
+    #[test]
+    fn default_font_renders_some_cells() {
+        // Smoke test: parsing the embedded default TDF + rendering a
+        // single letter should produce at least one row of cells.
+        let grid = render_grid("Y", default_name()).expect("default font should parse");
+        let (w, h) = grid_size(&grid);
+        assert!(w > 0 && h > 0, "expected non-empty grid, got {w}x{h}");
+    }
+}

@@ -129,6 +129,8 @@ fn sections_group_sessions() {
             id: "g1".into(),
             name: "Premium Products".into(),
             members: vec!["beta".to_string(), "gamma".to_string()],
+            collapsed: false,
+            banner_font: None,
         }],
     };
     let frame = render(&state, 80, 12);

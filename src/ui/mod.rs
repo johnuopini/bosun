@@ -1,6 +1,8 @@
+pub mod banner;
 pub mod layout;
 pub mod modal;
 pub mod preview;
+pub mod section_preview;
 pub mod session_list;
 pub mod statusbar;
 pub mod theme;

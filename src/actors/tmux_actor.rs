@@ -391,6 +391,7 @@ pub fn spawn(
                 | Command::SaveDivider(_)
                 | Command::SaveSidebar(_)
                 | Command::SaveSessionHistory(_)
+                | Command::SaveBannerFont(_)
                 | Command::InsertSection { .. }
                 | Command::RenameSection { .. } => {
                     // Pure UI state — the app loop intercepts these

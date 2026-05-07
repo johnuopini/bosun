@@ -110,6 +110,9 @@ pub enum Command {
     /// Persist the display_name → section_name history to config.toml.
     /// Intercepted by the app loop — never forwarded to the tmux actor.
     SaveSessionHistory(std::collections::HashMap<String, String>),
+    /// Persist the global TDF banner font to config.toml. Intercepted
+    /// by the app loop — never forwarded to the tmux actor.
+    SaveBannerFont(String),
     /// Insert a new section header above the cursor with the given name.
     /// Intercepted by the app loop — never forwarded to the tmux actor.
     InsertSection { name: String },

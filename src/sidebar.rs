@@ -27,6 +27,22 @@ pub struct Section {
     pub name: String,
     #[serde(default)]
     pub members: Vec<String>,
+    /// When true, the section's members are hidden from the rendered
+    /// sidebar (only the header is visible). Toggled by Tab on the
+    /// header. Persisted in `config.toml` so the open/closed state
+    /// survives restarts. Default false (expanded) — old configs
+    /// without this field stay expanded on first read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub collapsed: bool,
+    /// Per-section override for the TDF banner font shown in the
+    /// preview pane. `None` falls back to `Config::banner_font`
+    /// (the global default). Toggled by `f` on the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner_font: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Section {
@@ -39,6 +55,8 @@ impl Section {
             id: format!("sec-{:08x}", nanos as u32),
             name: name.into(),
             members: Vec::new(),
+            collapsed: false,
+            banner_font: None,
         }
     }
 }
@@ -114,13 +132,23 @@ impl<'a> VisibleEntry<'a> {
 }
 
 impl SidebarModel {
+    /// How many of `s.members` actually contribute visible rows. Zero
+    /// when the section is collapsed; full count when expanded.
+    fn visible_member_count(s: &Section) -> usize {
+        if s.collapsed {
+            0
+        } else {
+            s.members.len()
+        }
+    }
+
     /// Total number of visible rows in the flattened sidebar.
     pub fn len(&self) -> usize {
         self.ungrouped.len()
             + self
                 .sections
                 .iter()
-                .map(|s| 1 + s.members.len())
+                .map(|s| 1 + Self::visible_member_count(s))
                 .sum::<usize>()
     }
 
@@ -129,6 +157,8 @@ impl SidebarModel {
     }
 
     /// Flatten the model into an ordered list of visible entries.
+    /// Members of collapsed sections are skipped — only the header row
+    /// is emitted for those.
     pub fn visible(&self) -> Vec<VisibleEntry<'_>> {
         let mut out = Vec::with_capacity(self.len());
         for n in &self.ungrouped {
@@ -136,11 +166,13 @@ impl SidebarModel {
         }
         for s in &self.sections {
             out.push(VisibleEntry::SectionHeader(s));
-            for m in &s.members {
-                out.push(VisibleEntry::SectionMember {
-                    section: s,
-                    internal: m.as_str(),
-                });
+            if !s.collapsed {
+                for m in &s.members {
+                    out.push(VisibleEntry::SectionMember {
+                        section: s,
+                        internal: m.as_str(),
+                    });
+                }
             }
         }
         out
@@ -157,7 +189,7 @@ impl SidebarModel {
             if idx == cursor {
                 return Some(Location::Header(si));
             }
-            let next = cursor + 1 + sec.members.len();
+            let next = cursor + 1 + Self::visible_member_count(sec);
             if idx < next {
                 return Some(Location::Member(si, idx - cursor - 1));
             }
@@ -167,7 +199,9 @@ impl SidebarModel {
     }
 
     /// Convert a location back into a flattened index. Saturates to
-    /// `len()` if the location is out of bounds.
+    /// `len()` if the location is out of bounds. A collapsed section's
+    /// members aren't visible — `Member(si, _)` returns the header's
+    /// index in that case.
     pub fn flat_index(&self, loc: Location) -> usize {
         match loc {
             Location::Ungrouped(i) => i.min(self.ungrouped.len()),
@@ -175,7 +209,7 @@ impl SidebarModel {
                 let mut idx = self.ungrouped.len();
                 let bound = si.min(self.sections.len());
                 for s in &self.sections[..bound] {
-                    idx += 1 + s.members.len();
+                    idx += 1 + Self::visible_member_count(s);
                 }
                 idx
             }
@@ -185,9 +219,13 @@ impl SidebarModel {
                 }
                 let mut idx = self.ungrouped.len();
                 for s in &self.sections[..si] {
-                    idx += 1 + s.members.len();
+                    idx += 1 + Self::visible_member_count(s);
                 }
-                idx + 1 + mi.min(self.sections[si].members.len())
+                let header = idx;
+                if self.sections[si].collapsed {
+                    return header;
+                }
+                header + 1 + mi.min(self.sections[si].members.len())
             }
         }
     }
@@ -285,6 +323,8 @@ mod tests {
             id: id.into(),
             name: name.into(),
             members: members.iter().map(|s| s.to_string()).collect(),
+            collapsed: false,
+            banner_font: None,
         }
     }
 

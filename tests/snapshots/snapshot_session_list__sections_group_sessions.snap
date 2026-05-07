@@ -3,14 +3,14 @@ source: tests/snapshot_session_list.rs
 expression: frame
 ---
    ○  alpha  1w               │                                                 
-       claude · /tmp/work     │  preview: capturing…                            
- ▌ 1 ▸ PREMIUM PRODUCTS  (2)  │                                                 
-     ○  beta  1w              │                                                 
+       claude · /tmp/work     │    ██▀▀█▄ ██▀▀█▄▄▄█▀▀▀▄▄█▄▄▄█████ ██  ██▄▄█▄▄▄  
+ ▌ 1 ▾ PREMIUM PRODUCTS  (2)  │    ██▄▄█▀ ██▄▄█▀ ██▄  ███▀▀██████ ██  █████▀▀█  
+     ○  beta  1w              │    ██     ██▀▀██ ██▄▄▄███  ██████▀▀█▄▄█▀███  █  
          claude · /tmp/work   │                                                 
-     ○  gamma  1w  •attached  │                                                 
-         claude · /tmp/work   │                                                 
-                              │                                                 
-                              │                                                 
-                              │                                                 
-                              │                                                 
- bosun  v0.2.12 3 sessions↵ attach · n new · g group · 1-9 move · r ren · d kill
+     ○  gamma  1w  •attached  │   font: eatmex · f to cycle · 2 sessions        
+         claude · /tmp/work   │   ────────────────────────────────────────────  
+                              │   ○  beta   claude   2940w                      
+                              │        /tmp/work                                
+                              │   ○  gamma   claude   2940w  •attached          
+                              │        /tmp/work                                
+ bosun  v0.2.13 3 sessions↵ attach · n new · g group · 1-9 move · r ren · d kill

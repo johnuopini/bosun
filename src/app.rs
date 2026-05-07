@@ -99,6 +99,11 @@ pub struct AppState {
     /// the default ungrouped bucket. Cleared on consume; overwritten
     /// each time the modal is opened.
     pub pending_new_session_section: Option<String>,
+    /// Global TDF banner font used by the section/empty preview when
+    /// no per-section override is set. Cycled by pressing `f` on a
+    /// section header (per-section override) or on the empty splash
+    /// (this global default). Persisted via `Command::SaveBannerFont`.
+    pub banner_font: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +512,46 @@ impl AppState {
             (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
                 self.pending_modal = Some(ModalRequest::Theme);
             }
+            // Tab: toggle collapse on a section header. Hides the
+            // section's members in the rendered sidebar; the open/
+            // closed state is persisted in `config.toml` so it
+            // survives restarts. No-op when the cursor isn't on a
+            // header.
+            (KeyCode::Tab, _) => {
+                if let Some(Location::Header(si)) = self.selected_location() {
+                    let s = &mut self.sidebar.sections[si];
+                    s.collapsed = !s.collapsed;
+                    self.save_sidebar(out);
+                    self.clamp_selection();
+                }
+            }
+            // f: cycle the TDF banner font. On a section header it
+            // sets that section's override (and clears it when the
+            // override would equal the global). With no sessions yet
+            // (empty splash), it cycles the global default. No-op
+            // elsewhere — the cursor is on a session and there's no
+            // banner being shown.
+            (KeyCode::Char('f'), KeyModifiers::NONE) => {
+                if let Some(Location::Header(si)) = self.selected_location() {
+                    let global = crate::ui::banner::canonical(&self.banner_font);
+                    let cur = self.sidebar.sections[si]
+                        .banner_font
+                        .as_deref()
+                        .unwrap_or(global);
+                    let nxt = crate::ui::banner::next(cur);
+                    let s = &mut self.sidebar.sections[si];
+                    s.banner_font = if nxt == global {
+                        None
+                    } else {
+                        Some(nxt.to_string())
+                    };
+                    self.save_sidebar(out);
+                } else if self.sessions.is_empty() && self.sidebar.is_empty() {
+                    let nxt = crate::ui::banner::next(&self.banner_font);
+                    self.banner_font = nxt.to_string();
+                    out.push(Command::SaveBannerFont(nxt.to_string()));
+                }
+            }
             // Direct-jump: 0 → ungrouped, 1..=9 → sections[0..=8]. Only
             // meaningful when the cursor is on a session; the move
             // helper no-ops on section headers and out-of-range targets.
@@ -848,6 +893,7 @@ impl App {
             divider_x: config.divider_x,
             sidebar: config.sidebar.clone(),
             session_history: config.session_history.clone(),
+            banner_font: config.banner_font.clone(),
             ..Default::default()
         };
 
@@ -922,6 +968,11 @@ impl App {
                     Command::SaveSessionHistory(history) => {
                         if let Err(e) = crate::config::write_session_history(&history) {
                             self.state.warning = Some(format!("history: failed to save: {e}"));
+                        }
+                    }
+                    Command::SaveBannerFont(name) => {
+                        if let Err(e) = crate::config::write_banner_font(&name) {
+                            self.state.warning = Some(format!("banner: failed to save: {e}"));
                         }
                     }
                     Command::InsertSection { name } => {
@@ -1296,6 +1347,8 @@ mod tests {
             id: id.into(),
             name: name.into(),
             members: members.iter().map(|s| s.to_string()).collect(),
+            collapsed: false,
+            banner_font: None,
         }
     }
 

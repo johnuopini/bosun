@@ -43,6 +43,8 @@ fn migrate_legacy_sidebar(old: Vec<LegacySidebarEntry>) -> SidebarModel {
                     id,
                     name,
                     members: Vec::new(),
+                    collapsed: false,
+                    banner_font: None,
                 });
             }
             LegacySidebarEntry::Session { internal } => {
@@ -107,6 +109,10 @@ pub struct Config {
     /// the new session is placed back into that section if one with
     /// the same name still exists. Persisted as `[session_history]`.
     pub session_history: std::collections::HashMap<String, String>,
+    /// Global TDF banner font used for the section/empty preview
+    /// banner. Per-section overrides live on `Section.banner_font`.
+    /// Persisted in `config.toml` as `banner_font = "metalix"`.
+    pub banner_font: String,
 }
 
 impl Default for Config {
@@ -119,6 +125,7 @@ impl Default for Config {
             divider_x: None,
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
+            banner_font: crate::ui::banner::default_name().to_string(),
         }
     }
 }
@@ -151,6 +158,10 @@ struct ConfigFile {
     /// migration; never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_order: Option<Vec<String>>,
+    /// Global TDF banner font name (e.g. `"metalix"`). When absent,
+    /// `Config::load` falls back to `banner::default_name()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    banner_font: Option<String>,
 }
 
 impl Config {
@@ -206,6 +217,9 @@ impl Config {
         };
 
         let session_history = file.session_history.unwrap_or_default();
+        let banner_font = file
+            .banner_font
+            .unwrap_or_else(|| crate::ui::banner::default_name().to_string());
 
         Self {
             session_prefix,
@@ -215,6 +229,7 @@ impl Config {
             divider_x,
             sidebar,
             session_history,
+            banner_font,
         }
     }
 
@@ -323,6 +338,29 @@ pub fn write_theme(name: &str) -> std::io::Result<()> {
 
     // Atomic write: temp file + rename. Avoids a half-written
     // config.toml if bosun is killed mid-write.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Persist the global banner font to `config.toml`. Same
+/// read-modify-write approach as `write_theme`.
+pub fn write_banner_font(name: &str) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.banner_font = Some(name.to_string());
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
@@ -442,6 +480,7 @@ mod tests {
             divider_x: None,
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
+            banner_font: crate::ui::banner::default_name().to_string(),
         }
     }
 
@@ -478,6 +517,7 @@ mod tests {
             divider_x: None,
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
+            banner_font: crate::ui::banner::default_name().to_string(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
