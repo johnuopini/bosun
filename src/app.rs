@@ -345,9 +345,11 @@ impl AppState {
                 self.sync_focus(&mut out);
             }
             AppMsg::Mouse(m) => {
-                // Mouse events are only used by the draggable divider
-                // between the session list and preview pane. No modal
-                // dispatching — modals don't react to mouse yet.
+                // Mouse: divider drag + scroll-wheel nav in the list.
+                // Modals don't react to mouse yet, but we suppress
+                // scroll-wheel selection changes while a modal is open
+                // so the wheel can't shift the list underneath a
+                // confirm dialog.
                 self.handle_mouse(m, &mut out);
             }
             AppMsg::Resize(w, h) => {
@@ -798,8 +800,8 @@ impl AppState {
         }
     }
 
-    /// Map a mouse event onto the draggable divider between the
-    /// session list and preview pane.
+    /// Map a mouse event onto the draggable divider or the session
+    /// list scroll wheel.
     ///
     /// - `Down(Left)` on the divider column starts a drag.
     /// - `Drag(Left)` while `dragging_divider` updates `divider_x`
@@ -807,9 +809,16 @@ impl AppState {
     ///   min-widths on the next render.
     /// - `Up(Left)` clears the drag flag regardless of location —
     ///   releasing the button anywhere ends the gesture.
+    /// - `ScrollDown` / `ScrollUp` over the list rect step the
+    ///   selection (same as j/k). Scroll-follows-selection in
+    ///   `ui::session_list` makes the viewport scroll naturally,
+    ///   which gives mobile clients (Termius one-finger pan, Blink
+    ///   two-finger pan) a way to reach off-screen sessions when
+    ///   the keyboard isn't ideal. Suppressed while a modal is
+    ///   open so the wheel can't shift selection underneath it.
     ///
-    /// Non-left-button events and any event while `term_size` is
-    /// unset (pre-first-draw) are ignored.
+    /// Non-handled events and any event while `term_size` is unset
+    /// (pre-first-draw) are ignored.
     fn handle_mouse(&mut self, m: MouseEvent, out: &mut Vec<Command>) {
         if self.term_size.0 == 0 {
             return;
@@ -833,8 +842,32 @@ impl AppState {
                 out.push(Command::SaveDivider(self.divider_x));
             }
             MouseEventKind::Up(MouseButton::Left) => {}
+            MouseEventKind::ScrollDown if self.point_in_list(&layouts, m) => {
+                let len = self.sidebar.len();
+                if len > 0 {
+                    self.selected = (self.selected + 1).min(len - 1);
+                }
+            }
+            MouseEventKind::ScrollUp if self.point_in_list(&layouts, m) => {
+                self.selected = self.selected.saturating_sub(1);
+            }
             _ => {}
         }
+    }
+
+    /// True iff the mouse event lands inside the session-list rect
+    /// and no modal is open. Scroll-wheel nav uses this to ignore
+    /// wheel events that happen over the preview pane or while a
+    /// confirm/rename dialog is up.
+    fn point_in_list(&self, layouts: &layout::Layouts, m: MouseEvent) -> bool {
+        if !self.modals.is_empty() {
+            return false;
+        }
+        let r = layouts.list;
+        m.column >= r.x
+            && m.column < r.x.saturating_add(r.width)
+            && m.row >= r.y
+            && m.row < r.y.saturating_add(r.height)
     }
 }
 
@@ -1319,6 +1352,40 @@ mod tests {
             70,
         )));
         assert!(!s.dragging_divider);
+    }
+
+    #[test]
+    fn scroll_down_in_list_advances_selection() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
+        s.term_size = (120, 30);
+        // col 10 is comfortably inside the list rect at 120-col width.
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        assert_eq!(s.selected, 1);
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        assert_eq!(s.selected, 2, "saturates at len-1");
+    }
+
+    #[test]
+    fn scroll_up_in_list_retreats_selection() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 2);
+        s.term_size = (120, 30);
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        assert_eq!(s.selected, 1);
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        assert_eq!(s.selected, 0, "saturates at 0");
+    }
+
+    #[test]
+    fn scroll_over_preview_pane_ignored() {
+        // At 120 cols with default split, the list ends at col 45 and
+        // the preview starts at col 46. Wheel events over the preview
+        // must not move the list selection.
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
+        s.term_size = (120, 30);
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 80)));
+        assert_eq!(s.selected, 0);
     }
 
     #[test]
