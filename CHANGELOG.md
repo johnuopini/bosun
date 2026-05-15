@@ -4,6 +4,37 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-15
+
+### Added
+- **Sidebar survives tmux restarts and reboots.** `SidebarModel::reconcile`
+  no longer auto-drops dead sessions; entries are removed only when the
+  user explicitly hits `d`. A tmux server restart (or full reboot) no
+  longer wipes section structure or ordering.
+- **Friendly labels on dead sidebar rows.** Missing-session rows now
+  render the original display name (looked up in the Recents store via
+  slug match) instead of the raw internal `bosun-slug-hex` name. Falls
+  back to the slug, then the internal name, if no Recent matches.
+- **`R` restarts dead sessions from Recents.** Pressing `R` on a
+  missing-session row resolves the slug → Recent and fires
+  `CreateSession` with the stored spec. The session lands back in its
+  original section (via `session_history`). The dead row stays until
+  you `d` it, so accidental Esc on the confirm doesn't lose data.
+- **`d` works on dead rows too.** Confirms with "Remove from sidebar?"
+  and uses the same `KillSession` path (idempotent on dead sessions).
+
+### Internal
+- `slug_from_internal(internal, prefix)` reverses `build_internal_name`,
+  returning `None` on shape mismatch (foreign session names, unknown
+  prefix, malformed suffix). Unit tests cover the happy path and the
+  reject cases.
+- `AppState` gained `session_prefix: String` and `recents: Vec<Recent>`,
+  populated at startup and refreshed on every `SessionsRefreshed` so
+  dead-row resolution always uses the latest store.
+- `slugify` made `pub(crate)` so `dead_display_for` /
+  `recent_for_internal` can match across the same canonicalization
+  that `build_internal_name` originally applied.
+
 ## [0.3.1] — 2026-05-15
 
 ### Fixed

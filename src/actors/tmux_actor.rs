@@ -542,7 +542,7 @@ fn build_internal_name(prefix: &str, display: &str) -> String {
 /// Lowercase slug: alphanumeric and underscores are kept (underscore
 /// is valid in tmux session names); everything else collapses to
 /// single dashes; leading/trailing dashes are trimmed.
-fn slugify(s: &str) -> String {
+pub(crate) fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_dash = false;
     for c in s.chars() {
@@ -557,6 +557,31 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_end_matches('-').to_string()
+}
+
+/// Reverse of `build_internal_name`: extract the slug portion from an
+/// internal session name shaped like `<prefix><slug>-<8-hex>`. Returns
+/// `None` if the input doesn't match the expected shape — caller can
+/// then fall back to showing the raw internal name.
+///
+/// Used by the sidebar to render a friendlier label on "missing" rows
+/// (sessions that died with a tmux server restart) and to match those
+/// rows back to a `Recent` so `R` can recreate them.
+pub(crate) fn slug_from_internal<'a>(internal: &'a str, prefix: &str) -> Option<&'a str> {
+    let after_prefix = if prefix.is_empty() {
+        internal
+    } else {
+        internal.strip_prefix(prefix)?
+    };
+    // Last `-` separates slug from the 8-hex suffix.
+    let dash = after_prefix.rfind('-')?;
+    let (slug, rest) = after_prefix.split_at(dash);
+    let suffix = rest.strip_prefix('-')?;
+    if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(slug)
+    } else {
+        None
+    }
 }
 
 /// Map the agent + options + extra args into a shell command to type
@@ -914,5 +939,29 @@ mod build_cmd_tests {
         assert_eq!(slugify("  leading space"), "leading-space");
         assert_eq!(slugify("multi   spaces"), "multi-spaces");
         assert_eq!(slugify("trailing!!!"), "trailing");
+    }
+
+    #[test]
+    fn slug_from_internal_strips_prefix_and_hex_suffix() {
+        assert_eq!(
+            slug_from_internal("bosun-raycast-1e18ae00", "bosun-"),
+            Some("raycast")
+        );
+        assert_eq!(
+            slug_from_internal("bosun-my-rocket-fox-a1b2c3d4", "bosun-"),
+            Some("my-rocket-fox")
+        );
+        // Empty prefix (BOSUN_PREFIX="") is allowed.
+        assert_eq!(slug_from_internal("raycast-1e18ae00", ""), Some("raycast"));
+    }
+
+    #[test]
+    fn slug_from_internal_rejects_non_hex_suffix() {
+        // Last 8 chars after `-` aren't hex → not bosun-shaped, decline.
+        assert_eq!(slug_from_internal("bosun-foo-zzzzzzzz", "bosun-"), None);
+        // Suffix is hex but wrong length.
+        assert_eq!(slug_from_internal("bosun-foo-abc", "bosun-"), None);
+        // No prefix match.
+        assert_eq!(slug_from_internal("other-foo-12345678", "bosun-"), None);
     }
 }

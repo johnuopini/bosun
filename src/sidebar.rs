@@ -255,31 +255,43 @@ impl SidebarModel {
     }
 
     /// Reconcile against the current live set of tmux session names.
-    /// - Drops any session name not in `live` from every bucket.
     /// - Dedupes sessions that appear in multiple buckets (keeps the
     ///   first occurrence in visible order — ungrouped > section 0 > ...).
     /// - Appends any live session not already present to `ungrouped`.
     ///
     /// Sections are preserved even if they end up empty.
+    ///
+    /// **Dead sessions are NOT auto-removed.** Entries are dropped only
+    /// when the user explicitly deletes them via `remove_session` —
+    /// otherwise a tmux server restart (or reboot) would wipe the
+    /// entire sidebar, losing the user's grouping and ordering work.
+    /// Dead entries render as "missing" rows; the user can recreate
+    /// them from the recents store or `d` to remove.
     pub fn reconcile(&mut self, live: &[String]) {
-        // 1. Drop dead sessions.
-        self.ungrouped.retain(|n| live.iter().any(|l| l == n));
-        for s in &mut self.sections {
-            s.members.retain(|n| live.iter().any(|l| l == n));
-        }
-        // 2. Dedupe — if a name appears in multiple places, keep the
+        // 1. Dedupe — if a name appears in multiple places, keep the
         //    earliest in visible order.
         let mut seen = std::collections::HashSet::new();
         self.ungrouped.retain(|n| seen.insert(n.clone()));
         for s in &mut self.sections {
             s.members.retain(|n| seen.insert(n.clone()));
         }
-        // 3. Append new live sessions to ungrouped.
+        // 2. Append new live sessions to ungrouped.
         for n in live {
             if !seen.contains(n) {
                 self.ungrouped.push(n.clone());
                 seen.insert(n.clone());
             }
+        }
+    }
+
+    /// Explicit removal of a session entry from every bucket. Called
+    /// only when the user kills a session via `d` — never from
+    /// reconciliation, so dead-but-grouped sessions survive across a
+    /// tmux restart / reboot.
+    pub fn remove_session(&mut self, internal: &str) {
+        self.ungrouped.retain(|n| n != internal);
+        for s in &mut self.sections {
+            s.members.retain(|n| n != internal);
         }
     }
 
@@ -361,12 +373,34 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_drops_dead_keeps_sections_appends_new() {
+    fn reconcile_keeps_dead_sessions_appends_new() {
         let mut m = model(&["a"], vec![sec("g1", "W", &["b", "gone"])]);
         m.reconcile(&["a".into(), "b".into(), "newbie".into()]);
-        // "gone" is removed from the section. "newbie" lands in ungrouped.
+        // "gone" stays in the section even though it's not live —
+        // explicit-only removal protects across a tmux restart.
+        // "newbie" lands in ungrouped.
         assert_eq!(m.ungrouped, vec!["a".to_string(), "newbie".to_string()]);
-        assert_eq!(m.sections[0].members, vec!["b".to_string()]);
+        assert_eq!(
+            m.sections[0].members,
+            vec!["b".to_string(), "gone".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_empty_live_preserves_everything() {
+        // The reboot scenario: tmux server died, no live sessions yet.
+        // Sidebar must NOT be wiped — that'd lose all the user's
+        // section structure and ordering work.
+        let mut m = model(
+            &["alpha", "beta"],
+            vec![sec("g1", "Work", &["gamma", "delta"])],
+        );
+        m.reconcile(&[]);
+        assert_eq!(m.ungrouped, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            m.sections[0].members,
+            vec!["gamma".to_string(), "delta".to_string()]
+        );
     }
 
     #[test]
@@ -377,6 +411,18 @@ mod tests {
         m.reconcile(&["a".into(), "b".into(), "c".into()]);
         assert_eq!(m.ungrouped, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(m.sections[0].members, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn remove_session_drops_from_both_buckets() {
+        let mut m = model(
+            &["alpha", "beta"],
+            vec![sec("g1", "W", &["gamma", "delta"])],
+        );
+        m.remove_session("alpha");
+        m.remove_session("gamma");
+        assert_eq!(m.ungrouped, vec!["beta".to_string()]);
+        assert_eq!(m.sections[0].members, vec!["delta".to_string()]);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::error::{BosunError, Result};
 use crate::events::{AppMsg, Command};
 use crate::sidebar::{Location, SidebarModel, VisibleKind};
-use crate::store::Store;
+use crate::store::{Recent, Store};
 use crate::tmux::attach::attach_with_ctrl_q_detach;
 use crate::tmux::session::SessionView;
 use crate::tmux::TmuxClient;
@@ -105,6 +105,52 @@ pub struct AppState {
     /// section header (per-section override) or on the empty splash
     /// (this global default). Persisted via `Command::SaveBannerFont`.
     pub banner_font: String,
+    /// Managed-session prefix (e.g. `bosun-`). Snapshot of
+    /// `Config::session_prefix` at startup. Used to extract the slug
+    /// from an internal name when rendering missing-session rows in
+    /// the sidebar and when matching a dead row back to a `Recent`
+    /// for `R`-to-restart.
+    pub session_prefix: String,
+    /// Last-loaded snapshot of the SQLite recents store. Used to
+    /// resolve internal-name → display-name for dead sidebar entries
+    /// (so the row reads `Raycast` instead of `bosun-raycast-1e18ae00`)
+    /// and to look up the full `SessionSpec` when restarting a dead
+    /// session with `R`. Refreshed on every `SessionsRefreshed`.
+    pub recents: Vec<Recent>,
+}
+
+impl AppState {
+    /// Resolve a dead session's internal name into the friendliest
+    /// label we can produce — usually the original display name from
+    /// the Recents store, falling back to the slug if no Recent
+    /// matches, and ultimately to the raw internal name. Used by the
+    /// sidebar's missing-row renderer so users see `Raycast` instead
+    /// of `bosun-raycast-1e18ae00`.
+    pub fn dead_display_for(&self, internal: &str) -> String {
+        match self.recent_for_internal(internal) {
+            Some(r) => r.name.clone(),
+            None => {
+                match crate::actors::tmux_actor::slug_from_internal(internal, &self.session_prefix)
+                {
+                    Some(slug) if !slug.is_empty() => slug.to_string(),
+                    _ => internal.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Look up the persisted spec for a dead sidebar entry. Matches
+    /// by slug equivalence: `slugify(recent.name) == slug(internal)`.
+    /// Slug collisions are theoretically possible (two recents that
+    /// slugify identically) but in practice unlikely; first match
+    /// wins. Returns `None` for live entries — call `selected_session`
+    /// for those.
+    pub fn recent_for_internal(&self, internal: &str) -> Option<&Recent> {
+        let slug = crate::actors::tmux_actor::slug_from_internal(internal, &self.session_prefix)?;
+        self.recents
+            .iter()
+            .find(|r| crate::actors::tmux_actor::slugify(&r.name) == slug)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +388,18 @@ impl AppState {
                                         self.pending_new_session_section =
                                             self.current_section_name();
                                     }
+                                    // Explicit kill: drop the sidebar
+                                    // entry locally too. Reconcile no
+                                    // longer auto-removes dead sessions
+                                    // (so a tmux restart doesn't wipe
+                                    // the user's groups), so the only
+                                    // way an entry leaves the sidebar
+                                    // is via this explicit-action path.
+                                    if let Command::KillSession(internal) = &c {
+                                        self.sidebar.remove_session(internal);
+                                        self.clamp_selection();
+                                        self.save_sidebar(&mut out);
+                                    }
                                     out.push(c);
                                 }
                             }
@@ -497,12 +555,29 @@ impl AppState {
                             ConfirmModal::new(title, msg, Command::KillSession(internal))
                                 .destructive(),
                         ));
+                    } else if let Some(internal) = self.selected_session_name() {
+                        // Dead/missing entry — the underlying tmux session
+                        // is gone (e.g. server restarted), but the sidebar
+                        // row remains so the user can decide whether to
+                        // remove it. Same command path; `kill_session` is
+                        // idempotent on missing sessions.
+                        let title = "Remove from sidebar?";
+                        let msg = format!(
+                            "'{}' is no longer a live tmux session. Remove the entry?",
+                            internal
+                        );
+                        self.modals.push(Box::new(
+                            ConfirmModal::new(title, msg, Command::KillSession(internal))
+                                .destructive(),
+                        ));
                     }
                 }
                 None => {}
             },
             (KeyCode::Char('R'), _) => {
                 if let Some(sel) = self.selected_session() {
+                    // Live session — restart in place via the actor,
+                    // which reads metadata off the live tmux session.
                     let internal = sel.name().to_string();
                     let display = sel.display().to_string();
                     let title = "Restart session?";
@@ -515,6 +590,41 @@ impl AppState {
                         msg,
                         Command::RestartSession(internal),
                     )));
+                } else if let Some(internal) = self.selected_session_name() {
+                    // Dead/missing entry — the tmux session and its
+                    // stored metadata are gone, so we can't use
+                    // `RestartSession` (the actor would fail at
+                    // `get_session_metadata`). Instead, look up the
+                    // persisted spec from the Recents store via slug
+                    // match and fire `CreateSession`. The reducer's
+                    // existing placement logic (session_history)
+                    // drops the new session back into its old section.
+                    //
+                    // We leave the dead row in place; once the new
+                    // session lands the user can `d` the old row.
+                    // Pre-removing on confirm would be lost if the
+                    // user hit Esc and the data isn't trivially
+                    // recoverable from inside the modal flow.
+                    if let Some(recent) = self.recent_for_internal(&internal) {
+                        let spec = recent.to_spec();
+                        let display = spec.name.clone();
+                        let title = "Restart from recents?";
+                        let msg = format!(
+                            "Recreate '{}' from its last-saved spec? \
+                             The old dead row stays — `d` to remove it after.",
+                            display
+                        );
+                        self.modals.push(Box::new(ConfirmModal::new(
+                            title,
+                            msg,
+                            Command::CreateSession(spec),
+                        )));
+                    } else {
+                        self.warning = Some(format!(
+                            "no recent found for '{}' — can't restart",
+                            internal
+                        ));
+                    }
                 }
             }
             (KeyCode::Char('n'), KeyModifiers::NONE)
@@ -944,11 +1054,19 @@ impl App {
         );
         let input_handle = input_actor::spawn(evt_tx.clone());
 
+        // Seed the recents cache from the store so dead sidebar rows
+        // can render their proper display name and `R` can restart
+        // them from their stored spec on first paint. Refreshed on
+        // every `SessionsRefreshed`.
+        let recents = store.list_recents(200).unwrap_or_default();
+
         let state = AppState {
             divider_x: config.divider_x,
             sidebar: config.sidebar.clone(),
             session_history: config.session_history.clone(),
             banner_font: config.banner_font.clone(),
+            session_prefix: config.session_prefix.clone(),
+            recents,
             ..Default::default()
         };
 
@@ -998,7 +1116,19 @@ impl App {
             // emit follow-up commands (e.g. SaveSidebar) as part of
             // their handler; `queue` lets us re-enter the dispatch
             // without a recursive call.
+            //
+            // Recents change asynchronously (CreateSession upserts via
+            // the actor; DeleteRecent runs in the actor too) and we
+            // need them fresh in `AppState` so dead sidebar rows
+            // resolve to display names and `R` can find the right
+            // spec. Every `SessionsRefreshed` already runs after any
+            // command that could mutate the recents table, so it's
+            // the right edge to re-cache on.
+            let should_reload_recents = matches!(msg, AppMsg::SessionsRefreshed { .. });
             let mut queue: Vec<Command> = self.state.apply(msg);
+            if should_reload_recents {
+                self.state.recents = self.store.list_recents(200).unwrap_or_default();
+            }
             while let Some(c) = queue.pop() {
                 match c {
                     Command::SetTheme { name, persist } => {
@@ -1257,10 +1387,15 @@ mod tests {
     }
 
     #[test]
-    fn selection_clamps_after_refresh() {
+    fn dead_sessions_persist_in_sidebar_across_refresh() {
+        // Reboot scenario: tmux server died, the next refresh sees zero
+        // live sessions. The sidebar must NOT shrink — entries are only
+        // removed via explicit user action (kill / `d`). Selection
+        // stays put because the row it points at still exists.
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 2);
         s.apply(refreshed(vec![ses("a")]));
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.sidebar.len(), 3, "dead entries must persist");
+        assert_eq!(s.selected, 2, "selection stays on the same row");
     }
 
     #[test]

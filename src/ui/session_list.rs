@@ -56,7 +56,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     out.push(render_meta_line(v, selected, false, area.width, theme));
                 }
                 None => {
-                    out.push(render_missing_line(n, selected, false, area.width, theme));
+                    let label = state.dead_display_for(n);
+                    out.push(render_missing_line(
+                        &label, selected, false, area.width, theme,
+                    ));
                 }
             },
             VisibleEntry::SectionHeader(s) => {
@@ -76,8 +79,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     out.push(render_meta_line(v, selected, true, area.width, theme));
                 }
                 None => {
+                    let label = state.dead_display_for(internal);
                     out.push(render_missing_line(
-                        internal, selected, true, area.width, theme,
+                        &label, selected, true, area.width, theme,
                     ));
                 }
             },
@@ -286,7 +290,7 @@ fn render_meta_line(
 }
 
 fn render_missing_line(
-    internal: &str,
+    label: &str,
     selected: bool,
     indented: bool,
     width: u16,
@@ -294,7 +298,10 @@ fn render_missing_line(
 ) -> Line<'static> {
     let bg = row_bg(selected, theme);
     let extra = if indented { "  " } else { "" };
-    let body = format!("  ? {}", internal);
+    // Label is the resolved display name (from Recents lookup) or
+    // a slug fallback — see `AppState::dead_display_for`. `R` on this
+    // row recreates the session from its persisted spec.
+    let body = format!("  ? {}", label);
     let used = extra.chars().count() + body.chars().count();
     let pad = (width as usize).saturating_sub(used);
     Line::from(vec![
