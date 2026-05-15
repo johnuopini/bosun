@@ -11,7 +11,10 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bosun::tmux::attach::{clear_ctrl_q_bound, ensure_ctrl_q_bound};
+use bosun::tmux::attach::{
+    clear_ctrl_q_bound, clear_session_cycle_bound, ensure_ctrl_q_bound,
+    ensure_session_cycle_bound,
+};
 
 fn unique_socket(tag: &str) -> String {
     let nanos = SystemTime::now()
@@ -38,6 +41,27 @@ fn list_keys_root(socket: &str) -> String {
 fn count_ctrl_q_bindings(socket: &str) -> usize {
     let keys = list_keys_root(socket);
     keys.lines().filter(|l| l.contains("C-q")).count()
+}
+
+fn list_keys_prefix(socket: &str) -> String {
+    // `bind-key -n` aliases to `bind-key -T root`, so the cycle binds
+    // live in the root table. List that one specifically — the
+    // default `list-keys` also dumps `copy-mode` and `copy-mode-vi`,
+    // which ship with their own built-in S-Left / S-Right bindings
+    // for word-wise selection and would skew our count.
+    let out = tmux(socket, &["list-keys", "-T", "root"]);
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Count bindings that look like bosun's MRU cycle install — i.e. an
+/// S-Left or S-Right entry whose body is `run-shell …`. tmux's defaults
+/// bind these keys to `previous-window`/`next-window`, which our install
+/// overwrites, so the bare-name count starts at 2 even on a fresh server.
+fn count_cycle_bindings(socket: &str) -> usize {
+    let keys = list_keys_prefix(socket);
+    keys.lines()
+        .filter(|l| (l.contains("S-Left") || l.contains("S-Right")) && l.contains("run-shell"))
+        .count()
 }
 
 fn kill_server(socket: &str) {
@@ -90,6 +114,47 @@ fn ensure_is_idempotent() {
 
     clear_ctrl_q_bound(Some(&sock));
     assert_eq!(count_ctrl_q_bindings(&sock), 0);
+
+    kill_server(&sock);
+}
+
+#[test]
+fn cycle_bindings_install_and_clear() {
+    let sock = unique_socket("cycle");
+    tmux(&sock, &["new-session", "-d", "-s", "dummy"]);
+
+    assert_eq!(
+        count_cycle_bindings(&sock),
+        0,
+        "expected no S-Left/S-Right bindings before test"
+    );
+
+    ensure_session_cycle_bound(Some(&sock));
+    assert_eq!(
+        count_cycle_bindings(&sock),
+        2,
+        "expected exactly 2 cycle bindings (S-Left + S-Right) after install, got:\n{}",
+        list_keys_prefix(&sock)
+    );
+
+    // Idempotent re-assert keeps the count at 2.
+    for _ in 0..3 {
+        ensure_session_cycle_bound(Some(&sock));
+    }
+    assert_eq!(
+        count_cycle_bindings(&sock),
+        2,
+        "repeated ensure_session_cycle_bound must not duplicate bindings, got:\n{}",
+        list_keys_prefix(&sock)
+    );
+
+    clear_session_cycle_bound(Some(&sock));
+    assert_eq!(
+        count_cycle_bindings(&sock),
+        0,
+        "expected cycle bindings gone after clear, got:\n{}",
+        list_keys_prefix(&sock)
+    );
 
     kill_server(&sock);
 }

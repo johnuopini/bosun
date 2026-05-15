@@ -26,6 +26,7 @@ use crate::ui;
 use crate::ui::layout;
 use crate::ui::modal::confirm::ConfirmModal;
 use crate::ui::modal::new_session::NewSessionModal;
+use crate::ui::modal::quickjump::{QuickJumpModal, QuickJumpRow};
 use crate::ui::modal::rename::RenameModal;
 use crate::ui::modal::section::SectionModal;
 use crate::ui::modal::theme::ThemeModal;
@@ -119,6 +120,9 @@ pub enum ModalRequest {
     Section {
         editing: Option<(String, String)>,
     },
+    /// Open the type-ahead quick-jump session picker. Populated by
+    /// the app loop with the current managed sessions.
+    QuickJump,
 }
 
 impl AppState {
@@ -326,10 +330,20 @@ impl AppState {
                         StackDispatch::PassThrough => self.handle_key(k, &mut out),
                         StackDispatch::Closed(cmd) => {
                             if let Some(c) = cmd {
-                                if matches!(c, Command::CreateSession(_)) {
-                                    self.pending_new_session_section = self.current_section_name();
+                                // Command::Attach from a closing modal
+                                // (QuickJump) is handled inline by the
+                                // app loop — the tmux actor ignores it.
+                                // Redirect to pending_attach so the
+                                // standard attach flow runs next turn.
+                                if let Command::Attach { name } = c {
+                                    self.pending_attach = Some(name);
+                                } else {
+                                    if matches!(c, Command::CreateSession(_)) {
+                                        self.pending_new_session_section =
+                                            self.current_section_name();
+                                    }
+                                    out.push(c);
                                 }
-                                out.push(c);
                             }
                         }
                         StackDispatch::Emit(cmd) => {
@@ -513,6 +527,14 @@ impl AppState {
             }
             (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
                 self.pending_modal = Some(ModalRequest::Theme);
+            }
+            // `/` opens the type-ahead session picker. Mirrors fzf/
+            // vim's convention for "start a filter". The app loop
+            // populates it with the current managed sessions.
+            (KeyCode::Char('/'), KeyModifiers::NONE)
+                if self.modals.top_id() != Some("quickjump") =>
+            {
+                self.pending_modal = Some(ModalRequest::QuickJump);
             }
             // Tab: toggle collapse on a section header. Hides the
             // section's members in the rendered sidebar; the open/
@@ -1048,6 +1070,25 @@ impl App {
                             None => SectionModal::new_section(),
                         };
                         self.state.modals.push(Box::new(modal));
+                    }
+                    ModalRequest::QuickJump => {
+                        // Snapshot the current managed sessions into
+                        // QuickJumpRows. The modal owns its data — we
+                        // don't re-query on refresh; the picker shows
+                        // the list as of the moment it was opened.
+                        let rows: Vec<QuickJumpRow> = self
+                            .state
+                            .sessions
+                            .iter()
+                            .map(|v| QuickJumpRow {
+                                internal: v.name().to_string(),
+                                display: v.display().to_string(),
+                                agent: v.session.agent.clone(),
+                                path: v.session.best_path().map(String::from),
+                                attached: v.session.attached,
+                            })
+                            .collect();
+                        self.state.modals.push(Box::new(QuickJumpModal::new(rows)));
                     }
                 }
             }

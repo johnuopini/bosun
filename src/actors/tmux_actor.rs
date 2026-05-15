@@ -44,7 +44,10 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::config::Config;
 use crate::events::{AppMsg, ClaudeSessionMode, Command, SessionSpec, SpecOptions};
 use crate::store::Store;
-use crate::tmux::attach::{clear_ctrl_q_bound, ensure_ctrl_q_bound};
+use crate::tmux::attach::{
+    clear_ctrl_q_bound, clear_quick_jump_bound, clear_session_cycle_bound, ensure_ctrl_q_bound,
+    ensure_quick_jump_bound, ensure_session_cycle_bound,
+};
 use crate::tmux::control::Notification;
 use crate::tmux::control_client::ControlClient;
 use crate::tmux::detector::{DetectContext, DetectorRegistry, Status};
@@ -55,14 +58,17 @@ use crate::util::collision::resolve_name_collision;
 use crate::util::hysteresis::Smoother;
 
 /// RAII cleanup for globals installed by the status bar (prefix-1..9
-/// bindings) and the C-q detach binding. Per-session status-* options
-/// are left in place when the actor exits — they die with their
-/// sessions, and leaving them means a restarting bosun can reuse them
-/// without a reinit flash.
+/// bindings), the C-q detach binding, the S-Left / S-Right session
+/// cycle bindings, and the M-O quick-jump popup binding. Per-session
+/// status-* options are left in place when the actor exits — they die
+/// with their sessions, and leaving them means a restarting bosun can
+/// reuse them without a reinit flash.
 struct GlobalsGuard {
     socket: Option<String>,
     installed: bool,
     cq_installed: bool,
+    cycle_installed: bool,
+    quick_jump_installed: bool,
 }
 
 impl Drop for GlobalsGuard {
@@ -72,6 +78,12 @@ impl Drop for GlobalsGuard {
         }
         if self.cq_installed {
             clear_ctrl_q_bound(self.socket.as_deref());
+        }
+        if self.cycle_installed {
+            clear_session_cycle_bound(self.socket.as_deref());
+        }
+        if self.quick_jump_installed {
+            clear_quick_jump_bound(self.socket.as_deref());
         }
     }
 }
@@ -93,6 +105,8 @@ pub fn spawn(
             socket: socket.clone(),
             installed: false,
             cq_installed: false,
+            cycle_installed: false,
+            quick_jump_installed: false,
         };
 
         // Install the C-q detach binding up-front so it's live even
@@ -101,6 +115,15 @@ pub fn spawn(
         // anything that clobbers the root key table mid-session.
         ensure_ctrl_q_bound(socket.as_deref());
         globals.cq_installed = true;
+
+        // Install the S-Left / S-Right MRU session cycle bindings. Same
+        // self-heal pattern as C-q: do_refresh re-asserts every tick.
+        ensure_session_cycle_bound(socket.as_deref());
+        globals.cycle_installed = true;
+
+        // Install the M-O quick-jump popup binding. Same self-heal.
+        ensure_quick_jump_bound(socket.as_deref());
+        globals.quick_jump_installed = true;
 
         // Start the control-mode monitor subprocess. The guard is
         // held for the lifetime of the actor — dropping it on exit
@@ -678,6 +701,10 @@ async fn do_refresh(
     // self-heals if anything clobbers the root key table during a
     // long-running session (source-file, another tool's hook, etc).
     ensure_ctrl_q_bound(socket);
+    // Same self-heal for the S-Left / S-Right cycle bindings.
+    ensure_session_cycle_bound(socket);
+    // And for the M-O quick-jump popup binding.
+    ensure_quick_jump_bound(socket);
 
     let views = refresh_all(client, config, registry, smoothers, focused).await?;
     smoothers.retain(|name, _| views.iter().any(|v| v.name() == name));

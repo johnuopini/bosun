@@ -17,6 +17,7 @@
 
 pub mod confirm;
 pub mod new_session;
+pub mod quickjump;
 pub mod recents;
 pub mod rename;
 pub mod section;

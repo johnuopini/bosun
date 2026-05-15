@@ -49,9 +49,26 @@ pub struct BarSession {
 
 // --- Visual constants -------------------------------------------------
 
-const BRAND: &str = "#[bg=#7c5cff,fg=#0b0d12,bold] ⚓ bosun #[default] ";
-const BRAND_LEN: &str = "14";
-const STATUS_RIGHT_LEN: &str = "400";
+/// Status-left: brand + current session's display name. The name is
+/// read from the per-session `@bosun_display` user option (set when
+/// the session is created); we fall back to `#S` (the internal tmux
+/// name) for any session that somehow lacks it. The same format
+/// string works for every session because tmux expands
+/// `#{@bosun_display}` in the context of whichever session the bar is
+/// being drawn for.
+///
+/// Stays static — no conditional, no chip strip. The prefix+1..9
+/// jump bindings still install (see `bind_jump_keys`) so users who
+/// memorize them can use them, but the bar itself just shows the
+/// session name. Trying to render chips conditionally on
+/// `client_prefix` produced visible flicker on session switch in
+/// real-world testing, and a 10+ session chip list adds little for
+/// users who navigate via S-←/S-→ or the bosun TUI anyway.
+const STATUS_LEFT: &str = "#[bg=#7c5cff,fg=#0b0d12,bold] ⚓ bosun #[default] \
+                           #[fg=#e6e9ef,bold]#{?#{@bosun_display},#{@bosun_display},#S} ";
+/// Wide enough for the brand chip plus a 30-ish-char display name.
+const STATUS_LEFT_LEN: &str = "60";
+const STATUS_RIGHT_LEN: &str = "120";
 const STATUS_STYLE: &str = "bg=default,fg=#e6e9ef";
 
 // --- Public API ------------------------------------------------------
@@ -76,10 +93,9 @@ pub fn uninstall_globals(socket: Option<&str>) {
 pub fn configure_session(
     socket: Option<&str>,
     session: &str,
-    sessions: &[BarSession],
+    _sessions: &[BarSession],
 ) -> Result<()> {
     let hint = build_hint(socket);
-    let status_right = build_status_right(sessions, &hint);
     let target = &["-t", session];
 
     run_targeted(socket, target, &["set-option", "status", "on"])?;
@@ -88,18 +104,14 @@ pub fn configure_session(
         target,
         &["set-option", "status-style", STATUS_STYLE],
     )?;
-    run_targeted(socket, target, &["set-option", "status-left", BRAND])?;
+    run_targeted(socket, target, &["set-option", "status-left", STATUS_LEFT])?;
     run_targeted(
         socket,
         target,
-        &["set-option", "status-left-length", BRAND_LEN],
+        &["set-option", "status-left-length", STATUS_LEFT_LEN],
     )?;
     run_targeted(socket, target, &["set-option", "status-justify", "left"])?;
-    run_targeted(
-        socket,
-        target,
-        &["set-option", "status-right", &status_right],
-    )?;
+    run_targeted(socket, target, &["set-option", "status-right", &hint])?;
     run_targeted(
         socket,
         target,
@@ -150,21 +162,6 @@ fn digit_key(n: usize) -> String {
 
 // --- Internal: string building --------------------------------------
 
-fn build_status_right(sessions: &[BarSession], hint: &str) -> String {
-    let list: String = sessions
-        .iter()
-        .enumerate()
-        .take(9)
-        .map(|(i, entry)| format_chip(i + 1, &entry.display, entry.attached))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if list.is_empty() {
-        hint.to_string()
-    } else {
-        format!("{}  {}", list, hint)
-    }
-}
-
 /// Build the right-hand hint string with the user's actual prefix key.
 /// Defaults to `C-b` (tmux's shipped default) if the option is unset.
 fn build_hint(socket: Option<&str>) -> String {
@@ -174,22 +171,10 @@ fn build_hint(socket: Option<&str>) -> String {
     } else {
         prefix.as_str()
     };
-    format!("#[fg=#7c8495]^Q detach · {} 1-9 jump ", prefix)
-}
-
-fn format_chip(num: usize, name: &str, attached: bool) -> String {
-    let safe = escape_tmux_format(name);
-    if attached {
-        format!("#[bg=#1e2433,fg=#7c5cff,bold] {}:{} #[default]", num, safe)
-    } else {
-        format!("#[fg=#e6e9ef] {}:{} #[default]", num, safe)
-    }
-}
-
-/// Tmux format strings interpret `#` as the start of a directive; double
-/// it to `##` to render a literal `#`.
-fn escape_tmux_format(s: &str) -> String {
-    s.replace('#', "##")
+    format!(
+        "#[fg=#7c8495]^Q detach · S-←→ cycle · {} 1-9 jump ",
+        prefix
+    )
 }
 
 /// Wrap `s` in double quotes for passing through tmux's own argv parser.
@@ -243,26 +228,6 @@ fn run_targeted(socket: Option<&str>, target: &[&str], args: &[&str]) -> Result<
 mod tests {
     use super::*;
 
-    const TEST_HINT: &str = "#[fg=#7c8495]^Q detach · C-a 1-9 jump ";
-
-    #[test]
-    fn format_chip_highlights_attached() {
-        let attached = format_chip(2, "main", true);
-        assert!(attached.contains("#[bg=#1e2433,fg=#7c5cff,bold]"));
-        assert!(attached.contains(" 2:main "));
-
-        let idle = format_chip(3, "work", false);
-        assert!(idle.contains("#[fg=#e6e9ef]"));
-        assert!(idle.contains(" 3:work "));
-    }
-
-    #[test]
-    fn escape_tmux_format_doubles_hash() {
-        assert_eq!(escape_tmux_format("a#b"), "a##b");
-        assert_eq!(escape_tmux_format("no hash"), "no hash");
-        assert_eq!(escape_tmux_format("#start"), "##start");
-    }
-
     #[test]
     fn tmux_quote_wraps_and_escapes() {
         assert_eq!(tmux_quote("plain"), "\"plain\"");
@@ -270,36 +235,22 @@ mod tests {
         assert_eq!(tmux_quote("has\"quote"), "\"has\\\"quote\"");
     }
 
-    fn bar_session(display: &str, attached: bool) -> BarSession {
-        BarSession {
-            internal: format!("bosun-{}-dead", display),
-            display: display.to_string(),
-            attached,
-        }
+    #[test]
+    fn status_left_renders_display_name_from_option() {
+        // Bar pulls the display name from each session's
+        // `@bosun_display` option (set when bosun creates the session)
+        // and falls back to `#S` if missing.
+        assert!(STATUS_LEFT.contains("@bosun_display"));
+        assert!(STATUS_LEFT.contains("#S"));
+        assert!(STATUS_LEFT.contains("⚓ bosun"));
     }
 
     #[test]
-    fn build_status_right_caps_at_nine() {
-        let sessions: Vec<BarSession> = (1..=12)
-            .map(|i| bar_session(&format!("s{}", i), i == 3))
-            .collect();
-        let out = build_status_right(&sessions, TEST_HINT);
-        assert!(out.contains("9:s9"));
-        assert!(!out.contains("10:s10"));
-        assert!(out.contains(TEST_HINT));
-    }
-
-    #[test]
-    fn build_status_right_empty_keeps_hint() {
-        let out = build_status_right(&[], TEST_HINT);
-        assert_eq!(out, TEST_HINT);
-    }
-
-    #[test]
-    fn build_status_right_escapes_hash_in_names() {
-        let sessions = vec![bar_session("pre#post", false)];
-        let out = build_status_right(&sessions, TEST_HINT);
-        assert!(out.contains("1:pre##post"));
+    fn hint_includes_shift_arrow_cycle() {
+        let hint = build_hint(None);
+        assert!(hint.contains("S-←→ cycle"));
+        assert!(hint.contains("^Q detach"));
+        assert!(hint.contains("1-9 jump"));
     }
 
     #[test]
