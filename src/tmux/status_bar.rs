@@ -171,10 +171,7 @@ fn build_hint(socket: Option<&str>) -> String {
     } else {
         prefix.as_str()
     };
-    format!(
-        "#[fg=#7c8495]^Q detach · S-←→ cycle · {} 1-9 jump ",
-        prefix
-    )
+    format!("#[fg=#7c8495]^Q detach · S-←→ cycle · {} 1-9 jump ", prefix)
 }
 
 /// Wrap `s` in double quotes for passing through tmux's own argv parser.

@@ -12,8 +12,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bosun::tmux::attach::{
-    clear_ctrl_q_bound, clear_session_cycle_bound, ensure_ctrl_q_bound,
-    ensure_session_cycle_bound,
+    clear_ctrl_q_bound, clear_session_cycle_bound, ensure_ctrl_q_bound, ensure_session_cycle_bound,
 };
 
 fn unique_socket(tag: &str) -> String {

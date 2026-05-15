@@ -285,11 +285,7 @@ fn render_row(r: &QuickJumpRow, selected: bool, width: u16, theme: &Theme) -> Li
     let meta_style = Style::default().fg(theme.text_muted).bg(row_bg);
     let attached_style = Style::default().fg(theme.status_running).bg(row_bg);
 
-    let path_short = r
-        .path
-        .as_deref()
-        .map(shorten_path)
-        .unwrap_or_else(String::new);
+    let path_short = r.path.as_deref().map(shorten_path).unwrap_or_default();
     let agent = r.agent.as_deref().unwrap_or("");
     let attached_label = if r.attached { "  •attached" } else { "" };
 
@@ -309,10 +305,7 @@ fn render_row(r: &QuickJumpRow, selected: bool, width: u16, theme: &Theme) -> Li
 
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let pad = (width as usize).saturating_sub(used);
-    spans.push(Span::styled(
-        " ".repeat(pad),
-        Style::default().bg(row_bg),
-    ));
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(row_bg)));
 
     Line::from(spans)
 }

@@ -4,6 +4,13 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-15
+
+### Fixed
+- CI: `cargo fmt` and `cargo clippy -D warnings` formatting / lint nits
+  in v0.3.0 that broke the release workflow on tag push. No
+  user-visible behavior change.
+
 ## [0.3.0] — 2026-05-15
 
 ### Added

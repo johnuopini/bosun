@@ -224,9 +224,7 @@ pub fn ensure_quick_jump_bound(socket: Option<&str>) {
     // `choose-tree -f` literally and be evaluated per-row there, so
     // we double-hash. tmux's expansion collapses each `##` to `#`,
     // leaving the format spec intact for the inner tmux invocation.
-    let cmd = format!(
-        "{tmux} choose-tree -Zs -f '##{{!=:##{{session_name}},{exclude}}}'"
-    );
+    let cmd = format!("{tmux} choose-tree -Zs -f '##{{!=:##{{session_name}},{exclude}}}'");
     let out = sync_tmux(
         socket,
         [
