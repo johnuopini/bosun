@@ -25,6 +25,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `bosun update [--check]` runs synchronously, prints to stderr,
+    // and exits before any TUI/tmux machinery starts. Failures
+    // surface as a non-zero exit code with the anyhow chain printed.
+    let mut args = std::env::args().skip(1);
+    if let Some(first) = args.next() {
+        if first == "update" {
+            let check_only = args.any(|a| a == "--check");
+            return match bosun::commands::update::run(check_only) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("bosun update: {:#}", e);
+                    std::process::exit(1);
+                }
+            };
+        }
+        if first == "help" || first == "--help" || first == "-h" {
+            print_help();
+            return Ok(());
+        }
+    }
+
     init_tracing();
 
     let config = Config::from_env();
@@ -86,6 +107,25 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     .map_err(BosunError::Io)?;
     terminal.show_cursor().map_err(BosunError::Io)?;
     Ok(())
+}
+
+fn print_help() {
+    println!(
+        "bosun {version} — tmux-native orchestrator for AI agent sessions
+
+USAGE:
+    bosun                Launch the TUI (default)
+    bosun update         Check for and install the latest release
+    bosun update --check Check for an update without installing
+    bosun --version      Print version and exit
+    bosun --help         Print this message
+
+ENVIRONMENT:
+    BOSUN_LOG    Tracing filter (e.g. `info`, `bosun=debug`). Off by default.
+
+See https://github.com/yetidevworks/bosun for full docs.",
+        version = env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn init_tracing() {

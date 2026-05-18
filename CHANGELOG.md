@@ -4,6 +4,33 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] — 2026-05-18
+
+### Added
+- **`bosun update` subcommand.** Checks the latest GitHub release and
+  upgrades in place. Detects how the running binary was installed and
+  routes accordingly:
+  - **Homebrew** (`/Cellar/`, `/homebrew/`) → prints `brew upgrade bosun`.
+  - **Cargo** (`~/.cargo/bin/`) → prints `cargo install --force bosun-tmux`.
+  - **Standalone binary** (anywhere else, including `~/.local/bin/bosun`
+    from `make install`) → downloads the matching
+    `bosun-<platform>.tar.gz` from the GitHub release, extracts to a
+    temp dir, and atomically swaps it into place. Safe to run while a
+    TUI session is attached — the running process keeps its mmap'd
+    binary; the new one takes effect on the next launch.
+- **`bosun update --check`.** Reports whether a newer release exists
+  without downloading or installing anything.
+- **`bosun --help` / `bosun help`.** Lists the available subcommands
+  and the `BOSUN_LOG` env var.
+
+### Internal
+- New `src/commands/update.rs` (port of ygrep's `commands/update.rs`,
+  adapted to bosun's release-asset naming and `directories::ProjectDirs`
+  data dir). Update cache lives at
+  `<data_dir>/update-check.json`.
+- New deps: `ureq` (with the `json` feature) for the GitHub API call
+  and asset download, `serde_json` for the API response.
+
 ## [0.3.3] — 2026-05-18
 
 ### Changed

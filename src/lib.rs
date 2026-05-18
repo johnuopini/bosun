@@ -1,5 +1,6 @@
 pub mod actors;
 pub mod app;
+pub mod commands;
 pub mod config;
 pub mod error;
 pub mod events;

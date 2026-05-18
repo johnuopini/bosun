@@ -1,6 +1,6 @@
 [package]
 name = "bosun-tmux"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Andy Miller <hello@skulkworks.dev>"]
@@ -36,6 +36,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.4"
 retrofont = "0.2"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
 
 [dev-dependencies]
 insta = "1.47"
