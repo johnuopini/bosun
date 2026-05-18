@@ -284,6 +284,40 @@ impl SidebarModel {
         }
     }
 
+    /// Replace one internal name with another, in place. Used by the
+    /// restart flow so a kill+recreate doesn't leave a dead row above
+    /// the freshly-created session — the row's slot (and section) is
+    /// inherited by the new internal name. No-op if `old` isn't present
+    /// or `new` is already present (the swap would create a duplicate).
+    /// Returns true if the swap happened.
+    pub fn replace_session(&mut self, old: &str, new: &str) -> bool {
+        if old == new {
+            return false;
+        }
+        if self.contains(new) {
+            return false;
+        }
+        if let Some(slot) = self.ungrouped.iter_mut().find(|n| *n == old) {
+            *slot = new.to_string();
+            return true;
+        }
+        for s in &mut self.sections {
+            if let Some(slot) = s.members.iter_mut().find(|n| *n == old) {
+                *slot = new.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contains(&self, internal: &str) -> bool {
+        self.ungrouped.iter().any(|n| n == internal)
+            || self
+                .sections
+                .iter()
+                .any(|s| s.members.iter().any(|n| n == internal))
+    }
+
     /// Explicit removal of a session entry from every bucket. Called
     /// only when the user kills a session via `d` — never from
     /// reconciliation, so dead-but-grouped sessions survive across a

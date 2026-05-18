@@ -117,7 +117,24 @@ pub struct AppState {
     /// and to look up the full `SessionSpec` when restarting a dead
     /// session with `R`. Refreshed on every `SessionsRefreshed`.
     pub recents: Vec<Recent>,
+    /// Old internal name to swap out of the sidebar on the next
+    /// `SessionsRefreshed`. Set when the user confirms a restart
+    /// (live `R` or dead-row recents-restart) so the new internal
+    /// inherits the old row's slot and section instead of leaving
+    /// a "? <name>" ghost above the freshly-created session.
+    pub pending_restart_swap: Option<String>,
+    /// Running accumulator for scroll-wheel events. A trackpad gesture
+    /// fires many wheel events per swipe, so we only step the selection
+    /// once every `SCROLL_TICKS_PER_STEP` events. Positive = pending
+    /// downward steps, negative = pending upward steps; resets on
+    /// direction change so a flick the other way feels immediate.
+    pub scroll_accum: i32,
 }
+
+/// Number of wheel events that must accumulate in one direction before
+/// the selection steps. Tuned for macOS trackpads, which fire ~10
+/// events per modest two-finger swipe.
+const SCROLL_TICKS_PER_STEP: i32 = 2;
 
 impl AppState {
     /// Resolve a dead session's internal name into the friendliest
@@ -316,9 +333,23 @@ impl AppState {
 
                 self.sessions = sessions;
 
+                // Restart-swap: if the user just confirmed a restart,
+                // replace the old (now-dead) internal name with the
+                // new one in place, so reconcile sees the new session
+                // already present and doesn't append it. This kills
+                // the "? <name>" dead row that would otherwise sit
+                // above the freshly-created session.
+                let swap_applied = match (self.pending_restart_swap.take(), select_after.as_ref()) {
+                    (Some(old), Some(new)) => self.sidebar.replace_session(&old, new),
+                    _ => false,
+                };
+
                 let live: Vec<String> =
                     self.sessions.iter().map(|v| v.name().to_string()).collect();
                 self.sidebar.reconcile(&live);
+                if swap_applied {
+                    self.save_sidebar(&mut out);
+                }
 
                 // If this refresh is the result of a session create
                 // and the user opened the new-session modal while
@@ -399,6 +430,30 @@ impl AppState {
                                         self.sidebar.remove_session(internal);
                                         self.clamp_selection();
                                         self.save_sidebar(&mut out);
+                                    }
+                                    // Capture restart swaps so the next
+                                    // `SessionsRefreshed` can splice the
+                                    // new internal name into the dead
+                                    // row's slot instead of appending it
+                                    // and leaving a "? <name>" ghost.
+                                    if let Command::RestartSession(internal) = &c {
+                                        self.pending_restart_swap = Some(internal.clone());
+                                    }
+                                    if let Command::CreateSession(spec) = &c {
+                                        // Dead-row restart-from-recents:
+                                        // selection is on a dead entry
+                                        // whose display matches the spec
+                                        // we're about to create. Modals
+                                        // block selection movement, so
+                                        // the cursor is still on the row
+                                        // the user originally pressed R on.
+                                        if self.selected_session().is_none() {
+                                            if let Some(dead) = self.selected_session_name() {
+                                                if self.dead_display_for(&dead) == spec.name {
+                                                    self.pending_restart_swap = Some(dead);
+                                                }
+                                            }
+                                        }
                                     }
                                     out.push(c);
                                 }
@@ -942,7 +997,9 @@ impl AppState {
     /// - `Up(Left)` clears the drag flag regardless of location —
     ///   releasing the button anywhere ends the gesture.
     /// - `ScrollDown` / `ScrollUp` over the list rect step the
-    ///   selection (same as j/k). Scroll-follows-selection in
+    ///   selection (same as j/k), throttled through `tick_scroll`
+    ///   so a single trackpad gesture doesn't fly through the
+    ///   list. Scroll-follows-selection in
     ///   `ui::session_list` makes the viewport scroll naturally,
     ///   which gives mobile clients (Termius one-finger pan, Blink
     ///   two-finger pan) a way to reach off-screen sessions when
@@ -974,16 +1031,40 @@ impl AppState {
                 out.push(Command::SaveDivider(self.divider_x));
             }
             MouseEventKind::Up(MouseButton::Left) => {}
+            // Inverted vs. crossterm's labels so trackpad gestures
+            // feel natural on macOS (and on iOS/Android Termius +
+            // Blink, where vertical pans report the same direction as
+            // desktop natural scroll): swiping content downward shows
+            // earlier items, swiping upward shows later items.
             MouseEventKind::ScrollDown if self.point_in_list(&layouts, m) => {
-                let len = self.sidebar.len();
-                if len > 0 {
-                    self.selected = (self.selected + 1).min(len - 1);
-                }
+                self.tick_scroll(-1);
             }
             MouseEventKind::ScrollUp if self.point_in_list(&layouts, m) => {
-                self.selected = self.selected.saturating_sub(1);
+                self.tick_scroll(1);
             }
             _ => {}
+        }
+    }
+
+    /// Accumulate one wheel tick in the given direction (+1 = down,
+    /// -1 = up). Every `SCROLL_TICKS_PER_STEP` ticks in one direction
+    /// advances the selection by one row; the accumulator resets on
+    /// direction change so a counter-flick takes effect immediately.
+    fn tick_scroll(&mut self, dir: i32) {
+        if dir.signum() != self.scroll_accum.signum() && self.scroll_accum != 0 {
+            self.scroll_accum = 0;
+        }
+        self.scroll_accum += dir;
+        while self.scroll_accum >= SCROLL_TICKS_PER_STEP {
+            let len = self.sidebar.len();
+            if len > 0 {
+                self.selected = (self.selected + 1).min(len - 1);
+            }
+            self.scroll_accum -= SCROLL_TICKS_PER_STEP;
+        }
+        while self.scroll_accum <= -SCROLL_TICKS_PER_STEP {
+            self.selected = self.selected.saturating_sub(1);
+            self.scroll_accum += SCROLL_TICKS_PER_STEP;
         }
     }
 
@@ -1531,26 +1612,56 @@ mod tests {
     }
 
     #[test]
-    fn scroll_down_in_list_advances_selection() {
+    fn scroll_up_in_list_advances_selection() {
+        // Direction inverted vs. crossterm's labels: ScrollUp advances.
+        // Throttled at SCROLL_TICKS_PER_STEP events per row step.
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
         s.term_size = (120, 30);
         // col 10 is comfortably inside the list rect at 120-col width.
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        for _ in 0..SCROLL_TICKS_PER_STEP {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        }
         assert_eq!(s.selected, 1);
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        for _ in 0..(SCROLL_TICKS_PER_STEP * 5) {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        }
         assert_eq!(s.selected, 2, "saturates at len-1");
     }
 
     #[test]
-    fn scroll_up_in_list_retreats_selection() {
+    fn scroll_down_in_list_retreats_selection() {
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 2);
         s.term_size = (120, 30);
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        for _ in 0..SCROLL_TICKS_PER_STEP {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        }
         assert_eq!(s.selected, 1);
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        for _ in 0..(SCROLL_TICKS_PER_STEP * 5) {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        }
         assert_eq!(s.selected, 0, "saturates at 0");
+    }
+
+    #[test]
+    fn scroll_below_step_threshold_does_not_move() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
+        s.term_size = (120, 30);
+        for _ in 0..(SCROLL_TICKS_PER_STEP - 1) {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        }
+        assert_eq!(s.selected, 0, "sub-threshold gesture must not step");
+    }
+
+    #[test]
+    fn scroll_direction_change_resets_accumulator() {
+        let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
+        s.term_size = (120, 30);
+        // Build up almost a step forward, then flick the other way.
+        for _ in 0..(SCROLL_TICKS_PER_STEP - 1) {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 10)));
+        }
+        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 10)));
+        assert_eq!(s.selected, 0, "counter-flick wipes pending ticks");
     }
 
     #[test]
@@ -1560,7 +1671,9 @@ mod tests {
         // must not move the list selection.
         let mut s = state_with(vec![ses("a"), ses("b"), ses("c")], 0);
         s.term_size = (120, 30);
-        s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollDown, 80)));
+        for _ in 0..(SCROLL_TICKS_PER_STEP * 2) {
+            s.apply(AppMsg::Mouse(mouse(MouseEventKind::ScrollUp, 80)));
+        }
         assert_eq!(s.selected, 0);
     }
 
@@ -1892,6 +2005,55 @@ mod tests {
 
         assert!(s.sidebar.ungrouped.is_empty());
         assert_eq!(s.sidebar.sections[0].members, vec!["bosun-abc".to_string()]);
+    }
+
+    /// Restart-swap: a pending swap captured at modal-confirm time
+    /// rewrites the dead row's internal name to the new internal name
+    /// in place on the next `SessionsRefreshed`, so the dead "? <name>"
+    /// ghost doesn't survive above the freshly-created session.
+    #[test]
+    fn restart_swap_replaces_dead_row_in_place() {
+        let mut s = AppState::default();
+        s.sidebar = model(
+            &["bosun-other"],
+            vec![section("g1", "Work", &["bosun-abc"])],
+        );
+        s.pending_restart_swap = Some("bosun-abc".to_string());
+
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-other"), ses("bosun-def")],
+            select_after: Some("bosun-def".to_string()),
+        });
+
+        assert_eq!(
+            s.sidebar.sections[0].members,
+            vec!["bosun-def".to_string()],
+            "new internal inherits the dead row's slot"
+        );
+        assert_eq!(
+            s.sidebar.ungrouped,
+            vec!["bosun-other".to_string()],
+            "no append of bosun-def to ungrouped"
+        );
+        assert!(s.pending_restart_swap.is_none(), "swap is consumed");
+    }
+
+    /// A pending swap doesn't apply to an unrelated refresh that
+    /// carries no `select_after` — it's just dropped so it doesn't
+    /// leak into a later, unrelated create.
+    #[test]
+    fn restart_swap_drops_on_refresh_without_select_after() {
+        let mut s = AppState::default();
+        s.sidebar = model(&["bosun-abc"], vec![]);
+        s.pending_restart_swap = Some("bosun-abc".to_string());
+
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-abc")],
+            select_after: None,
+        });
+
+        assert!(s.pending_restart_swap.is_none());
+        assert_eq!(s.sidebar.ungrouped, vec!["bosun-abc".to_string()]);
     }
 
     /// Renaming a section rewrites matching history entries so the

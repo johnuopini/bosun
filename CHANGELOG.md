@@ -4,6 +4,35 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-05-18
+
+### Changed
+- **Scroll-wheel direction inverted.** Wheel/trackpad pan over the
+  session list now matches macOS natural-scroll semantics on both
+  desktop and mobile clients (Termius, Blink): swiping content
+  downward moves the selection up, and vice versa.
+- **Scroll sensitivity throttled.** A single trackpad gesture no
+  longer flies through the list — wheel events accumulate and step
+  the selection every two ticks. Counter-flicks reset the
+  accumulator so reversing direction feels immediate.
+
+### Fixed
+- **Restart no longer leaves a "? &lt;name&gt;" ghost row.** Restarting
+  a session (live `R` or dead-row restart-from-recents) now swaps
+  the new internal name into the old row's slot — same section,
+  same position — instead of appending the new session at the
+  bottom while a dead ghost sits above it.
+
+### Internal
+- `SidebarModel::replace_session(old, new)` swaps an internal name
+  in place across `ungrouped` and section members.
+- `AppState.pending_restart_swap` captures the old internal at
+  modal-confirm time; the next `SessionsRefreshed` consumes it
+  before `reconcile` so the new session inherits the slot.
+- Scroll handling: new `SCROLL_TICKS_PER_STEP` constant + per-state
+  `scroll_accum` for the throttle; direction flip lives in the
+  `MouseEventKind::Scroll{Up,Down}` arms of `handle_mouse`.
+
 ## [0.3.2] — 2026-05-15
 
 ### Added
