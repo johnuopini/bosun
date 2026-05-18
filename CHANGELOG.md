@@ -4,6 +4,14 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] — 2026-05-18
+
+### Added
+- **`bosun release-notes` subcommand.** Pages the `CHANGELOG.md` that
+  was embedded in the binary at compile time. Honors `$PAGER`, falls
+  back to `less -RFX` and then `more`. Piping (`bosun release-notes |
+  grep …`) prints directly without a pager.
+
 ## [0.3.4] — 2026-05-18
 
 ### Added

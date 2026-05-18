@@ -3,4 +3,5 @@
 //! pull in HTTP / archive-extraction deps unless `bosun update` is
 //! actually invoked.
 
+pub mod release_notes;
 pub mod update;

@@ -40,6 +40,15 @@ async fn main() -> Result<()> {
                 }
             };
         }
+        if first == "release-notes" {
+            return match bosun::commands::release_notes::run() {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("bosun release-notes: {:#}", e);
+                    std::process::exit(1);
+                }
+            };
+        }
         if first == "help" || first == "--help" || first == "-h" {
             print_help();
             return Ok(());
@@ -117,6 +126,7 @@ USAGE:
     bosun                Launch the TUI (default)
     bosun update         Check for and install the latest release
     bosun update --check Check for an update without installing
+    bosun release-notes  Page the bundled CHANGELOG.md
     bosun --version      Print version and exit
     bosun --help         Print this message
 
