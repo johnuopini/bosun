@@ -192,7 +192,17 @@ jobs:
           cd tap
           mkdir -p "$(dirname "${FORMULA_PATH}")"
 
-          # Write formula using printf to avoid YAML parsing issues with heredoc
+          # Write formula using printf to avoid YAML parsing issues with heredoc.
+          #
+          # OS/arch selection uses `if Hardware::CPU.intel?` /
+          # `if Hardware::CPU.arm?` inside `on_macos` / `on_linux`
+          # rather than the nested `on_intel` / `on_arm` DSL. Reason:
+          # with the nested-DSL form, Homebrew 5.x on Intel macOS can
+          # fail to register a top-level `url` at formula-load time,
+          # which breaks `brew info` and `brew outdated` with
+          # "formula requires at least a URL" (yetidevworks/bosun#1).
+          # The `Hardware::CPU.*` form matches the canonical
+          # GoReleaser-generated formula style.
           printf '%s\n' \
             "class Bosun < Formula" \
             "  desc \"Tmux-native orchestrator for AI agent sessions\"" \
@@ -201,22 +211,22 @@ jobs:
             "  version \"${VER}\"" \
             "" \
             "  on_macos do" \
-            "    on_arm do" \
+            "    if Hardware::CPU.arm?" \
             "      url \"${TAP_URL}/bosun-darwin-aarch64.tar.gz\"" \
             "      sha256 \"${DARWIN_ARM64_SHA}\"" \
             "    end" \
-            "    on_intel do" \
+            "    if Hardware::CPU.intel?" \
             "      url \"${TAP_URL}/bosun-darwin-x86_64.tar.gz\"" \
             "      sha256 \"${DARWIN_X86_64_SHA}\"" \
             "    end" \
             "  end" \
             "" \
             "  on_linux do" \
-            "    on_intel do" \
+            "    if Hardware::CPU.intel?" \
             "      url \"${TAP_URL}/bosun-linux-x86_64.tar.gz\"" \
             "      sha256 \"${LINUX_X86_64_SHA}\"" \
             "    end" \
-            "    on_arm do" \
+            "    if Hardware::CPU.arm?" \
             "      url \"${TAP_URL}/bosun-linux-aarch64.tar.gz\"" \
             "      sha256 \"${LINUX_AARCH64_SHA}\"" \
             "    end" \
