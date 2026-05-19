@@ -333,15 +333,25 @@ impl AppState {
 
                 self.sessions = sessions;
 
-                // Restart-swap: if the user just confirmed a restart,
-                // replace the old (now-dead) internal name with the
-                // new one in place, so reconcile sees the new session
-                // already present and doesn't append it. This kills
-                // the "? <name>" dead row that would otherwise sit
-                // above the freshly-created session.
-                let swap_applied = match (self.pending_restart_swap.take(), select_after.as_ref()) {
-                    (Some(old), Some(new)) => self.sidebar.replace_session(&old, new),
-                    _ => false,
+                // Restart-swap (dead-row restart-from-recents only —
+                // live restart is in-place and never changes the
+                // internal name): if the user confirmed a recreate
+                // from a dead row, replace the old (still-dead)
+                // internal name with the new one in place so
+                // reconcile sees the new session already present and
+                // doesn't append it. Only fire when this refresh
+                // actually corresponds to the recreate (`select_after`
+                // set) — intermediate refreshes from tmux monitor
+                // notifications (e.g. a separate kill elsewhere)
+                // must NOT consume the pending swap.
+                let swap_applied = if let (Some(old), Some(new)) =
+                    (self.pending_restart_swap.as_deref(), select_after.as_ref())
+                {
+                    let did = self.sidebar.replace_session(old, new);
+                    self.pending_restart_swap = None;
+                    did
+                } else {
+                    false
                 };
 
                 let live: Vec<String> =
@@ -431,22 +441,25 @@ impl AppState {
                                         self.clamp_selection();
                                         self.save_sidebar(&mut out);
                                     }
-                                    // Capture restart swaps so the next
-                                    // `SessionsRefreshed` can splice the
-                                    // new internal name into the dead
-                                    // row's slot instead of appending it
-                                    // and leaving a "? <name>" ghost.
-                                    if let Command::RestartSession(internal) = &c {
-                                        self.pending_restart_swap = Some(internal.clone());
-                                    }
+                                    // Dead-row restart-from-recents:
+                                    // selection is on a dead entry
+                                    // whose display matches the spec
+                                    // we're about to create. Capture
+                                    // the dead internal so the next
+                                    // `SessionsRefreshed` can splice
+                                    // the new internal into the dead
+                                    // row's slot. Modals block
+                                    // selection movement, so the
+                                    // cursor is still on the row the
+                                    // user originally pressed R on.
+                                    //
+                                    // Live restart goes through
+                                    // `Command::RestartSession`, which
+                                    // is now in-place (same internal
+                                    // name, same pane, no sidebar
+                                    // churn), so no swap is needed
+                                    // for that path.
                                     if let Command::CreateSession(spec) = &c {
-                                        // Dead-row restart-from-recents:
-                                        // selection is on a dead entry
-                                        // whose display matches the spec
-                                        // we're about to create. Modals
-                                        // block selection movement, so
-                                        // the cursor is still on the row
-                                        // the user originally pressed R on.
                                         if self.selected_session().is_none() {
                                             if let Some(dead) = self.selected_session_name() {
                                                 if self.dead_display_for(&dead) == spec.name {
@@ -2038,22 +2051,41 @@ mod tests {
         assert!(s.pending_restart_swap.is_none(), "swap is consumed");
     }
 
-    /// A pending swap doesn't apply to an unrelated refresh that
-    /// carries no `select_after` — it's just dropped so it doesn't
-    /// leak into a later, unrelated create.
+    /// A pending swap survives intermediate `SessionsRefreshed`
+    /// events that have no `select_after` (e.g. the refresh fired by
+    /// the tmux monitor when the actor kills the old session, before
+    /// it creates the replacement). Consuming the swap on those would
+    /// strand the new session at the bottom of ungrouped instead of
+    /// dropping it into the dead row's slot.
     #[test]
-    fn restart_swap_drops_on_refresh_without_select_after() {
+    fn restart_swap_survives_intermediate_refresh() {
         let mut s = AppState::default();
         s.sidebar = model(&["bosun-abc"], vec![]);
         s.pending_restart_swap = Some("bosun-abc".to_string());
 
+        // First refresh: actor has killed the old session but not yet
+        // created the new one. No `select_after`.
         s.apply(AppMsg::SessionsRefreshed {
-            sessions: vec![ses("bosun-abc")],
+            sessions: vec![],
             select_after: None,
         });
+        assert_eq!(
+            s.pending_restart_swap.as_deref(),
+            Some("bosun-abc"),
+            "swap must survive an intermediate refresh"
+        );
 
-        assert!(s.pending_restart_swap.is_none());
-        assert_eq!(s.sidebar.ungrouped, vec!["bosun-abc".to_string()]);
+        // Second refresh: new session created, `select_after` set.
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-def")],
+            select_after: Some("bosun-def".to_string()),
+        });
+        assert!(s.pending_restart_swap.is_none(), "swap consumed");
+        assert_eq!(
+            s.sidebar.ungrouped,
+            vec!["bosun-def".to_string()],
+            "new internal landed in the old slot"
+        );
     }
 
     /// Renaming a section rewrites matching history entries so the

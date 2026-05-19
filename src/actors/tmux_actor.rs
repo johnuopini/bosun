@@ -291,47 +291,47 @@ pub fn spawn(
                     }
                 }
                 Command::RestartSession(internal) => {
+                    // In-place restart: send C-c twice to kill the
+                    // running agent, then `send-keys -l` the launch
+                    // command again. The session, its internal name,
+                    // and the pane all stay the same — no sidebar
+                    // churn, no ghost row, no slot change. Same
+                    // contract as before from the user's POV:
+                    // "press R, agent restarts."
                     match client.get_session_metadata(&internal).await {
                         Ok(Some(meta)) => {
-                            // Rebuild the spec, kill the old session,
-                            // then create a new one with the same
-                            // display name + options (new internal
-                            // hex suffix).
                             let spec = metadata_to_spec(meta);
-                            if let Err(e) = client.kill_session(&internal).await {
-                                let _ = evt_tx.send(AppMsg::Warn(format!("restart kill: {}", e)));
+                            let command =
+                                build_agent_command(&spec.agent, &spec.options, &spec.args);
+                            if let Err(e) = client.restart_in_place(&internal, &command).await {
+                                let _ = evt_tx.send(AppMsg::Warn(format!("restart: {}", e)));
                                 continue;
                             }
-                            if focused.as_deref() == Some(internal.as_str()) {
-                                focused = None;
+                            // Recents row is touched so this session
+                            // bubbles to the top of the recents store,
+                            // matching the pre-existing kill+create
+                            // semantics.
+                            if let Err(e) = store.upsert_recent(&spec) {
+                                tracing::warn!("store upsert on restart: {}", e);
                             }
-                            match create_session(&*client, &config, spec.clone()).await {
-                                Ok(new_internal) => {
-                                    focused = Some(new_internal.clone());
-                                    if let Err(e) = store.upsert_recent(&spec) {
-                                        tracing::warn!("store upsert on restart: {}", e);
-                                    }
-                                    let _ = evt_tx
-                                        .send(AppMsg::Warn(format!("restarted {}", spec.name)));
-                                    let _ = do_refresh(
-                                        &*client,
-                                        &config,
-                                        &registry,
-                                        &mut smoothers,
-                                        focused.as_deref(),
-                                        socket.as_deref(),
-                                        &mut last_bar_state,
-                                        &mut globals,
-                                        &evt_tx,
-                                        Some(new_internal),
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    let _ =
-                                        evt_tx.send(AppMsg::Warn(format!("restart create: {}", e)));
-                                }
-                            }
+                            let _ =
+                                evt_tx.send(AppMsg::Warn(format!("restarted {}", spec.name)));
+                            // Trigger a preview refresh so the pane's
+                            // new contents (the just-launched agent's
+                            // splash screen) show up promptly.
+                            let _ = do_refresh(
+                                &*client,
+                                &config,
+                                &registry,
+                                &mut smoothers,
+                                focused.as_deref(),
+                                socket.as_deref(),
+                                &mut last_bar_state,
+                                &mut globals,
+                                &evt_tx,
+                                None,
+                            )
+                            .await;
                         }
                         Ok(None) => {
                             let _ = evt_tx.send(AppMsg::Warn(

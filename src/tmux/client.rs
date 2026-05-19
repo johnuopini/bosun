@@ -83,6 +83,15 @@ pub trait TmuxClient: Send + Sync {
     /// feature or wasn't created by bosun). Used by restart to
     /// rebuild the original spec.
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>>;
+
+    /// Restart the agent inside a live session without killing the
+    /// session itself. Sends Ctrl-C twice (covers agents that swallow
+    /// the first interrupt to confirm), then types the new launch
+    /// command and Enter. The pane stays alive (the shell keeps
+    /// running underneath), the session's internal name doesn't
+    /// change, and bosun's sidebar position is preserved with zero
+    /// model churn.
+    async fn restart_in_place(&self, session: &str, command: &str) -> Result<()>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -403,6 +412,52 @@ impl TmuxClient for TokioTmuxClient {
             claude_skip_permissions: parts[5] == "1",
             codex_yolo: parts[6] == "1",
         }))
+    }
+
+    async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
+        // C-c kills the running agent; we send it twice with a small
+        // gap because some agents (codex with confirmations, claude
+        // with an in-flight tool call) swallow the first interrupt to
+        // ask "are you sure?" before honoring the second. Then we
+        // type the launch command via `send-keys -l` and submit it
+        // with a separate `send-keys Enter` — same idiom as the
+        // initial create path.
+        for _ in 0..2 {
+            let mut cc = self.cmd();
+            cc.arg("send-keys").arg("-t").arg(session).arg("C-c");
+            if let Err(e) = cc.output().await {
+                tracing::warn!("restart_in_place send C-c to {}: {}", session, e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+
+        // Empty command means "nothing to launch" (terminal agent
+        // with no args) — leave the shell at its prompt.
+        if command.is_empty() {
+            return Ok(());
+        }
+
+        let mut literal = self.cmd();
+        literal
+            .arg("send-keys")
+            .arg("-l")
+            .arg("-t")
+            .arg(session)
+            .arg("--")
+            .arg(command);
+        if let Err(e) = literal.output().await {
+            tracing::warn!("restart_in_place send-keys -l to {}: {}", session, e);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut enter = self.cmd();
+        enter.arg("send-keys").arg("-t").arg(session).arg("Enter");
+        if let Err(e) = enter.output().await {
+            tracing::warn!("restart_in_place send Enter to {}: {}", session, e);
+        }
+
+        Ok(())
     }
 }
 

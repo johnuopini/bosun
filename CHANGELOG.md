@@ -4,6 +4,46 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] — 2026-05-19
+
+### Changed
+- **`R` on a live session now restarts in place.** Instead of killing
+  the tmux session and creating a new one with a fresh internal name,
+  `R` sends `Ctrl-C` twice (covers agents that swallow the first
+  interrupt to confirm) and then re-types the launch command in the
+  same pane. The session, its internal name, and the sidebar slot are
+  all preserved — no ghost rows, no jump to the end of the list, no
+  selection bounce.
+
+### Fixed
+- **Ghost dead row on restart.** The previous kill-and-recreate path
+  fired an intermediate `SessionsRefreshed` (between the kill and the
+  create) which prematurely consumed the pending restart-swap state,
+  so the new internal name was appended at the bottom while the dead
+  `? <name>` ghost stayed in the old slot. The dead-row
+  restart-from-recents path still uses swap, but now only consumes it
+  when `select_after` is actually set — intermediate refreshes pass
+  through harmlessly.
+- **Homebrew formula on Intel macOS** (yetidevworks/bosun#1). The
+  release workflow now writes top-level `if OS.mac?` / `if OS.linux?`
+  guards with an `else` fallback for the arch, instead of the nested
+  `on_macos do ... on_intel do` DSL. The latter form fails on
+  Homebrew 5.x setups where `Hardware::CPU.*` returns `:dunno` and
+  both `intel?` and `arm?` evaluate to `false`, leaving the formula
+  with no URL registered and breaking `brew info` / `brew outdated`.
+
+### Internal
+- New `TmuxClient::restart_in_place(session, command)` method:
+  `send-keys C-c` (×2 with a 120ms gap) followed by `send-keys -l
+  <command>` and `send-keys Enter`. Mirrors the create path's idiom
+  but skips the new-session step.
+- `Command::RestartSession` handler in the tmux actor now uses
+  `restart_in_place` instead of `kill_session + create_session`.
+- Reducer no longer captures `pending_restart_swap` for live restart
+  (the internal name doesn't change). Dead-row restart-from-recents
+  still captures swap and now uses `as_deref()`-based consumption so
+  intermediate refreshes don't clear the state prematurely.
+
 ## [0.3.5] — 2026-05-18
 
 ### Added
