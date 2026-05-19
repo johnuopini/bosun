@@ -4,6 +4,23 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] — 2026-05-19
+
+### Fixed
+- **Restart-in-place was dropping the first character of the launch
+  command** under async prompts (powerlevel10k, spaceship) and after
+  agents that print a multi-line shutdown message. The `send-keys -l`
+  arrived while zsh's line editor wasn't ready yet, so `claude …`
+  showed up as `laude: command not found`. Restart now does
+  `C-c → wait → C-c → longer wait → Enter → C-u → command`, which
+  forces the prompt to repaint and clears any residue before the
+  command lands.
+- **Homebrew release workflow** now pulls release tarballs via
+  `gh release download` from the just-created release page instead
+  of `actions/download-artifact@v4`, which was intermittently 403ing
+  on `ListArtifacts` when `update-formula` and `publish-crate`
+  raced against the same artifact API endpoint after `release`.
+
 ## [0.3.6] — 2026-05-19
 
 ### Changed

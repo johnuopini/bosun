@@ -415,24 +415,48 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
-        // C-c kills the running agent; we send it twice with a small
-        // gap because some agents (codex with confirmations, claude
-        // with an in-flight tool call) swallow the first interrupt to
-        // ask "are you sure?" before honoring the second. Then we
-        // type the launch command via `send-keys -l` and submit it
-        // with a separate `send-keys Enter` — same idiom as the
-        // initial create path.
-        for _ in 0..2 {
-            let mut cc = self.cmd();
-            cc.arg("send-keys").arg("-t").arg(session).arg("C-c");
-            if let Err(e) = cc.output().await {
-                tracing::warn!("restart_in_place send C-c to {}: {}", session, e);
+        // Sequence (tuned against claude + codex + plain shell):
+        //   1. C-c, wait, C-c, longer wait — kills the running agent.
+        //      The second C-c covers agents that swallow the first
+        //      to ask "are you sure?" before honoring it.
+        //   2. Enter — forces the shell to redraw a fresh prompt.
+        //      Harmless if we're already at one; nudges async prompt
+        //      frameworks (powerlevel10k, spaceship) to finish
+        //      painting before the line editor starts accepting keys.
+        //   3. C-u — wipes the current input line of any residue
+        //      from the agent's shutdown message or partial keys.
+        //   4. send-keys -l <command> — type the launch command.
+        //      Without the prep above, the first character regularly
+        //      gets eaten by the still-shutting-down agent or by zsh
+        //      before its line editor is ready, producing e.g.
+        //      "laude: command not found" instead of "claude …".
+        //   5. Enter — submit.
+        let send = |args: Vec<&str>| {
+            let mut c = self.cmd();
+            c.arg("send-keys").arg("-t").arg(session);
+            for a in args {
+                c.arg(a);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        }
+            async move {
+                if let Err(e) = c.output().await {
+                    tracing::warn!("restart_in_place send-keys to {}: {}", session, e);
+                }
+            }
+        };
+
+        send(vec!["C-c"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        send(vec!["C-c"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+        send(vec!["Enter"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        send(vec!["C-u"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         // Empty command means "nothing to launch" (terminal agent
-        // with no args) — leave the shell at its prompt.
+        // with no args) — the Enter + C-u above already left the
+        // shell at a clean prompt.
         if command.is_empty() {
             return Ok(());
         }
@@ -448,15 +472,9 @@ impl TmuxClient for TokioTmuxClient {
         if let Err(e) = literal.output().await {
             tracing::warn!("restart_in_place send-keys -l to {}: {}", session, e);
         }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let mut enter = self.cmd();
-        enter.arg("send-keys").arg("-t").arg(session).arg("Enter");
-        if let Err(e) = enter.output().await {
-            tracing::warn!("restart_in_place send Enter to {}: {}", session, e);
-        }
-
+        send(vec!["Enter"]).await;
         Ok(())
     }
 }
