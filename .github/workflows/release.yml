@@ -121,10 +121,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/artifacts
+      - name: Download tarballs from the GitHub Release
+        # Pulling from the release page (already populated by the
+        # `release` job above) rather than the Actions artifact API
+        # avoids the intermittent 403 from `ListArtifacts` that hits
+        # when `update-formula` and `publish-crate` both call
+        # download-artifact concurrently against the same run.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/artifacts
+          cd /tmp/artifacts
+          for f in \
+            bosun-darwin-aarch64.tar.gz \
+            bosun-darwin-x86_64.tar.gz \
+            bosun-linux-x86_64.tar.gz \
+            bosun-linux-aarch64.tar.gz; do
+            gh release download "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${f}" \
+              --clobber
+          done
+          ls -la
 
       - name: Compute SHAs
         id: shas
@@ -132,16 +151,16 @@ jobs:
           set -euo pipefail
           hash() { sha256sum "$1" | awk '{print $1}'; }
 
-          f=$(find /tmp/artifacts -name '*darwin-aarch64.tar.gz' -print -quit)
+          f=/tmp/artifacts/bosun-darwin-aarch64.tar.gz
           [[ -f "$f" ]] && echo "darwin_arm64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
-          f=$(find /tmp/artifacts -name '*darwin-x86_64.tar.gz' -print -quit)
+          f=/tmp/artifacts/bosun-darwin-x86_64.tar.gz
           [[ -f "$f" ]] && echo "darwin_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
-          f=$(find /tmp/artifacts -name '*linux-x86_64.tar.gz' -print -quit)
+          f=/tmp/artifacts/bosun-linux-x86_64.tar.gz
           [[ -f "$f" ]] && echo "linux_x86_64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
-          f=$(find /tmp/artifacts -name '*linux-aarch64.tar.gz' -print -quit)
+          f=/tmp/artifacts/bosun-linux-aarch64.tar.gz
           [[ -f "$f" ]] && echo "linux_aarch64_sha=$(hash "$f")" >> $GITHUB_OUTPUT
 
       - name: Read version from Cargo.toml
