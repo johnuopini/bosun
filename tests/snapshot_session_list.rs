@@ -34,14 +34,23 @@ fn ses(name: &str, attached: bool) -> SessionView {
 }
 
 fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
+    // `fmt_age` in `section_preview` is `now - last_activity`, so using
+    // `UNIX_EPOCH` would render as "N weeks" where N grows every
+    // calendar week and breaks the snapshot. Anchor `last_activity` to
+    // `now - 1.5 weeks` so it deterministically rounds to "1w" no
+    // matter when the test runs.
+    let week_and_a_half = std::time::Duration::from_secs(604_800 + 302_400);
+    let stable_activity = SystemTime::now()
+        .checked_sub(week_and_a_half)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     SessionView::new(
         TmuxSession {
             name: name.into(),
             display_name: None,
             windows: 1,
             attached,
-            created: Some(SystemTime::UNIX_EPOCH),
-            last_activity: Some(SystemTime::UNIX_EPOCH),
+            created: Some(stable_activity),
+            last_activity: Some(stable_activity),
             current_path: Some("/tmp".into()),
             agent: Some("claude".into()),
             // `/tmp/work` is chosen deliberately: the session_list meta
