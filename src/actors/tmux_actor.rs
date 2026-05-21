@@ -291,13 +291,11 @@ pub fn spawn(
                     }
                 }
                 Command::RestartSession(internal) => {
-                    // In-place restart: send C-c twice to kill the
-                    // running agent, then `send-keys -l` the launch
-                    // command again. The session, its internal name,
-                    // and the pane all stay the same — no sidebar
-                    // churn, no ghost row, no slot change. Same
-                    // contract as before from the user's POV:
-                    // "press R, agent restarts."
+                    // In-place restart: C-c × 3 to kill the running
+                    // agent, type the launch command again, send C-l
+                    // to force a redraw. The session, its internal
+                    // name, and the pane all stay the same — no
+                    // sidebar churn, no ghost row, no slot change.
                     match client.get_session_metadata(&internal).await {
                         Ok(Some(meta)) => {
                             let spec = metadata_to_spec(meta);
@@ -316,22 +314,29 @@ pub fn spawn(
                             }
                             let _ =
                                 evt_tx.send(AppMsg::Warn(format!("restarted {}", spec.name)));
-                            // Trigger a preview refresh so the pane's
-                            // new contents (the just-launched agent's
-                            // splash screen) show up promptly.
-                            let _ = do_refresh(
-                                &*client,
-                                &config,
-                                &registry,
-                                &mut smoothers,
-                                focused.as_deref(),
-                                socket.as_deref(),
-                                &mut last_bar_state,
-                                &mut globals,
-                                &evt_tx,
-                                None,
-                            )
-                            .await;
+                            // Burst a few refreshes so the preview
+                            // catches the agent's splash painting in
+                            // real time instead of waiting up to a
+                            // full preview_tick (1s) for the next
+                            // capture. Each capture grabs the pane's
+                            // current visible buffer, so spacing the
+                            // calls picks up the redraw progression.
+                            for delay_ms in [200u64, 600, 1200] {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                let _ = do_refresh(
+                                    &*client,
+                                    &config,
+                                    &registry,
+                                    &mut smoothers,
+                                    focused.as_deref(),
+                                    socket.as_deref(),
+                                    &mut last_bar_state,
+                                    &mut globals,
+                                    &evt_tx,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                         Ok(None) => {
                             let _ = evt_tx.send(AppMsg::Warn(

@@ -416,21 +416,25 @@ impl TmuxClient for TokioTmuxClient {
 
     async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
         // Sequence (tuned against claude + codex + plain shell):
-        //   1. C-c, wait, C-c, longer wait — kills the running agent.
-        //      The second C-c covers agents that swallow the first
-        //      to ask "are you sure?" before honoring it.
-        //   2. Enter — forces the shell to redraw a fresh prompt.
-        //      Harmless if we're already at one; nudges async prompt
-        //      frameworks (powerlevel10k, spaceship) to finish
-        //      painting before the line editor starts accepting keys.
-        //   3. C-u — wipes the current input line of any residue
-        //      from the agent's shutdown message or partial keys.
-        //   4. send-keys -l <command> — type the launch command.
-        //      Without the prep above, the first character regularly
-        //      gets eaten by the still-shutting-down agent or by zsh
-        //      before its line editor is ready, producing e.g.
-        //      "laude: command not found" instead of "claude …".
-        //   5. Enter — submit.
+        //   1. C-c × 3 with growing gaps. The first dismisses an open
+        //      confirm dialog or interrupts a tool call; the second
+        //      tells the agent we're serious; the third covers agents
+        //      that catch and discard the first two (codex --yolo,
+        //      claude with deep nested operations).
+        //   2. Enter + C-u — forces the shell to redraw its prompt
+        //      (helps async frameworks like powerlevel10k / spaceship
+        //      finish painting) and wipes any partial keystrokes or
+        //      residue from the agent's shutdown banner. Without this
+        //      the first character of the launch command got eaten
+        //      and the user saw `laude: command not found`.
+        //   3. send-keys -l <command> + Enter — submit the launch.
+        //   4. C-l after the agent's had a moment to start. Many
+        //      TUI agents (claude, codex) draw onto the alternate
+        //      screen and only fully repaint when prompted with a
+        //      WINCH or a form-feed. Without this, capture-pane in a
+        //      never-attached detached session can keep returning a
+        //      stale buffer until the user attaches and detaches,
+        //      forcing the redraw manually.
         let send = |args: Vec<&str>| {
             let mut c = self.cmd();
             c.arg("send-keys").arg("-t").arg(session);
@@ -444,15 +448,20 @@ impl TmuxClient for TokioTmuxClient {
             }
         };
 
+        // Kill the running agent. Three C-c's covers everything
+        // we've seen in the wild.
         send(vec!["C-c"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
         send(vec!["C-c"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+        send(vec!["C-c"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
+        // Prep the shell for input.
         send(vec!["Enter"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         send(vec!["C-u"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Empty command means "nothing to launch" (terminal agent
         // with no args) — the Enter + C-u above already left the
@@ -473,8 +482,16 @@ impl TmuxClient for TokioTmuxClient {
             tracing::warn!("restart_in_place send-keys -l to {}: {}", session, e);
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-
         send(vec!["Enter"]).await;
+
+        // Give the agent a beat to claim the pane, then send C-l to
+        // force a full redraw. Detached tmux sessions don't deliver
+        // a WINCH on launch, so alt-screen TUIs can sit half-painted
+        // until something pokes them. C-l fixes that for the
+        // capture-pane preview without the user having to attach.
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        send(vec!["C-l"]).await;
+
         Ok(())
     }
 }

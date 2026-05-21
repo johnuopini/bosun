@@ -4,6 +4,33 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] — 2026-05-20
+
+### Fixed
+- **Restart misses on stubborn agents.** Send `C-c` three times now
+  (180ms → 220ms → 400ms) instead of twice. The first dismisses an
+  open confirm dialog, the second tells the agent we mean it, the
+  third covers codex `--yolo` and claude with deep nested tool
+  calls that catch and discard the first two.
+- **Preview stuck at pre-restart state until attach + detach.** Two
+  things were going wrong:
+  - Many TUI agents draw onto the alternate screen and only fully
+    repaint when prompted with a WINCH or a form-feed. In a detached
+    tmux pane that signal never arrives, so `capture-pane` kept
+    returning a half-painted buffer until the user attached and
+    detached manually to force the redraw. Restart now sends `C-l`
+    after the agent has had ~450ms to claim the pane.
+  - The preview was waiting up to a full 1s `preview_tick` for the
+    next capture. The actor now bursts three refreshes (at +200ms,
+    +600ms, +1200ms post-restart) so the preview tracks the agent's
+    splash paint in real time.
+
+### Internal
+- `TmuxClient::restart_in_place` sends C-c × 3 with larger gaps and
+  appends a trailing `C-l` after the launch.
+- `Command::RestartSession` handler in the tmux actor now fires three
+  spaced `do_refresh` calls after the restart instead of one.
+
 ## [0.3.7] — 2026-05-19
 
 ### Fixed
