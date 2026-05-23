@@ -4,6 +4,34 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] — 2026-05-23
+
+### Fixed
+- **Restart unreliable: empty shell prompt, stuck "claude " text, stale
+  preview.** Three different failure modes, all caused by the same
+  root issue — the prior implementation guessed at timing with fixed
+  sleeps. The worst case was the trailing `C-l` firing while the pane
+  was still in zsh (claude hadn't finished launching yet), which
+  cleared the shell's screen instead of forcing the agent to repaint,
+  leaving capture-pane staring at an empty starship prompt.
+  `TmuxClient::restart_in_place` now polls `#{pane_current_command}`
+  at the two state transitions that matter:
+  1. After `C-c`, wait until the foreground process is a shell again
+     (resending `C-c` periodically while the agent is still up).
+     Hard timeout 3.5s.
+  2. After typing the launch command, wait until the foreground
+     process is no longer a shell — i.e. the new agent is actually
+     running. Only then send `C-l`. Hard timeout 6s.
+  Restart now waits for the state it needs instead of hoping a sleep
+  was long enough, so it works under cold-start npm spin-up, slow
+  rc files, and busy agents alike.
+
+### Internal
+- New `TokioTmuxClient::pane_current_command` helper backed by
+  `display-message -p '#{pane_current_command}'`.
+- `restart_in_place` is split into explicit kill / prep / launch /
+  wait-for-agent / redraw phases, each with its own deadline.
+
 ## [0.3.8] — 2026-05-20
 
 ### Fixed

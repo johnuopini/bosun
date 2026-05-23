@@ -131,6 +131,38 @@ impl TokioTmuxClient {
     pub fn socket(&self) -> Option<&str> {
         self.socket.as_deref()
     }
+
+    /// Read the basename of the pane's foreground process, e.g. `zsh`
+    /// while sitting at a prompt or `node` / `claude` / `codex` /
+    /// `python3` while an agent is running. Returns an empty string if
+    /// the session has gone away. Used by `restart_in_place` to poll
+    /// for "agent has died" and "agent has started" without relying on
+    /// fixed-duration sleeps.
+    async fn pane_current_command(&self, session: &str) -> String {
+        let mut cmd = self.cmd();
+        cmd.arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(session)
+            .arg("#{pane_current_command}");
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// Heuristic: is this pane's foreground process a shell prompt, i.e.
+/// safe to type a launch command into? Matches the common login
+/// shells. False negatives just mean `restart_in_place` waits a bit
+/// longer for shell detection before falling through on timeout.
+fn is_shell(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu" | "pwsh"
+    )
 }
 
 impl Default for TokioTmuxClient {
@@ -415,27 +447,35 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
-        // Sequence (tuned against claude + codex + plain shell):
-        //   1. C-c × 3 with growing gaps. The first dismisses an open
-        //      confirm dialog or interrupts a tool call; the second
-        //      tells the agent we're serious; the third covers agents
-        //      that catch and discard the first two (codex --yolo,
-        //      claude with deep nested operations).
-        //   2. Enter + C-u — forces the shell to redraw its prompt
-        //      (helps async frameworks like powerlevel10k / spaceship
-        //      finish painting) and wipes any partial keystrokes or
-        //      residue from the agent's shutdown banner. Without this
-        //      the first character of the launch command got eaten
-        //      and the user saw `laude: command not found`.
-        //   3. send-keys -l <command> + Enter — submit the launch.
-        //   4. C-l after the agent's had a moment to start. Many
-        //      TUI agents (claude, codex) draw onto the alternate
-        //      screen and only fully repaint when prompted with a
-        //      WINCH or a form-feed. Without this, capture-pane in a
-        //      never-attached detached session can keep returning a
-        //      stale buffer until the user attaches and detaches,
-        //      forcing the redraw manually.
-        let send = |args: Vec<&str>| {
+        // Strategy: poll `#{pane_current_command}` instead of guessing
+        // timings with fixed sleeps. The two questions we need answered
+        // are "has the old agent actually exited?" and "has the new
+        // agent actually started?" — both are directly observable via
+        // tmux's display-message format, so we wait for the actual
+        // state transition rather than hoping a sleep was long enough.
+        //
+        //   1. Send C-c, poll until pane_current_command is a shell.
+        //      Re-send C-c periodically while the agent is still up
+        //      (claude / codex sometimes swallow the first one to ask
+        //      for confirmation, etc.). Bounded by a hard timeout so
+        //      we never wedge the actor.
+        //   2. Once we observe a shell, prep the line: Enter (forces
+        //      any async prompt framework to finish painting), C-u
+        //      (wipe residue from the shutdown banner).
+        //   3. send-keys -l <command> + Enter to launch the new agent.
+        //   4. Poll again until pane_current_command leaves the shell
+        //      — i.e. the agent process is actually the foreground
+        //      process. Only then send C-l. Sending C-l while still
+        //      at the shell (the old behavior's failure mode) just
+        //      clears the shell screen, which is exactly the empty
+        //      starship prompt we'd see in failed restarts.
+        //   5. The C-l forces alt-screen TUIs (claude, codex) to fully
+        //      repaint, which capture-pane then picks up cleanly for
+        //      the sidebar preview.
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let send_keys = |args: Vec<&str>| {
             let mut c = self.cmd();
             c.arg("send-keys").arg("-t").arg(session);
             for a in args {
@@ -448,28 +488,57 @@ impl TmuxClient for TokioTmuxClient {
             }
         };
 
-        // Kill the running agent. Three C-c's covers everything
-        // we've seen in the wild.
-        send(vec!["C-c"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(180)).await;
-        send(vec!["C-c"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
-        send(vec!["C-c"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // ── Phase 1: kill the running agent, wait for shell ──────────
+        send_keys(vec!["C-c"]).await;
+        let kill_deadline = Instant::now() + Duration::from_millis(3500);
+        let mut next_cc = Instant::now() + Duration::from_millis(250);
+        let mut at_shell = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let cur = self.pane_current_command(session).await;
+            if cur.is_empty() {
+                // Session went away — nothing to restart.
+                return Ok(());
+            }
+            if is_shell(&cur) {
+                at_shell = true;
+                break;
+            }
+            if Instant::now() >= kill_deadline {
+                tracing::warn!(
+                    "restart_in_place: gave up waiting for shell on {} (still running {})",
+                    session,
+                    cur
+                );
+                break;
+            }
+            if Instant::now() >= next_cc {
+                send_keys(vec!["C-c"]).await;
+                next_cc = Instant::now() + Duration::from_millis(400);
+            }
+        }
 
-        // Prep the shell for input.
-        send(vec!["Enter"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        send(vec!["C-u"]).await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Tiny settle so the shell's line editor is fully primed before
+        // we type. Even after pane_current_command flips to "zsh",
+        // async prompt frameworks (powerlevel10k, spaceship) may still
+        // be painting; ~100ms is enough in practice.
+        tokio::time::sleep(Duration::from_millis(120)).await;
 
-        // Empty command means "nothing to launch" (terminal agent
-        // with no args) — the Enter + C-u above already left the
-        // shell at a clean prompt.
+        // ── Phase 2: prep the shell line for input ───────────────────
+        send_keys(vec!["C-u"]).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        send_keys(vec!["Enter"]).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        send_keys(vec!["C-u"]).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Empty command means "leave a clean shell prompt" (terminal
+        // agent with no args). Nothing else to do.
         if command.is_empty() {
             return Ok(());
         }
 
+        // ── Phase 3: type and submit the launch command ──────────────
         let mut literal = self.cmd();
         literal
             .arg("send-keys")
@@ -481,16 +550,47 @@ impl TmuxClient for TokioTmuxClient {
         if let Err(e) = literal.output().await {
             tracing::warn!("restart_in_place send-keys -l to {}: {}", session, e);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        send(vec!["Enter"]).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        send_keys(vec!["Enter"]).await;
 
-        // Give the agent a beat to claim the pane, then send C-l to
-        // force a full redraw. Detached tmux sessions don't deliver
-        // a WINCH on launch, so alt-screen TUIs can sit half-painted
-        // until something pokes them. C-l fixes that for the
-        // capture-pane preview without the user having to attach.
-        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-        send(vec!["C-l"]).await;
+        // ── Phase 4: wait for the new agent to actually start ────────
+        // If we couldn't confirm we were at a shell, don't loop forever
+        // — fall through after a single deadline check. Shell-start has
+        // its own deadline.
+        let start_deadline = Instant::now() + Duration::from_millis(6000);
+        let mut agent_up = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let cur = self.pane_current_command(session).await;
+            if cur.is_empty() {
+                // Session vanished.
+                return Ok(());
+            }
+            if !is_shell(&cur) {
+                agent_up = true;
+                break;
+            }
+            if Instant::now() >= start_deadline {
+                tracing::warn!(
+                    "restart_in_place: agent didn't appear in pane_current_command on {} \
+                     (still showing shell {}); skipping C-l",
+                    session,
+                    cur
+                );
+                break;
+            }
+        }
+        let _ = at_shell;
+
+        // ── Phase 5: force a redraw inside the new agent ─────────────
+        // Only send C-l once we've confirmed the foreground process is
+        // no longer a shell — otherwise C-l would clear the shell's
+        // screen and capture-pane would snapshot an empty prompt.
+        if agent_up {
+            // Let the TUI claim the alt-screen before nudging it.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            send_keys(vec!["C-l"]).await;
+        }
 
         Ok(())
     }
