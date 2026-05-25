@@ -4,6 +4,16 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] — 2026-05-25
+
+### Added
+- **Key-bindings help modal.** Press `?` or `h` on the main list to
+  open a scrollable cheat sheet covering every binding in bosun —
+  navigation, session ops, reorder/move, sections, modals, and the
+  `Ctrl+Q` detach inside an attached session. Scroll with arrows /
+  PgUp / PgDn / Home / End; Esc or Enter closes. The status bar now
+  ends with `? help` so the key is discoverable.
+
 ## [0.3.9] — 2026-05-23
 
 ### Fixed

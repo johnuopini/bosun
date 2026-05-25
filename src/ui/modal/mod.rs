@@ -16,6 +16,7 @@
 //!     so there's no `dyn Any` downcasting.
 
 pub mod confirm;
+pub mod help;
 pub mod new_session;
 pub mod quickjump;
 pub mod recents;

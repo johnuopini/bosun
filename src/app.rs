@@ -25,6 +25,7 @@ use crate::tmux::TmuxClient;
 use crate::ui;
 use crate::ui::layout;
 use crate::ui::modal::confirm::ConfirmModal;
+use crate::ui::modal::help::HelpModal;
 use crate::ui::modal::new_session::NewSessionModal;
 use crate::ui::modal::quickjump::{QuickJumpModal, QuickJumpRow};
 use crate::ui::modal::rename::RenameModal;
@@ -186,6 +187,9 @@ pub enum ModalRequest {
     /// Open the type-ahead quick-jump session picker. Populated by
     /// the app loop with the current managed sessions.
     QuickJump,
+    /// Open the key-bindings help / cheat-sheet modal. Pure UI; the
+    /// app loop just constructs a `HelpModal` with no extra data.
+    Help,
 }
 
 impl AppState {
@@ -754,6 +758,15 @@ impl AppState {
                     out.push(Command::SaveBannerFont(nxt.to_string()));
                 }
             }
+            // `?` and `h` open the key-bindings cheat sheet. `h`
+            // doesn't collide with anything else on the main list
+            // (we use arrows / j-k for navigation, not h-l), so it's
+            // free to double as a "help" mnemonic alongside `?`.
+            (KeyCode::Char('?'), _) | (KeyCode::Char('h'), KeyModifiers::NONE)
+                if self.modals.top_id() != Some("help") =>
+            {
+                self.pending_modal = Some(ModalRequest::Help);
+            }
             // Direct-jump: 0 → ungrouped, 1..=9 → sections[0..=8]. Only
             // meaningful when the cursor is on a session; the move
             // helper no-ops on section headers and out-of-range targets.
@@ -1314,6 +1327,9 @@ impl App {
                             .collect();
                         self.state.modals.push(Box::new(QuickJumpModal::new(rows)));
                     }
+                    ModalRequest::Help => {
+                        self.state.modals.push(Box::new(HelpModal::new()));
+                    }
                 }
             }
 
@@ -1865,6 +1881,22 @@ mod tests {
             s.pending_modal,
             Some(ModalRequest::Section { editing: None })
         ));
+    }
+
+    /// `?` opens the help modal.
+    #[test]
+    fn question_mark_requests_help_modal() {
+        let mut s = state_with(vec![ses("a")], 0);
+        s.apply(AppMsg::Key(key(KeyCode::Char('?'))));
+        assert!(matches!(s.pending_modal, Some(ModalRequest::Help)));
+    }
+
+    /// `h` (with no modifiers) also opens the help modal.
+    #[test]
+    fn h_requests_help_modal() {
+        let mut s = state_with(vec![ses("a")], 0);
+        s.apply(AppMsg::Key(key(KeyCode::Char('h'))));
+        assert!(matches!(s.pending_modal, Some(ModalRequest::Help)));
     }
 
     /// `r` on a selected section requests the rename modal in edit mode.
