@@ -262,7 +262,10 @@ fn build_rows() -> Vec<Row> {
         Binding("Ctrl+R", "Force immediate refresh"),
         Blank,
         Section("Organize"),
-        Binding("Shift+↑ ↓ / K J", "Reorder within section / move section block"),
+        Binding(
+            "Shift+↑ ↓ / K J",
+            "Reorder within section / move section block",
+        ),
         Binding("Shift+→", "Move session to next section"),
         Binding("Shift+←", "Move session to previous section"),
         Binding("1 – 9", "Move session to section N"),
