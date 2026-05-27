@@ -136,6 +136,11 @@ pub enum Command {
     /// The reducer pre-resolves both fields so the loop just calls
     /// `Command::new(...).spawn()`.
     OpenEditor { editor: String, path: String },
+    /// Persist the single-window-mode flag to `config.toml`.
+    /// Intercepted by the app loop — never forwarded to the tmux
+    /// actor. Emitted by the `s` key handler in the reducer after
+    /// it flips `AppState::single_window_mode`.
+    SaveSingleWindow(bool),
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

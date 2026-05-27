@@ -11,4 +11,4 @@ expression: frame
                               │                                                 
                               │   press n to create a session                   
                               │   press f to cycle banner fonts                 
- bosun  v0.4.0 0 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren
+ bosun  v0.4.0 0 sessions↵ attach · s single-win · n new · e edit · g group · 1-

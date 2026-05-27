@@ -139,6 +139,17 @@ pub struct Config {
     /// previews are unaffected — they always use the polled path
     /// (they don't need a PTY).
     pub embed_enabled: bool,
+    /// Single-window mode (2.0+): when true, `Enter` / `Right` on a
+    /// session opens it *inside* the preview pane (focused embed)
+    /// instead of tearing down ratatui and running a full-screen
+    /// `tmux attach`. The sidebar stays visible the whole time.
+    /// `Ctrl-Q` exits back to bosun navigation, same as it does
+    /// from a real tmux attach. Default false (matches v0.4
+    /// behavior). Toggled live with `s` and persisted to
+    /// `config.toml` as `single_window = true`. Env override:
+    /// `BOSUN_SINGLE_WINDOW=1|true|yes|on` enables, anything else
+    /// disables.
+    pub single_window_mode: bool,
 }
 
 impl Default for Config {
@@ -155,6 +166,7 @@ impl Default for Config {
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
+            single_window_mode: false,
         }
     }
 }
@@ -210,6 +222,9 @@ struct ConfigFile {
     /// Embedded-terminal preview opt-out. See `Config::embed_enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embed: Option<bool>,
+    /// Single-window mode persistence. See `Config::single_window_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    single_window: Option<bool>,
 }
 
 impl Config {
@@ -298,6 +313,17 @@ impl Config {
             Err(_) => file.embed.unwrap_or(DEFAULT_EMBED_ENABLED),
         };
 
+        // Single-window mode: env override accepts truthy values.
+        // Anything else (or absent) → fall through to the file
+        // setting, then to default-false.
+        let single_window_mode = match env::var("BOSUN_SINGLE_WINDOW") {
+            Ok(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => file.single_window.unwrap_or(false),
+        };
+
         Self {
             session_prefix,
             tmux_socket,
@@ -310,6 +336,7 @@ impl Config {
             editor,
             preview_tick_ms,
             embed_enabled,
+            single_window_mode,
         }
     }
 
@@ -471,6 +498,30 @@ pub fn write_editor(editor: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the single-window-mode flag to `config.toml`. Same
+/// read-modify-write approach as `write_theme`. Writes `None`
+/// (skipped via `skip_serializing_if`) when the value is the
+/// default-false so the file stays clean of redundant entries.
+pub fn write_single_window(on: bool) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.single_window = if on { Some(true) } else { None };
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Persist the divider position to `config.toml`. Same
 /// read-modify-write approach as `write_theme`.
 pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
@@ -588,6 +639,7 @@ mod tests {
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
+            single_window_mode: false,
         }
     }
 
@@ -628,6 +680,7 @@ mod tests {
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
+            single_window_mode: false,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

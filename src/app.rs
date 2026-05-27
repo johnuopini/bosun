@@ -136,6 +136,14 @@ pub struct AppState {
     /// downward steps, negative = pending upward steps; resets on
     /// direction change so a flick the other way feels immediate.
     pub scroll_accum: i32,
+    /// Single-window mode (2.0+). When true, the App's `pending_attach`
+    /// handler routes through `enter_focus` (preview pane becomes
+    /// the interactive surface) instead of `perform_attach` (full-
+    /// screen `tmux attach` with ratatui torn down). The sidebar
+    /// stays visible the whole time. Toggled live with `s`;
+    /// persisted via `Command::SaveSingleWindow` so the preference
+    /// survives across bosun restarts.
+    pub single_window_mode: bool,
 }
 
 /// Number of wheel events that must accumulate in one direction before
@@ -736,6 +744,23 @@ impl AppState {
             (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
                 self.pending_modal = Some(ModalRequest::Theme);
             }
+            // `s`: toggle single-window mode (2.0+). When on,
+            // `Enter` / `Right` on a session opens it inside the
+            // preview pane (focused embed) instead of doing a
+            // full-screen `tmux attach`. Persisted to `config.toml`
+            // so the preference sticks across restarts. The actual
+            // mode switch in the live embed is handled by the app
+            // loop on the next iteration via `sync_embed`-style
+            // reconciliation.
+            (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                self.single_window_mode = !self.single_window_mode;
+                out.push(Command::SaveSingleWindow(self.single_window_mode));
+                self.warning = Some(if self.single_window_mode {
+                    "single-window mode ON — Enter opens in preview pane".to_string()
+                } else {
+                    "single-window mode OFF — Enter attaches full-screen".to_string()
+                });
+            }
             // `/` opens the type-ahead session picker. Mirrors fzf/
             // vim's convention for "start a filter". The app loop
             // populates it with the current managed sessions.
@@ -1254,6 +1279,7 @@ impl App {
             session_prefix: config.session_prefix.clone(),
             editor: config.editor.clone(),
             recents,
+            single_window_mode: config.single_window_mode,
             ..Default::default()
         };
 
@@ -1329,27 +1355,6 @@ impl App {
                     // the redraw. If the keystroke produces no echo
                     // (unusual), the screen is unchanged anyway.
                     continue;
-                }
-            }
-
-            // `f` outside of focus mode = enter focus, when the
-            // cursor is on a live session and we have an embed to
-            // promote. Intercepted before the reducer because the
-            // reducer is pure and can't await the synchronous
-            // capture-pane the respawn does.
-            if !self.embed_focused && self.state.modals.is_empty() {
-                if let AppMsg::Key(k) = &msg {
-                    use crossterm::event::{KeyCode, KeyModifiers};
-                    let is_plain_f =
-                        matches!(k.code, KeyCode::Char('f')) && k.modifiers == KeyModifiers::NONE;
-                    if is_plain_f && self.state.selected_session().is_some() && self.embed.is_some()
-                    {
-                        self.enter_focus().await;
-                        terminal
-                            .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
-                            .map_err(term_err)?;
-                        continue;
-                    }
                 }
             }
 
@@ -1438,6 +1443,12 @@ impl App {
                     Command::SaveDivider(x) => {
                         if let Err(e) = crate::config::write_divider_x(x) {
                             self.state.warning = Some(format!("divider: failed to save: {e}"));
+                        }
+                    }
+                    Command::SaveSingleWindow(on) => {
+                        if let Err(e) = crate::config::write_single_window(on) {
+                            self.state.warning =
+                                Some(format!("single-window: failed to save: {e}"));
                         }
                     }
                     Command::SaveSidebar(entries) => {
@@ -1547,9 +1558,42 @@ impl App {
                 }
             }
 
-            // If the reducer queued an attach, perform it now: tear down the
-            // terminal, hand the tty to tmux, install/remove the Ctrl-Q binding.
+            // If the reducer queued an attach, perform it now.
+            //
+            // Two paths depending on `single_window_mode`:
+            //
+            // - OFF (default): tear down the terminal, hand the tty
+            //   to tmux, run a full-screen `tmux attach`. Sidebar
+            //   disappears until the user detaches with Ctrl-Q.
+            //   Matches v0.4 behavior.
+            // - ON: route through `enter_focus`, which respawns the
+            //   preview-pane embed in writable mode. Sidebar stays
+            //   visible the whole time. The user's keys flow into
+            //   the session through bosun's PTY writer. Ctrl-Q
+            //   exits focus, same chord.
+            //
+            // The embed must be live (embed_enabled + spawn
+            // succeeded) for the single-window path to make sense.
+            // If it isn't, fall back to the full-screen path so
+            // `Enter` still has a useful behavior.
             if let Some(name) = self.state.pending_attach.take() {
+                let want_single_window = self.state.single_window_mode
+                    && self.embed_enabled
+                    && self
+                        .embed
+                        .as_ref()
+                        .map(|e| e.session() == name)
+                        .unwrap_or(false);
+                if want_single_window {
+                    self.enter_focus().await;
+                    terminal
+                        .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                        .map_err(term_err)?;
+                    continue;
+                }
+
+                // Full-screen path — same as v0.4.
+                //
                 // Stop the input actor so tmux has stdin to itself. Without
                 // this, Bosun's crossterm reader and tmux race for each key
                 // byte and the user has to press Ctrl-Q twice to detach.
