@@ -1171,6 +1171,14 @@ pub struct App {
     /// the user ends up needing to press Ctrl-Q twice because the
     /// first press is read by Bosun and silently dropped.
     input_handle: Option<input_actor::Handle>,
+    /// Tmux client. The tmux actor owns the primary copy (it's the
+    /// single owner of all timed/notification-driven tmux work) but
+    /// we keep one here for the rare cases when the app task itself
+    /// needs to make a synchronous tmux call — currently just the
+    /// post-detach `capture_pane` snap (v0.4.1+) that eliminates the
+    /// "preview catching up" blink between detach and the first
+    /// async `Command::ListNow` round-trip.
+    client: Arc<dyn TmuxClient>,
 }
 
 impl App {
@@ -1232,6 +1240,7 @@ impl App {
             store,
             theme,
             input_handle: Some(input_handle),
+            client,
         }
     }
 
@@ -1460,6 +1469,40 @@ impl App {
                 }
 
                 attach_result?;
+
+                // Snap the focused session's preview to its current
+                // state *before* yielding back to the event loop, so
+                // the very first post-detach frame shows what the
+                // session looks like *now* — not a stale 200ms-old
+                // buffer that the fast tick happens to refresh a
+                // moment later. The user just left a full-screen
+                // tmux view of this same pane; the eye expects the
+                // preview to be a screenshot of the place it was
+                // *just* attached to, not a half-second-old recap.
+                //
+                // capture_pane is ~1-3ms on a normal pane, so the
+                // synchronous await is cheap; the trade is one tiny
+                // blocking hop for the disappearance of a visibly
+                // jarring "catching up" frame.
+                if let Some(focused) = self.state.selected_session_name() {
+                    match self.client.capture_pane(&focused).await {
+                        Ok(bytes) => {
+                            if let Some(view) =
+                                self.state.sessions.iter_mut().find(|v| v.name() == focused)
+                            {
+                                view.preview = Some(std::sync::Arc::from(bytes.into_boxed_slice()));
+                            }
+                        }
+                        Err(e) => {
+                            // Non-fatal — the async ListNow below
+                            // will pick up the right state within
+                            // a tick or two. Worst case the user
+                            // sees the same blink they used to see.
+                            tracing::debug!("post-detach capture_pane({focused}): {e}");
+                        }
+                    }
+                }
+
                 // After return, kick a refresh — the session may have been killed.
                 let _ = self.cmd_tx.send(Command::ListNow);
             }

@@ -4,6 +4,20 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-27
+
+### Fixed
+- **Brief stale-preview blink between detach and the first async
+  refresh.** Returning from `Enter` (full-screen `tmux attach`)
+  used to leave the preview pane showing a buffer captured up to
+  200ms before detach until the next async refresh round-trip
+  completed. The app now does a single synchronous `capture-pane`
+  on the focused session between attach return and the next
+  draw, so the first post-detach frame shows the session's
+  current state immediately. `capture-pane` is ~1-3ms on a
+  normal pane; the rest of the refresh path stays async as
+  before.
+
 ## [0.4.0] — 2026-05-27
 
 ### Added
