@@ -48,16 +48,35 @@ const READ_BUF_SIZE: usize = 8192;
 
 /// Attach mode for the embedded `tmux attach` PTY.
 ///
-/// `Preview` is the default for non-focused embeds — read-only,
-/// `ignore-size`. Bosun cannot send keys to the session, and the
-/// embed client is excluded from tmux's window-size negotiation so
-/// the user's real attached client (in another terminal) keeps its
-/// own size.
+/// `Preview` uses `-f read-only` (read-only, *not* `ignore-size`).
+/// Bosun cannot send keys to the session, but the client *does*
+/// participate in tmux's window-size negotiation. With the default
+/// `window-size latest`, this means the session tracks whichever
+/// client is most recently active — when bosun's preview is the
+/// current activity, the session resizes to bosun's preview area
+/// and content fits without clipping.
 ///
-/// `Focused` flips read-only off but preserves `ignore-size`, via
-/// `tmux attach -f ignore-size` (no `-r`). The user's keys now flow
-/// to the session through bosun, and the user's real client's size
-/// is still untouched. Used for the Step 4 focus mode.
+/// `Focused` uses plain `attach` (read-write, also part of
+/// negotiation). The user's keys flow to the session through
+/// bosun, and when bosun is active the session is sized to the
+/// preview area.
+///
+/// We previously used `-r` (which is `-f read-only,ignore-size`)
+/// and `-f ignore-size` to protect *other* clients from being
+/// resized by bosun, plus a `tmux resize-window` to force the
+/// session to bosun's preview width. That had two compounding
+/// problems: (1) `resize-window` sets `window-size=manual` as a
+/// side effect, which disables future auto-resize, so a user's
+/// full-screen `tmux attach` (after detaching from bosun) saw
+/// content clipped to bosun's narrower size. (2) `ignore-size`
+/// alone wouldn't have caused the session to track preview width
+/// in the first place. Dropping both fixes both issues.
+///
+/// Trade-off acknowledged: a parallel `tmux attach` to the same
+/// session in another terminal will see size changes as bosun
+/// toggles activity. In practice bosun is the sole viewer of
+/// sessions it manages, so this rarely matters; users who run
+/// parallel attaches can disable the embed via `BOSUN_EMBED=0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachMode {
     Preview,
@@ -65,15 +84,10 @@ pub enum AttachMode {
 }
 
 impl AttachMode {
-    /// Tmux args for this mode. Preview = `-r` (alias for
-    /// `-f read-only,ignore-size`). Focused = `-f ignore-size`
-    /// (read-write + ignore-size). In both cases the embed client
-    /// stays out of window-size negotiation so the user's real
-    /// attached client elsewhere is unaffected.
     fn tmux_attach_args(self) -> &'static [&'static str] {
         match self {
-            AttachMode::Preview => &["attach", "-r"],
-            AttachMode::Focused => &["attach", "-f", "ignore-size"],
+            AttachMode::Preview => &["attach", "-f", "read-only"],
+            AttachMode::Focused => &["attach"],
         }
     }
 }
@@ -90,10 +104,6 @@ pub struct EmbedTerminal {
     /// can recognize and discard stale messages from a previous
     /// embed instance after a focus switch.
     session: String,
-    /// Tmux socket name (`-L <socket>`). `None` means the default
-    /// socket. Stored so `resize()` can fire `tmux resize-window`
-    /// to keep the session sized to the preview area.
-    socket: Option<String>,
     parser: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
     /// Boxed `dyn Write` over the same PTY master as `master`.
@@ -231,21 +241,8 @@ impl EmbedTerminal {
             parser.process(snap);
         }
 
-        // Force the session's active window to match our preview
-        // dimensions. Without this, sessions that were previously
-        // attached at a larger size (e.g. from a full-screen
-        // `tmux attach` in another terminal) render their content
-        // at the original width — and the preview only shows the
-        // leftmost columns, with the right side clipped off
-        // screen. The `-r` / `-f ignore-size` flags protect
-        // *other* clients from being resized by us, but they also
-        // mean *we* see the wider content. `resize-window` is the
-        // explicit override.
-        force_resize_window(socket, session, rows, cols);
-
         Ok(Self {
             session: session.to_string(),
-            socket: socket.map(String::from),
             parser,
             master: pair.master,
             writer: Some(writer),
@@ -304,13 +301,10 @@ impl EmbedTerminal {
             pixel_width: 0,
             pixel_height: 0,
         });
-        // Push the new size up to tmux too. Without this, the
-        // session's window stays at whatever it was negotiated to
-        // by the most-recent non-ignore-size client; resizing
-        // bosun's preview pane wouldn't actually change the
-        // rendered width and content past the edge would still
-        // clip. See the spawn-site comment.
-        force_resize_window(self.socket.as_deref(), &self.session, rows, cols);
+        // The session's window will track our new size through
+        // tmux's normal negotiation (window-size=latest by default
+        // + our client participates because we don't set
+        // ignore-size). No explicit resize-window required.
     }
 
     /// Render the current vt100 screen into `area` of `buf`. Uses
@@ -340,33 +334,4 @@ impl Drop for EmbedTerminal {
 /// `std::io::Error` (what `thread::spawn` returns).
 fn io_err<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> std::io::Error {
     move |e| std::io::Error::other(format!("{what}: {e}"))
-}
-
-/// Force the active window in `session` to (rows, cols) via
-/// `tmux resize-window -x cols -y rows`. Best-effort; failures
-/// are logged but never propagated — a session that no longer
-/// exists (killed between spawn and resize, or before our
-/// resize-window lands) would error here, and that's not
-/// something the embed user can do anything about. The function
-/// runs synchronously and adds a tiny shell-out per spawn/resize;
-/// in exchange the preview shows the session at the right width
-/// instead of clipping off the right edge when the session was
-/// previously attached at a larger size from another terminal.
-fn force_resize_window(socket: Option<&str>, session: &str, rows: u16, cols: u16) {
-    let mut cmd = std::process::Command::new("tmux");
-    if let Some(s) = socket {
-        cmd.arg("-L").arg(s);
-    }
-    cmd.args([
-        "resize-window",
-        "-t",
-        session,
-        "-x",
-        &cols.to_string(),
-        "-y",
-        &rows.to_string(),
-    ]);
-    if let Err(e) = cmd.status() {
-        tracing::debug!("tmux resize-window {} {}x{}: {}", session, cols, rows, e);
-    }
 }
