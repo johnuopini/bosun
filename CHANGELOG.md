@@ -4,6 +4,34 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-27
+
+### Added
+- **Live-feeling pane preview (focused-session fast tick).** The
+  preview pane on the selected session now updates at 5 fps by
+  default instead of 1 Hz. A second timer inside the tmux actor
+  re-captures only the focused pane on a fast cadence and emits a
+  lightweight `PreviewRefreshed` update that bypasses the
+  session-list / status-detector / statusbar paths — so the cost
+  is one `capture-pane` per tick regardless of how many sessions
+  you have open. The full 1 Hz refresh that updates the session
+  list and the `●◐○✕` status glyphs is unchanged.
+- Configurable via `preview_tick_ms = 250` in `config.toml` or
+  `BOSUN_PREVIEW_TICK_MS=300` in the env. Set to `0` to disable
+  the fast tick entirely and fall back to v0.3.x behavior.
+
+### Internal
+- New `AppMsg::PreviewRefreshed { name, bytes }` variant carries
+  the lightweight payload from the actor to the app. The app
+  handler updates the matching `SessionView.preview` in place and
+  returns no commands — no sidebar reconcile, no statusbar diff,
+  no detector run on the hot path.
+- This is the Step 0 deliverable from the in-progress 2.0
+  embedded-terminal work (see the `2.0` branch). Validated in live
+  testing as a clear improvement over the v0.3.x 1 Hz preview but
+  *not* a full substitute for a real embedded terminal — that work
+  continues on the `2.0` branch and will land later.
+
 ## [0.3.11] — 2026-05-27
 
 ### Added
