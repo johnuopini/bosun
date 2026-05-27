@@ -1191,6 +1191,12 @@ pub struct App {
     /// Sticky copy of `Config::embed_enabled`. `App::sync_embed`
     /// reads this on every iteration to decide whether to spawn.
     embed_enabled: bool,
+    /// Step 4 focus mode (2.0+). When true, the embed is running
+    /// in `AttachMode::Focused` (real attach, ignore-size) and the
+    /// app loop routes all `AppMsg::Key` events straight into the
+    /// embed's PTY writer instead of bosun's reducer. Ctrl-Q is
+    /// intercepted to exit focus.
+    embed_focused: bool,
     /// Tmux client. The tmux actor owns the primary copy and runs
     /// all timed / notification-driven tmux work; we keep this
     /// secondary handle so the app task itself can do synchronous
@@ -1262,6 +1268,7 @@ impl App {
             input_handle: Some(input_handle),
             embed: None,
             embed_enabled: config.embed_enabled,
+            embed_focused: false,
             client,
         }
     }
@@ -1294,6 +1301,57 @@ impl App {
                 Some(m) => m,
                 None => break,
             };
+
+            // Step 4 focus mode: while the embed is focused, all
+            // `AppMsg::Key` events go directly into the embed's PTY
+            // writer instead of bosun's reducer. Ctrl-Q is the
+            // exit-focus chord (mirrors the existing tmux-attach
+            // detach key). Non-key AppMsgs (Resize, refresh,
+            // EmbedBytes, etc.) still flow through the normal paths
+            // so layout / state stay current.
+            if self.embed_focused {
+                if let AppMsg::Key(k) = &msg {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if is_ctrl_q {
+                        self.exit_focus().await;
+                    } else if let Some(bytes) = crate::ui::key_encode::encode(*k) {
+                        if let Some(embed) = self.embed.as_mut() {
+                            if let Err(e) = embed.write(&bytes) {
+                                tracing::warn!("embed write: {}", e);
+                                self.state.warning = Some(format!("focus: write failed: {e}"));
+                            }
+                        }
+                    }
+                    // Don't draw here — the next EmbedBytes chunk
+                    // from the agent's echo / response will trigger
+                    // the redraw. If the keystroke produces no echo
+                    // (unusual), the screen is unchanged anyway.
+                    continue;
+                }
+            }
+
+            // `f` outside of focus mode = enter focus, when the
+            // cursor is on a live session and we have an embed to
+            // promote. Intercepted before the reducer because the
+            // reducer is pure and can't await the synchronous
+            // capture-pane the respawn does.
+            if !self.embed_focused && self.state.modals.is_empty() {
+                if let AppMsg::Key(k) = &msg {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    let is_plain_f =
+                        matches!(k.code, KeyCode::Char('f')) && k.modifiers == KeyModifiers::NONE;
+                    if is_plain_f && self.state.selected_session().is_some() && self.embed.is_some()
+                    {
+                        self.enter_focus().await;
+                        terminal
+                            .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                            .map_err(term_err)?;
+                        continue;
+                    }
+                }
+            }
 
             // Fast path for embed PTY bytes. The reducer is pure and
             // AppState doesn't own the embed (it's runtime state on
@@ -1682,11 +1740,17 @@ impl App {
                         None
                     }
                 };
+                // sync_embed always spawns in Preview mode. Focus
+                // entry/exit (Step 4) is handled separately by
+                // `App::set_embed_focus`, which respawns with
+                // `AttachMode::Focused` while preserving the
+                // currently-focused session.
                 match crate::ui::embed_terminal::EmbedTerminal::spawn(
                     self.socket.as_deref(),
                     &t,
                     rows,
                     cols,
+                    crate::ui::embed_terminal::AttachMode::Preview,
                     snapshot.as_deref(),
                     self.evt_tx.clone(),
                 ) {
@@ -1708,6 +1772,97 @@ impl App {
         if let Some(embed) = self.embed.as_mut() {
             embed.resize(rows, cols);
         }
+    }
+
+    /// Switch the embed for the currently-selected session into
+    /// `AttachMode::Focused`. Idempotent if already focused; no-op
+    /// if there's no embed (focus has nothing to grab) or no live
+    /// session under the cursor. Captures a fresh snapshot before
+    /// the respawn so the focused embed's first frame is the same
+    /// stable view the user just had in preview mode.
+    async fn enter_focus(&mut self) {
+        if self.embed_focused {
+            return;
+        }
+        let Some(session) = self.state.selected_session().map(|v| v.name().to_string()) else {
+            return;
+        };
+        if self.embed.is_none() {
+            // Without an embed (embed_enabled=false, or spawn
+            // failed), focus mode has nothing to attach to.
+            return;
+        }
+        if let Err(e) = self
+            .respawn_embed(&session, crate::ui::embed_terminal::AttachMode::Focused)
+            .await
+        {
+            self.state.warning = Some(format!("focus: {e}"));
+            return;
+        }
+        self.embed_focused = true;
+        self.state.warning = Some("focus mode — Ctrl-Q to exit".to_string());
+    }
+
+    /// Switch the embed back to `AttachMode::Preview`. Mirrors
+    /// `enter_focus`. Always clears `embed_focused`, even if the
+    /// respawn itself failed — the user is no longer trying to
+    /// drive the session through bosun, so we'd rather fall back
+    /// to a polled preview than leave them stuck.
+    async fn exit_focus(&mut self) {
+        if !self.embed_focused {
+            return;
+        }
+        self.embed_focused = false;
+        let Some(session) = self.state.selected_session().map(|v| v.name().to_string()) else {
+            // Session disappeared while focused — drop the embed
+            // entirely; sync_embed will recreate it on the next
+            // selection change.
+            self.embed = None;
+            return;
+        };
+        if let Err(e) = self
+            .respawn_embed(&session, crate::ui::embed_terminal::AttachMode::Preview)
+            .await
+        {
+            // Best-effort fallback to the polled path — drop the
+            // embed and let the normal `sync_embed` flow on the
+            // next iteration try to bring one back in Preview mode.
+            tracing::warn!("exit_focus respawn: {e}");
+            self.embed = None;
+        }
+        self.state.warning = None;
+    }
+
+    /// Internal: drop the current embed and spawn a fresh one for
+    /// `session` in the given mode, priming with a synchronous
+    /// capture-pane snapshot so the transition is a single repaint
+    /// rather than the visible attach-replay animation. Used by
+    /// `enter_focus` / `exit_focus` — `sync_embed` has its own
+    /// inline spawn path because it also handles the no-target and
+    /// resize-only cases.
+    async fn respawn_embed(
+        &mut self,
+        session: &str,
+        mode: crate::ui::embed_terminal::AttachMode,
+    ) -> std::io::Result<()> {
+        let (rows, cols) = self.preview_dims();
+        let snapshot = self.client.capture_pane(session).await.ok();
+        // Drop the old embed *before* spawning the new one. Both
+        // attaches would otherwise briefly coexist on the same
+        // tmux session, which works fine but pointlessly fans out
+        // tmux's relay.
+        self.embed = None;
+        let embed = crate::ui::embed_terminal::EmbedTerminal::spawn(
+            self.socket.as_deref(),
+            session,
+            rows,
+            cols,
+            mode,
+            snapshot.as_deref(),
+            self.evt_tx.clone(),
+        )?;
+        self.embed = Some(embed);
+        Ok(())
     }
 
     /// Compute the current preview area dimensions in (rows, cols)

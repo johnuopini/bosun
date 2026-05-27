@@ -1,5 +1,6 @@
 pub mod banner;
 pub mod embed_terminal;
+pub mod key_encode;
 pub mod layout;
 pub mod modal;
 pub mod preview;

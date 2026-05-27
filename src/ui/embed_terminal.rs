@@ -26,7 +26,7 @@
 //! spawn time — the child still holds an fd to it; this just removes
 //! our local handle so we're not the last referent.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -46,6 +46,38 @@ use crate::events::AppMsg;
 /// arrives in one or two chunks.
 const READ_BUF_SIZE: usize = 8192;
 
+/// Attach mode for the embedded `tmux attach` PTY.
+///
+/// `Preview` is the default for non-focused embeds — read-only,
+/// `ignore-size`. Bosun cannot send keys to the session, and the
+/// embed client is excluded from tmux's window-size negotiation so
+/// the user's real attached client (in another terminal) keeps its
+/// own size.
+///
+/// `Focused` flips read-only off but preserves `ignore-size`, via
+/// `tmux attach -f ignore-size` (no `-r`). The user's keys now flow
+/// to the session through bosun, and the user's real client's size
+/// is still untouched. Used for the Step 4 focus mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachMode {
+    Preview,
+    Focused,
+}
+
+impl AttachMode {
+    /// Tmux args for this mode. Preview = `-r` (alias for
+    /// `-f read-only,ignore-size`). Focused = `-f ignore-size`
+    /// (read-write + ignore-size). In both cases the embed client
+    /// stays out of window-size negotiation so the user's real
+    /// attached client elsewhere is unaffected.
+    fn tmux_attach_args(self) -> &'static [&'static str] {
+        match self {
+            AttachMode::Preview => &["attach", "-r"],
+            AttachMode::Focused => &["attach", "-f", "ignore-size"],
+        }
+    }
+}
+
 /// Minimum PTY grid size. tmux refuses to size a session under
 /// (rows=2, cols=10) on some configurations, and vt100's screen
 /// would render a useless sliver anyway. We clamp at (4, 20).
@@ -60,6 +92,12 @@ pub struct EmbedTerminal {
     session: String,
     parser: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
+    /// Boxed `dyn Write` over the same PTY master as `master`.
+    /// portable_pty exposes input as `take_writer()`; we cache the
+    /// handle here so `write` doesn't need a fresh allocation per
+    /// keystroke. Always Some after construction; the Option is
+    /// only there to satisfy the borrow checker around `take_writer`.
+    writer: Option<Box<dyn Write + Send>>,
     child: Box<dyn Child + Send + Sync>,
     /// Belt-and-braces signal for the reader thread. The reliable
     /// stop is the child's death (master fd closes → reader sees
@@ -68,6 +106,11 @@ pub struct EmbedTerminal {
     stop: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
+    /// Current attach mode. Toggled by App when entering / leaving
+    /// focus mode — which actually means dropping this embed and
+    /// spawning a new one in the opposite mode (the PTY's attach
+    /// args differ between modes and aren't runtime-switchable).
+    mode: AttachMode,
 }
 
 impl EmbedTerminal {
@@ -89,6 +132,7 @@ impl EmbedTerminal {
         session: &str,
         rows: u16,
         cols: u16,
+        mode: AttachMode,
         initial_snapshot: Option<&[u8]>,
         evt_tx: mpsc::UnboundedSender<AppMsg>,
     ) -> std::io::Result<Self> {
@@ -110,8 +154,9 @@ impl EmbedTerminal {
             cmd.arg("-L");
             cmd.arg(sock);
         }
-        cmd.arg("attach");
-        cmd.arg("-r");
+        for a in mode.tmux_attach_args() {
+            cmd.arg(a);
+        }
         cmd.arg("-t");
         cmd.arg(session);
         // Hint to whatever shell tmux relays. tmux's own protocol
@@ -132,6 +177,11 @@ impl EmbedTerminal {
             .master
             .try_clone_reader()
             .map_err(io_err("clone reader"))?;
+        // Cache a writer handle so per-keystroke `write` doesn't
+        // re-acquire it. `take_writer` is portable_pty's owned-handle
+        // API; some platforms return a non-cloneable writer, so we
+        // take it once at spawn time.
+        let writer = pair.master.take_writer().map_err(io_err("take writer"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_reader = stop.clone();
         let session_owned = session.to_string();
@@ -181,11 +231,30 @@ impl EmbedTerminal {
             session: session.to_string(),
             parser,
             master: pair.master,
+            writer: Some(writer),
             child,
             stop,
             rows,
             cols,
+            mode,
         })
+    }
+
+    /// Write key bytes into the PTY master. Only meaningful in
+    /// `AttachMode::Focused` — `Preview` mode runs tmux's `-r`
+    /// (read-only) attach, which silently drops every byte we send.
+    /// Returns the underlying io error on write failure (rare; the
+    /// most likely cause is the child having exited).
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.write_all(bytes)?;
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn mode(&self) -> AttachMode {
+        self.mode
     }
 
     pub fn session(&self) -> &str {
