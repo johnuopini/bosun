@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::tmux::session::SessionView;
@@ -167,6 +169,16 @@ pub enum AppMsg {
         sessions: Vec<SessionView>,
         select_after: Option<String>,
     },
+    /// Lightweight preview refresh for a single (focused) session. The
+    /// tmux actor's fast-preview tick (`Config::preview_tick_ms`,
+    /// default 200ms) captures just the focused pane and emits this
+    /// message — much cheaper than a full `SessionsRefreshed`. The app
+    /// handler updates the preview bytes on the matching SessionView
+    /// in place and does no other work (no detector run, no sidebar
+    /// reconcile, no statusbar sync). A no-op if the named session is
+    /// no longer in the list (it was killed between capture and
+    /// delivery).
+    PreviewRefreshed { name: String, bytes: Arc<[u8]> },
     /// An attach just started — the UI should render a placeholder
     /// while we block in `tmux attach`.
     AttachStarted { name: String },

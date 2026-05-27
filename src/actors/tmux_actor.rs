@@ -163,6 +163,28 @@ pub fn spawn(
         // refresh explicitly just below.
         preview_tick.tick().await;
 
+        // Fast preview tick (`Config::preview_tick_ms`, default 200ms).
+        // This is the v0.x "1 fps preview" fix from Step 0 of the 2.0
+        // plan: re-capture just the focused session's pane on a tight
+        // cadence so the preview is perceptually live without paying
+        // for a full `refresh_all` (list-sessions + per-session
+        // detector + statusbar diff). The full 1Hz `preview_tick`
+        // above still runs and still updates the focused session's
+        // preview as a side effect — the fast tick is purely additive.
+        //
+        // When `preview_tick_ms == 0` or there's no focused session,
+        // the fast branch in the select! below is a no-op.
+        let mut preview_fast_tick = if config.preview_tick_ms > 0 {
+            let mut t = time::interval(Duration::from_millis(config.preview_tick_ms));
+            t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Skip the immediate first tick — the initial refresh
+            // below covers it.
+            t.tick().await;
+            Some(t)
+        } else {
+            None
+        };
+
         // Initial refresh so the UI populates without waiting for a
         // notification. Otherwise a user starting bosun against an
         // already-quiet tmux server would see an empty list until
@@ -511,6 +533,40 @@ pub fn spawn(
                         None,
                     )
                     .await;
+                }
+                _ = async {
+                    // If the fast tick is disabled (`preview_tick_ms = 0`),
+                    // park forever — select! just never picks this branch.
+                    match preview_fast_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                } => {
+                    // Cheap focused-session-only preview refresh.
+                    // Captures one pane (the focused session), packages
+                    // the bytes into an Arc, and sends a lightweight
+                    // PreviewRefreshed. Skipped entirely when no
+                    // session is focused (the empty-state and
+                    // section-header views don't need pane data).
+                    if let Some(name) = focused.as_deref() {
+                        match client.capture_pane(name).await {
+                            Ok(bytes) => {
+                                let arc: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+                                let _ = evt_tx.send(AppMsg::PreviewRefreshed {
+                                    name: name.to_string(),
+                                    bytes: arc,
+                                });
+                            }
+                            Err(e) => {
+                                // Capture can fail if the session died
+                                // between focus and the next tick.
+                                // The next full refresh will drop the
+                                // session from the list; nothing
+                                // urgent to do here.
+                                tracing::debug!("fast capture {}: {}", name, e);
+                            }
+                        }
+                    }
                 }
             }
         }

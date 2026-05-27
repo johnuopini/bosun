@@ -417,6 +417,16 @@ impl AppState {
                 }
                 self.sync_focus(&mut out);
             }
+            AppMsg::PreviewRefreshed { name, bytes } => {
+                // Hot path for the 2.0 fast preview tick. Update the
+                // preview bytes on the matching SessionView in place
+                // and return no commands — no detector run, no sidebar
+                // reconcile, no statusbar sync. A no-op if the named
+                // session was killed between capture and delivery.
+                if let Some(view) = self.sessions.iter_mut().find(|v| v.name() == name) {
+                    view.preview = Some(bytes);
+                }
+            }
             AppMsg::Key(k) => {
                 // Route through open modals first. Most modals consume
                 // everything they see so typing in a text field doesn't

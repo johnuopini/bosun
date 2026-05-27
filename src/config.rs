@@ -119,6 +119,16 @@ pub struct Config {
     /// bar. Set via `bosun editor <cmd>` or directly in `config.toml`
     /// as `editor = "zed"` (or `code`, `subl`, `nvim`, ...).
     pub editor: Option<String>,
+    /// Fast preview tick (milliseconds): how often the tmux actor
+    /// re-captures the *focused* session's pane to push a fresh
+    /// preview to the UI. Independent of the 1Hz full-refresh tick
+    /// that updates the session list + status detectors + statusbar.
+    /// Default 200ms (5 fps) keeps the preview perceptually live for
+    /// the cost of one `capture-pane` per tick. 0 disables the fast
+    /// tick (falls back to v0.x behavior — preview only updates on
+    /// full refresh). Override with `preview_tick_ms = 250` in
+    /// `config.toml` or `BOSUN_PREVIEW_TICK_MS=300` in the env.
+    pub preview_tick_ms: u64,
 }
 
 impl Default for Config {
@@ -133,9 +143,14 @@ impl Default for Config {
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
+            preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
         }
     }
 }
+
+/// Default fast preview tick in milliseconds. 200ms = 5 fps on the
+/// focused session's preview pane. See `Config::preview_tick_ms`.
+pub const DEFAULT_PREVIEW_TICK_MS: u64 = 200;
 
 /// Shape of `config.toml` on disk. All fields are optional and
 /// defaulted independently so a half-written file still loads.
@@ -173,6 +188,9 @@ struct ConfigFile {
     /// unset; `e` will warn until the user configures one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     editor: Option<String>,
+    /// Fast preview tick in milliseconds. See `Config::preview_tick_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview_tick_ms: Option<u64>,
 }
 
 impl Config {
@@ -240,6 +258,15 @@ impl Config {
             .editor
             .and_then(|e| if e.trim().is_empty() { None } else { Some(e) });
 
+        // Env var wins over config file, both win over the default.
+        // Parse failure of either falls through silently to the next
+        // source — bad values shouldn't brick startup.
+        let preview_tick_ms = env::var("BOSUN_PREVIEW_TICK_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or(file.preview_tick_ms)
+            .unwrap_or(DEFAULT_PREVIEW_TICK_MS);
+
         Self {
             session_prefix,
             tmux_socket,
@@ -250,6 +277,7 @@ impl Config {
             session_history,
             banner_font,
             editor,
+            preview_tick_ms,
         }
     }
 
@@ -526,6 +554,7 @@ mod tests {
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
+            preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
         }
     }
 
@@ -564,6 +593,7 @@ mod tests {
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
+            preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
