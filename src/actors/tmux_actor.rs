@@ -421,7 +421,8 @@ pub fn spawn(
                 | Command::SaveSessionHistory(_)
                 | Command::SaveBannerFont(_)
                 | Command::InsertSection { .. }
-                | Command::RenameSection { .. } => {
+                | Command::RenameSection { .. }
+                | Command::OpenEditor { .. } => {
                     // Pure UI state — the app loop intercepts these
                     // before forwarding. If one makes it here the
                     // intercept path is broken.

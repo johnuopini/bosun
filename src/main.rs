@@ -49,6 +49,21 @@ async fn main() -> Result<()> {
                 }
             };
         }
+        if first == "editor" {
+            // `bosun editor` (no arg) prints current; `bosun editor
+            // <cmd>` sets it. We don't accept multi-word commands
+            // through argv splitting — if a user wants `code --new-window`
+            // they can edit config.toml directly. The simple form is
+            // the documented path.
+            let arg = args.next();
+            return match bosun::commands::editor::run(arg) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("bosun editor: {:#}", e);
+                    std::process::exit(1);
+                }
+            };
+        }
         if first == "help" || first == "--help" || first == "-h" {
             print_help();
             return Ok(());
@@ -127,6 +142,8 @@ USAGE:
     bosun update         Check for and install the latest release
     bosun update --check Check for an update without installing
     bosun release-notes  Page the bundled CHANGELOG.md
+    bosun editor [<cmd>] Print or set the editor launched by `e` in the TUI
+                         (e.g. `bosun editor zed`, `bosun editor code`)
     bosun --version      Print version and exit
     bosun --help         Print this message
 

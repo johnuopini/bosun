@@ -112,6 +112,12 @@ pub struct AppState {
     /// the sidebar and when matching a dead row back to a `Recent`
     /// for `R`-to-restart.
     pub session_prefix: String,
+    /// Configured external editor command (`zed`, `code`, `subl`, ...).
+    /// `None` means no editor is configured; pressing `e` warns. Loaded
+    /// once at startup from `Config::editor`. The TUI doesn't currently
+    /// hot-reload this — the user re-runs `bosun editor <cmd>` and
+    /// restarts bosun.
+    pub editor: Option<String>,
     /// Last-loaded snapshot of the SQLite recents store. Used to
     /// resolve internal-name → display-name for dead sidebar entries
     /// (so the row reads `Raycast` instead of `bosun-raycast-1e18ae00`)
@@ -767,6 +773,35 @@ impl AppState {
             {
                 self.pending_modal = Some(ModalRequest::Help);
             }
+            // `e` opens the configured editor at the selected session's
+            // path. Requires both an editor configured (`bosun editor
+            // <cmd>` or `editor = "..."` in config.toml) and a session
+            // with a known path — section headers and path-less rows
+            // produce a status-bar warning instead.
+            (KeyCode::Char('e'), KeyModifiers::NONE) => {
+                let editor = match self.editor.clone() {
+                    Some(e) => e,
+                    None => {
+                        self.warning = Some(
+                            "no editor configured — run `bosun editor <cmd>` (e.g. zed, code)"
+                                .into(),
+                        );
+                        return;
+                    }
+                };
+                match self
+                    .selected_session()
+                    .and_then(|s| s.session.best_path().map(str::to_string))
+                {
+                    Some(path) => {
+                        out.push(Command::OpenEditor { editor, path });
+                    }
+                    None => {
+                        self.warning =
+                            Some("no path on selected row — pick a session, not a header".into());
+                    }
+                }
+            }
             // Direct-jump: 0 → ungrouped, 1..=9 → sections[0..=8]. Only
             // meaningful when the cursor is on a session; the move
             // helper no-ops on section headers and out-of-range targets.
@@ -1173,6 +1208,7 @@ impl App {
             session_history: config.session_history.clone(),
             banner_font: config.banner_font.clone(),
             session_prefix: config.session_prefix.clone(),
+            editor: config.editor.clone(),
             recents,
             ..Default::default()
         };
@@ -1272,6 +1308,32 @@ impl App {
                     }
                     Command::RenameSection { id, new_name } => {
                         self.state.rename_section(&id, new_name, &mut queue);
+                    }
+                    Command::OpenEditor { editor, path } => {
+                        // Fire-and-forget. Child stdio is detached to
+                        // /dev/null so a chatty editor (`code .` prints
+                        // to stderr on first launch) doesn't scribble
+                        // over the alt-screen. The `Child` is dropped
+                        // immediately — modern GUI editors fork their
+                        // own daemon and the launcher exits in <50ms,
+                        // so there's nothing to reap; the kernel
+                        // reparents to init. Failures are surfaced as
+                        // status-bar warnings.
+                        use std::process::{Command as ProcCommand, Stdio};
+                        let spawn = ProcCommand::new(&editor)
+                            .arg(&path)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                        match spawn {
+                            Ok(_child) => {
+                                self.state.warning = Some(format!("opened {} in {}", path, editor));
+                            }
+                            Err(e) => {
+                                self.state.warning = Some(format!("editor `{editor}` failed: {e}"));
+                            }
+                        }
                     }
                     other => {
                         // Sync send: unbounded, never blocks, never

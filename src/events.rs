@@ -127,6 +127,13 @@ pub enum Command {
     /// the picker emits `SetTheme { original, persist: false }` to
     /// revert the UI without touching disk.
     SetTheme { name: String, persist: bool },
+    /// Spawn the configured external editor (`bosun editor <cmd>` /
+    /// `editor = "..."` in config.toml) against the highlighted
+    /// session's path. Intercepted by the app loop — runs
+    /// `<editor> <path>` detached so the TUI keeps the foreground.
+    /// The reducer pre-resolves both fields so the loop just calls
+    /// `Command::new(...).spawn()`.
+    OpenEditor { editor: String, path: String },
     /// Graceful shutdown signal.
     #[allow(dead_code)]
     Shutdown,

@@ -113,6 +113,12 @@ pub struct Config {
     /// banner. Per-section overrides live on `Section.banner_font`.
     /// Persisted in `config.toml` as `banner_font = "metalix"`.
     pub banner_font: String,
+    /// External editor command launched by the `e` key on a highlighted
+    /// session — bosun runs `<editor> <session_path>` detached. `None`
+    /// means "no editor configured"; pressing `e` warns in the status
+    /// bar. Set via `bosun editor <cmd>` or directly in `config.toml`
+    /// as `editor = "zed"` (or `code`, `subl`, `nvim`, ...).
+    pub editor: Option<String>,
 }
 
 impl Default for Config {
@@ -126,6 +132,7 @@ impl Default for Config {
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
+            editor: None,
         }
     }
 }
@@ -162,6 +169,10 @@ struct ConfigFile {
     /// `Config::load` falls back to `banner::default_name()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     banner_font: Option<String>,
+    /// External editor command for the `e`-key launch. `None` means
+    /// unset; `e` will warn until the user configures one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    editor: Option<String>,
 }
 
 impl Config {
@@ -220,6 +231,14 @@ impl Config {
         let banner_font = file
             .banner_font
             .unwrap_or_else(|| crate::ui::banner::default_name().to_string());
+        // Editor is intentionally not env-overridable. It's a persistent
+        // user preference, not a per-session knob, and putting it on
+        // $EDITOR would conflict with the conventional terminal-editor
+        // meaning ($EDITOR is usually `vim` / `nvim` — not what a user
+        // wants the `e` key to spawn against a project path).
+        let editor = file
+            .editor
+            .and_then(|e| if e.trim().is_empty() { None } else { Some(e) });
 
         Self {
             session_prefix,
@@ -230,6 +249,7 @@ impl Config {
             sidebar,
             session_history,
             banner_font,
+            editor,
         }
     }
 
@@ -367,6 +387,30 @@ pub fn write_banner_font(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the editor command to `config.toml`. Pass `None` to clear
+/// the field. Same read-modify-write approach as `write_theme` so
+/// other fields survive intact.
+pub fn write_editor(editor: Option<&str>) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = read_config_file().unwrap_or_default();
+    file.editor = editor
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Persist the divider position to `config.toml`. Same
 /// read-modify-write approach as `write_theme`.
 pub fn write_divider_x(x: Option<u16>) -> std::io::Result<()> {
@@ -481,6 +525,7 @@ mod tests {
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
+            editor: None,
         }
     }
 
@@ -518,6 +563,7 @@ mod tests {
             sidebar: SidebarModel::default(),
             session_history: std::collections::HashMap::new(),
             banner_font: crate::ui::banner::default_name().to_string(),
+            editor: None,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
@@ -542,5 +588,11 @@ mod tests {
         assert!(parsed.session_prefix.is_none());
         assert!(parsed.tmux_socket.is_none());
         assert!(parsed.theme.is_none());
+    }
+
+    #[test]
+    fn editor_field_parses() {
+        let parsed: ConfigFile = toml::from_str(r#"editor = "zed""#).unwrap();
+        assert_eq!(parsed.editor.as_deref(), Some("zed"));
     }
 }

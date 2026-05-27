@@ -4,6 +4,19 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.11] — 2026-05-27
+
+### Added
+- **Open session path in an external editor (`e` key).** With a session
+  highlighted on the main list, press `e` to launch your configured
+  editor (`zed`, `code`, `subl`, `nvim`, etc.) against the session's
+  working directory. The editor is set with the new `bosun editor
+  <cmd>` CLI subcommand (e.g. `bosun editor zed`) and persisted to
+  `config.toml` as `editor = "zed"`. Run `bosun editor` with no
+  argument to print the current value, or `bosun editor ""` to clear
+  it. Status bar now includes `e edit`, and the `?` help modal lists
+  the binding under Sessions.
+
 ## [0.3.10] — 2026-05-25
 
 ### Added

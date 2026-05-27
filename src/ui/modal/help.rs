@@ -259,6 +259,7 @@ fn build_rows() -> Vec<Row> {
         Binding("r", "Rename session (on header: rename section)"),
         Binding("R", "Restart — kill + recreate with same spec"),
         Binding("d", "Kill session (on header: delete section)"),
+        Binding("e", "Open session's path in configured editor"),
         Binding("Ctrl+R", "Force immediate refresh"),
         Blank,
         Section("Organize"),
