@@ -52,10 +52,20 @@ pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
 
     match key.code {
         KeyCode::Char(c) => Some(encode_char(c, ctrl, alt)),
-        KeyCode::Enter => prepend_alt(alt, b"\r".to_vec()),
-        KeyCode::Tab => prepend_alt(alt, b"\t".to_vec()),
+        // Enter / Tab / Backspace with a non-trivial modifier emit
+        // the xterm `modifyOtherKeys=2` form so apps that opt in to
+        // that protocol (Claude Code, kitty, recent xterm, etc.)
+        // can distinguish e.g. Shift+Enter from plain Enter. Plain
+        // (no modifier) keeps the bare byte for everything else.
+        // Apps that don't understand modifyOtherKeys will see the
+        // escape sequence as an unknown CSI and typically drop it
+        // silently — strictly better than the prior behavior of
+        // sending Shift+Enter as a literal `\r` (i.e. submit) and
+        // confusing the user.
+        KeyCode::Enter => Some(modified_or(13, shift, ctrl, alt, b"\r")),
+        KeyCode::Tab => Some(modified_or(9, shift, ctrl, alt, b"\t")),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Backspace => prepend_alt(alt, b"\x7f".to_vec()),
+        KeyCode::Backspace => Some(modified_or(127, shift, ctrl, alt, b"\x7f")),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
         KeyCode::Left => Some(arrow_seq(b'D', shift, ctrl, alt)),
         KeyCode::Right => Some(arrow_seq(b'C', shift, ctrl, alt)),
@@ -125,6 +135,7 @@ fn ctrl_char_bytes(c: char) -> Vec<u8> {
     vec![byte]
 }
 
+#[allow(dead_code)]
 fn prepend_alt(alt: bool, bytes: Vec<u8>) -> Option<Vec<u8>> {
     if alt {
         let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -134,6 +145,25 @@ fn prepend_alt(alt: bool, bytes: Vec<u8>) -> Option<Vec<u8>> {
     } else {
         Some(bytes)
     }
+}
+
+/// xterm `modifyOtherKeys=2` encoding: `\e[27;<mod>;<keycode>~`.
+/// When no modifier is active (`mod == 1`), returns the plain
+/// `bare` bytes so backwards-compat is preserved for apps that
+/// don't understand the protocol. Callers pass the key's
+/// codepoint as `keycode` (e.g. 13 for Enter, 9 for Tab).
+fn modified_or(keycode: u16, shift: bool, ctrl: bool, alt: bool, bare: &[u8]) -> Vec<u8> {
+    let code = modifier_code(shift, ctrl, alt);
+    if code == 1 {
+        return bare.to_vec();
+    }
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(b"\x1b[27;");
+    out.extend_from_slice(code.to_string().as_bytes());
+    out.push(b';');
+    out.extend_from_slice(keycode.to_string().as_bytes());
+    out.push(b'~');
+    out
 }
 
 /// CSI-letter sequences (`ESC [ <mods> <letter>`) used by arrow
@@ -261,10 +291,46 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_uses_modify_other_keys() {
+        // Mod code 2 = shift. Keycode 13 = Enter (\r). Claude Code
+        // listens for this exact sequence to insert a newline
+        // without submitting.
+        assert_eq!(
+            encode(k(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(b"\x1b[27;2;13~".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_uses_modify_other_keys() {
+        // Mod code 5 = ctrl.
+        assert_eq!(
+            encode(k(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(b"\x1b[27;5;13~".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_tab_uses_modify_other_keys() {
+        assert_eq!(
+            encode(k(KeyCode::Tab, KeyModifiers::CONTROL)),
+            Some(b"\x1b[27;5;9~".to_vec())
+        );
+    }
+
+    #[test]
     fn backspace_is_del() {
         assert_eq!(
             encode(k(KeyCode::Backspace, KeyModifiers::NONE)),
             Some(b"\x7f".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_uses_modify_other_keys() {
+        assert_eq!(
+            encode(k(KeyCode::Backspace, KeyModifiers::CONTROL)),
+            Some(b"\x1b[27;5;127~".to_vec())
         );
     }
 

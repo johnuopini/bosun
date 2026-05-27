@@ -290,6 +290,20 @@ impl EmbedTerminal {
         self.mode
     }
 
+    /// True iff the inner app has enabled some flavor of mouse
+    /// tracking (DECSET 1000 / 1002 / 1003). The vt100 parser
+    /// tracks this from the byte stream; callers use it to gate
+    /// mouse forwarding so apps that *didn't* opt into mouse
+    /// don't get SGR-1006 sequences pumped into their stdin (which
+    /// they'd interpret as literal escape bytes — visible garbage
+    /// at best, broken input at worst).
+    pub fn wants_mouse(&self) -> bool {
+        !matches!(
+            self.parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        )
+    }
+
     pub fn session(&self) -> &str {
         &self.session
     }

@@ -1,7 +1,9 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -96,7 +98,12 @@ async fn main() -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         emergency_unbind(socket_for_hook.as_deref());
         emergency_status_bar(socket_for_hook.as_deref());
         default_hook(info);
@@ -116,7 +123,19 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // session list and preview pane can see clicks and drags. We
     // tear it down around `tmux attach` so tmux owns the mouse
     // during an attach (see `App::perform_attach`).
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(BosunError::Io)?;
+    // Bracketed paste lets crossterm hand us pasted text as one
+    // `Event::Paste(String)` rather than character-by-character
+    // `Event::Key` events. The outer terminal also encodes
+    // drag-drop file paths and image markers using the same
+    // protocol, so this is the path for "I dropped an image onto
+    // bosun" → forward to the focused embed PTY.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .map_err(BosunError::Io)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(BosunError::Io)
 }
@@ -125,6 +144,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     disable_raw_mode().map_err(BosunError::Io)?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
     )

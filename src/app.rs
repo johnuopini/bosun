@@ -445,6 +445,15 @@ impl AppState {
                 // problem.
                 tracing::warn!("EmbedBytes reached reducer — App::run intercept is broken");
             }
+            AppMsg::Paste(_) => {
+                // Paste handling lives on the App side too — the
+                // only currently-meaningful target is the embed
+                // PTY when focused. App::run intercepts before
+                // calling apply(). Reaching here means no embed
+                // (or not focused), in which case dropping is the
+                // right move; no modal currently expects pasted
+                // text directly.
+            }
             AppMsg::Key(k) => {
                 // Route through open modals first. Most modals consume
                 // everything they see so typing in a text field doesn't
@@ -1356,6 +1365,63 @@ impl App {
                     // (unusual), the screen is unchanged anyway.
                     continue;
                 }
+                if let AppMsg::Paste(text) = &msg {
+                    // Wrap in bracketed-paste markers so apps that
+                    // opted in (most modern shells, vim, Claude
+                    // Code, etc.) treat the whole block as a paste
+                    // rather than executing line-by-line. Outer
+                    // terminals deliver drag-dropped file paths
+                    // and image markers via this same path, so
+                    // this is also "I dropped an image onto bosun"
+                    // working correctly.
+                    if let Some(embed) = self.embed.as_mut() {
+                        let mut buf = Vec::with_capacity(text.len() + b"\x1b[200~\x1b[201~".len());
+                        buf.extend_from_slice(b"\x1b[200~");
+                        buf.extend_from_slice(text.as_bytes());
+                        buf.extend_from_slice(b"\x1b[201~");
+                        if let Err(e) = embed.write(&buf) {
+                            tracing::warn!("embed paste write: {}", e);
+                        }
+                    }
+                    continue;
+                }
+                if let AppMsg::Mouse(m) = &msg {
+                    // Forward mouse events to the PTY only when:
+                    //   (a) the inner app has enabled mouse tracking
+                    //       (otherwise we'd dump SGR-1006 escape
+                    //       bytes into a shell that interprets them
+                    //       as literal text), and
+                    //   (b) the event lands inside the preview /
+                    //       embed rectangle (mouse over the sidebar
+                    //       or status bar still goes to bosun for
+                    //       divider drag etc).
+                    // Coordinates are translated to embed-local
+                    // 0-based; the encoder converts to the 1-based
+                    // form SGR 1006 expects.
+                    let wants = self.embed.as_ref().is_some_and(|e| e.wants_mouse());
+                    if wants {
+                        if let Some(area) = self.preview_rect() {
+                            if point_in_rect(area, m.column, m.row) {
+                                let local_col = m.column - area.x;
+                                let local_row = m.row - area.y;
+                                if let Some(bytes) =
+                                    crate::ui::mouse_encode::encode(*m, local_col, local_row)
+                                {
+                                    if let Some(embed) = self.embed.as_mut() {
+                                        if let Err(e) = embed.write(&bytes) {
+                                            tracing::warn!("embed mouse write: {}", e);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Mouse outside the embed area (or app doesn't
+                    // want mouse): fall through to bosun's normal
+                    // handler so divider drag etc. still works
+                    // even while focused.
+                }
             }
 
             // Fast path for embed PTY bytes. The reducer is pure and
@@ -1710,19 +1776,21 @@ impl App {
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
         )
         .map_err(BosunError::Io)?;
 
         // 2. Install binding + run attach (blocking).
         let result = attach_with_ctrl_q_detach(self.socket.as_deref(), name);
 
-        // 3. Re-enter raw mode / alt screen / mouse capture
-        //    regardless of attach result.
+        // 3. Re-enter raw mode / alt screen / mouse capture /
+        //    bracketed paste regardless of attach result.
         crossterm::terminal::enable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
         )
         .map_err(BosunError::Io)?;
         terminal.clear().map_err(term_err)?;
@@ -1915,6 +1983,18 @@ impl App {
     /// all — the embed grid stays sized to something `vt100` accepts
     /// even though no rendering happens.
     fn preview_dims(&self) -> (u16, u16) {
+        match self.preview_rect() {
+            Some(p) => (p.height, p.width),
+            None => (4, 20),
+        }
+    }
+
+    /// Full preview rectangle (in terminal coords) for the current
+    /// layout. `None` on narrow terminals where the preview is
+    /// hidden. Used by mouse forwarding to decide whether an event
+    /// lands inside the embed area and to translate to local
+    /// coordinates.
+    fn preview_rect(&self) -> Option<ratatui::layout::Rect> {
         use ratatui::layout::Rect;
         let area = Rect {
             x: 0,
@@ -1922,12 +2002,18 @@ impl App {
             width: self.state.term_size.0,
             height: self.state.term_size.1,
         };
-        let layouts = crate::ui::layout::compute(area, self.state.divider_x);
-        match layouts.preview {
-            Some(p) => (p.height, p.width),
-            None => (4, 20),
-        }
+        crate::ui::layout::compute(area, self.state.divider_x).preview
     }
+}
+
+/// True iff `(col, row)` lands inside `rect`. Both ratatui `Rect`
+/// and crossterm coords are 0-based + half-open, so this is the
+/// standard containment check.
+fn point_in_rect(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 #[cfg(test)]

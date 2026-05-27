@@ -162,6 +162,17 @@ pub enum AppMsg {
     /// between the session list and preview. Dropped by non-mouse
     /// consumers.
     Mouse(MouseEvent),
+    /// A paste event from the terminal (bracketed paste). Crossterm
+    /// decodes `\e[200~ ... \e[201~` sequences from the outer
+    /// terminal and hands us the inner text as a `String`. Outer
+    /// terminals also use bracketed paste to deliver drag-drop
+    /// content (file paths, image markers), so this is the path
+    /// for "I dropped a file onto bosun". When the embed is
+    /// focused we re-wrap and forward to the embed PTY; otherwise
+    /// bosun ignores it (no modal currently accepts pasted text
+    /// directly — they all go through `Key(c)` events for
+    /// individual characters).
+    Paste(String),
     /// Terminal was resized.
     Resize(u16, u16),
     /// Fresh session list from tmux, with smoothed status and optional

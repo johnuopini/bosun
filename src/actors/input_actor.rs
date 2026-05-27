@@ -113,7 +113,12 @@ pub fn spawn(tx: mpsc::UnboundedSender<AppMsg>) -> Handle {
                             break;
                         }
                     }
-                    Ok(Event::FocusGained) | Ok(Event::FocusLost) | Ok(Event::Paste(_)) => {
+                    Ok(Event::Paste(text)) => {
+                        if tx.send(AppMsg::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::FocusGained) | Ok(Event::FocusLost) => {
                         // Not interested — drop the event and keep polling.
                     }
                     Err(e) => {

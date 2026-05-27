@@ -3,6 +3,7 @@ pub mod embed_terminal;
 pub mod key_encode;
 pub mod layout;
 pub mod modal;
+pub mod mouse_encode;
 pub mod preview;
 pub mod section_preview;
 pub mod session_list;
