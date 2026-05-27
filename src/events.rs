@@ -179,6 +179,16 @@ pub enum AppMsg {
     /// no longer in the list (it was killed between capture and
     /// delivery).
     PreviewRefreshed { name: String, bytes: Arc<[u8]> },
+    /// A chunk of bytes read from an embedded terminal's PTY (2.0+).
+    /// `session` is the internal tmux session name the embed was
+    /// spawned for. The app handler discards the chunk if the
+    /// currently-active embed isn't for the same session (stale
+    /// chunks from a previous embed instance after focus switch);
+    /// otherwise it feeds the bytes into the embed's vt100 parser.
+    /// Each chunk arrives from a dedicated reader thread inside
+    /// `EmbedTerminal` and triggers a normal redraw on the next
+    /// iteration of the app event loop.
+    EmbedBytes { session: String, bytes: Vec<u8> },
     /// An attach just started — the UI should render a placeholder
     /// while we block in `tmux attach`.
     AttachStarted { name: String },

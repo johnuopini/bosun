@@ -129,6 +129,16 @@ pub struct Config {
     /// full refresh). Override with `preview_tick_ms = 250` in
     /// `config.toml` or `BOSUN_PREVIEW_TICK_MS=300` in the env.
     pub preview_tick_ms: u64,
+    /// Embedded-terminal preview (2.0+): when true, the focused
+    /// session's preview pane is a real `vt100`-parsed embedded
+    /// terminal streaming from `tmux attach -r`, rather than a
+    /// periodic `capture-pane` snapshot. Default true. Disable with
+    /// `embed = false` in `config.toml` or `BOSUN_EMBED=0` /
+    /// `BOSUN_EMBED=off` in the env to fall back to the v0.4 polled
+    /// preview path. Non-focused sessions and section/empty-state
+    /// previews are unaffected — they always use the polled path
+    /// (they don't need a PTY).
+    pub embed_enabled: bool,
 }
 
 impl Default for Config {
@@ -144,6 +154,7 @@ impl Default for Config {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
         }
     }
 }
@@ -151,6 +162,11 @@ impl Default for Config {
 /// Default fast preview tick in milliseconds. 200ms = 5 fps on the
 /// focused session's preview pane. See `Config::preview_tick_ms`.
 pub const DEFAULT_PREVIEW_TICK_MS: u64 = 200;
+
+/// Default for `Config::embed_enabled`. v2.0+ ships with the
+/// embedded-terminal preview on; set to false here to invert the
+/// default if early adopters report regressions.
+pub const DEFAULT_EMBED_ENABLED: bool = true;
 
 /// Shape of `config.toml` on disk. All fields are optional and
 /// defaulted independently so a half-written file still loads.
@@ -191,6 +207,9 @@ struct ConfigFile {
     /// Fast preview tick in milliseconds. See `Config::preview_tick_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preview_tick_ms: Option<u64>,
+    /// Embedded-terminal preview opt-out. See `Config::embed_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed: Option<bool>,
 }
 
 impl Config {
@@ -267,6 +286,18 @@ impl Config {
             .or(file.preview_tick_ms)
             .unwrap_or(DEFAULT_PREVIEW_TICK_MS);
 
+        // Embed opt-out: accept `0`, `false`, `off`, `no` (case-
+        // insensitive) as disable; anything else as enable. Mirrors
+        // the conventional shell-flag idiom. Env beats file beats
+        // default.
+        let embed_enabled = match env::var("BOSUN_EMBED") {
+            Ok(s) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => file.embed.unwrap_or(DEFAULT_EMBED_ENABLED),
+        };
+
         Self {
             session_prefix,
             tmux_socket,
@@ -278,6 +309,7 @@ impl Config {
             banner_font,
             editor,
             preview_tick_ms,
+            embed_enabled,
         }
     }
 
@@ -555,6 +587,7 @@ mod tests {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
         }
     }
 
@@ -594,6 +627,7 @@ mod tests {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

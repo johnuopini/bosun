@@ -22,9 +22,16 @@ use ratatui::Frame;
 
 use crate::app::AppState;
 use crate::sidebar::{Location, VisibleKind};
+use crate::ui::embed_terminal::EmbedTerminal;
 use crate::ui::{banner, section_preview, Theme};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    embed: Option<&EmbedTerminal>,
+) {
     // Reset every cell in the preview area to Color::Reset before drawing
     // so any leftover styling from a previous frame (e.g. the placeholder
     // text) doesn't bleed through into a later TUI capture.
@@ -63,6 +70,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     font,
                     theme,
                 );
+                return;
+            }
+        }
+    }
+
+    // 2.0 fast path: if there's a live embed and its session matches
+    // the cursor's selection, render the vt100 grid via tui-term.
+    // The embed gets a real-time stream from the PTY, no scroll math
+    // required — vt100 already maintains the right scrollback row
+    // alignment inside its screen grid. Falls through to the polled
+    // snapshot path for non-focused sessions, when the embed is
+    // disabled, or when the spawn failed.
+    if let Some(embed) = embed {
+        if let Some(name) = state.selected_session_name() {
+            if embed.session() == name {
+                embed.render(frame.buffer_mut(), area);
                 return;
             }
         }

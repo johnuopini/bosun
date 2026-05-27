@@ -1,4 +1,5 @@
 pub mod banner;
+pub mod embed_terminal;
 pub mod layout;
 pub mod modal;
 pub mod preview;
@@ -12,15 +13,16 @@ use ratatui::style::Style;
 use ratatui::Frame;
 
 use crate::app::AppState;
+use crate::ui::embed_terminal::EmbedTerminal;
 pub use theme::Theme;
 
-pub fn draw(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
+pub fn draw(frame: &mut Frame<'_>, state: &AppState, theme: &Theme, embed: Option<&EmbedTerminal>) {
     let area = frame.area();
     let l = layout::compute(area, state.divider_x);
     session_list::render(frame, l.list, state, theme);
     // Preview is hidden on narrow terminals (mobile / mosh).
     if let Some(preview_area) = l.preview {
-        preview::render(frame, preview_area, state, theme);
+        preview::render(frame, preview_area, state, theme, embed);
     }
     // Divider glyph sits between list and preview in wide mode.
     // Accent color while the user is dragging, muted otherwise so

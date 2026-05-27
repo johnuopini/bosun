@@ -427,6 +427,16 @@ impl AppState {
                     view.preview = Some(bytes);
                 }
             }
+            AppMsg::EmbedBytes { .. } => {
+                // The reducer is pure and AppState doesn't own the
+                // embed (the App struct does — embed has runtime
+                // resources that don't belong in pure state). The
+                // App::run loop intercepts EmbedBytes before calling
+                // apply() and feeds bytes into the embed directly,
+                // so reaching here is a code-path bug, not a runtime
+                // problem.
+                tracing::warn!("EmbedBytes reached reducer — App::run intercept is broken");
+            }
             AppMsg::Key(k) => {
                 // Route through open modals first. Most modals consume
                 // everything they see so typing in a text field doesn't
@@ -1171,6 +1181,16 @@ pub struct App {
     /// the user ends up needing to press Ctrl-Q twice because the
     /// first press is read by Bosun and silently dropped.
     input_handle: Option<input_actor::Handle>,
+    /// Embedded terminal for the focused session's preview (2.0+).
+    /// `None` when no session is focused, when the user has opted
+    /// out via `embed_enabled = false`, or when the embed spawn
+    /// failed (in which case the preview path falls back to the
+    /// v0.4 polled snapshot — bosun stays useful even if PTY/tmux
+    /// negotiation hits an edge case).
+    embed: Option<crate::ui::embed_terminal::EmbedTerminal>,
+    /// Sticky copy of `Config::embed_enabled`. `App::sync_embed`
+    /// reads this on every iteration to decide whether to spawn.
+    embed_enabled: bool,
 }
 
 impl App {
@@ -1232,6 +1252,8 @@ impl App {
             store,
             theme,
             input_handle: Some(input_handle),
+            embed: None,
+            embed_enabled: config.embed_enabled,
         }
     }
 
@@ -1255,7 +1277,7 @@ impl App {
         }
 
         terminal
-            .draw(|f| ui::draw(f, &self.state, &self.theme))
+            .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
             .map_err(term_err)?;
 
         while !self.state.quit {
@@ -1263,6 +1285,26 @@ impl App {
                 Some(m) => m,
                 None => break,
             };
+
+            // Fast path for embed PTY bytes. The reducer is pure and
+            // AppState doesn't own the embed (it's runtime state on
+            // the App struct), so we feed bytes here instead of
+            // routing through `apply()`. Stale chunks from a previous
+            // embed (session was switched between read and delivery)
+            // are silently dropped. Render still happens at the
+            // bottom of the loop so the new vt100 grid state shows
+            // up on screen.
+            if let AppMsg::EmbedBytes { session, bytes } = msg {
+                if let Some(embed) = self.embed.as_mut() {
+                    if embed.session() == session {
+                        embed.feed(&bytes);
+                    }
+                }
+                terminal
+                    .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                    .map_err(term_err)?;
+                continue;
+            }
 
             // Intercept UI-only commands here before anything reaches
             // the tmux actor. Some commands (InsertSection, RenameSection)
@@ -1420,6 +1462,18 @@ impl App {
                     h.shutdown().await;
                 }
 
+                // Drop the embed before handing the terminal to tmux.
+                // Two reasons: (1) the embed's reader thread would
+                // otherwise keep queueing EmbedBytes into evt_rx for
+                // the entire attach session — an attach to a busy
+                // pane could accumulate hundreds of MB in the channel
+                // before the user detaches. (2) On detach we want a
+                // clean reattach with the parser cleared, so the
+                // returning preview shows current state, not an
+                // out-of-date scrollback. `sync_embed` re-spawns
+                // automatically after the attach returns.
+                self.embed = None;
+
                 // Update the terminal title to reflect the attached session.
                 let display = self
                     .state
@@ -1451,6 +1505,12 @@ impl App {
                 loop {
                     match self.evt_rx.try_recv() {
                         Ok(AppMsg::SessionsRefreshed { .. }) => {}
+                        // Bytes from the embed we just dropped (or
+                        // from the brief window before the reader
+                        // saw EOF) — silently discarded. The new
+                        // embed `sync_embed` spawns will have its
+                        // own clean parser.
+                        Ok(AppMsg::EmbedBytes { .. }) => {}
                         Ok(other) => preserved.push(other),
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
@@ -1464,8 +1524,14 @@ impl App {
                 let _ = self.cmd_tx.send(Command::ListNow);
             }
 
+            // Reconcile the embed against the current selection
+            // (spawn / drop / resize on focus change or terminal
+            // resize). Runs once per AppMsg, which covers every
+            // selection-changing key + every Resize event.
+            self.sync_embed();
+
             terminal
-                .draw(|f| ui::draw(f, &self.state, &self.theme))
+                .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
                 .map_err(term_err)?;
         }
 
@@ -1519,6 +1585,85 @@ impl App {
             self.state.warning = Some(format!("attach: {}", e));
         }
         Ok(())
+    }
+
+    /// Reconcile the embed against the current selection. Called
+    /// once per main-loop iteration after `apply()` returns, plus
+    /// just after `perform_attach` returns. Decisions:
+    /// - `embed_enabled == false` → no embed, drop any current one.
+    /// - cursor not on a live session → no embed.
+    /// - cursor on the same session as the current embed → resize
+    ///   to the current preview area dims (idempotent if unchanged).
+    /// - cursor on a different live session → drop old, spawn new.
+    ///
+    /// Spawn failure is logged and surfaced as a status-bar warning
+    /// but is non-fatal — the preview falls back to the v0.4 polled
+    /// snapshot path automatically (it's still drawn from
+    /// `SessionView.preview`, which the fast-tick keeps populated).
+    fn sync_embed(&mut self) {
+        if !self.embed_enabled {
+            if self.embed.is_some() {
+                self.embed = None;
+            }
+            return;
+        }
+
+        // `selected_session()` returns Some only when the cursor is
+        // on a row that maps to a live SessionView — dead rows,
+        // section headers, and the empty state all yield None,
+        // which is the right "no embed" answer.
+        let target = self.state.selected_session().map(|v| v.name().to_string());
+        let current = self.embed.as_ref().map(|e| e.session().to_string());
+
+        if target != current {
+            self.embed = None;
+            if let Some(t) = target {
+                let (rows, cols) = self.preview_dims();
+                match crate::ui::embed_terminal::EmbedTerminal::spawn(
+                    self.socket.as_deref(),
+                    &t,
+                    rows,
+                    cols,
+                    self.evt_tx.clone(),
+                ) {
+                    Ok(e) => self.embed = Some(e),
+                    Err(err) => {
+                        tracing::warn!("embed spawn failed for {}: {}", t, err);
+                        self.state.warning = Some(format!("embed: {err}"));
+                    }
+                }
+            }
+            return;
+        }
+
+        // Same embed; ensure it's sized to the current preview area.
+        // resize() short-circuits if dims are unchanged so this is
+        // free on the steady-state path. Compute dims first so we
+        // don't borrow self both mutably and immutably.
+        let (rows, cols) = self.preview_dims();
+        if let Some(embed) = self.embed.as_mut() {
+            embed.resize(rows, cols);
+        }
+    }
+
+    /// Compute the current preview area dimensions in (rows, cols)
+    /// from cached `term_size` + `divider_x`. Returns the minimums
+    /// in the narrow-terminal case where there's no preview area at
+    /// all — the embed grid stays sized to something `vt100` accepts
+    /// even though no rendering happens.
+    fn preview_dims(&self) -> (u16, u16) {
+        use ratatui::layout::Rect;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: self.state.term_size.0,
+            height: self.state.term_size.1,
+        };
+        let layouts = crate::ui::layout::compute(area, self.state.divider_x);
+        match layouts.preview {
+            Some(p) => (p.height, p.width),
+            None => (4, 20),
+        }
     }
 }
 

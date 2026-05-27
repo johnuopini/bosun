@@ -38,17 +38,18 @@ signal-hook = "0.4"
 retrofont = "0.2"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
-
-[dev-dependencies]
-insta = "1.47"
-# Step 1 perf-spike deps for `examples/spike_term.rs`. Kept out of the main
-# binary deps on purpose until Step 2 decides go/no-go (see PLAN_2_0.md).
-# tui-term 0.3.x targets ratatui-core 0.1 / ratatui-widgets 0.3, which is what
-# ratatui 0.30 re-exports — so the widget renders into the same Buffer type
-# the main bin uses.
+# 2.0 embedded-terminal stack. tui-term 0.3.x targets ratatui-core 0.1 /
+# ratatui-widgets 0.3, the widget surface ratatui 0.30 re-exports. The
+# vt100 repo has been quiet but tui-term actively tracks it, and the dep is
+# small enough to vendor in a one-file swap if maintenance ever stops. See
+# RESEARCH_2_0.md for the choice rationale + the Step 4 fallback to
+# alacritty_terminal if focus-mode hits vt100's mouse / HVP gaps.
 portable-pty = "0.9"
 vt100 = "0.16"
 tui-term = "0.3"
+
+[dev-dependencies]
+insta = "1.47"
 
 [features]
 default = []
