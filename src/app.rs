@@ -1191,6 +1191,14 @@ pub struct App {
     /// Sticky copy of `Config::embed_enabled`. `App::sync_embed`
     /// reads this on every iteration to decide whether to spawn.
     embed_enabled: bool,
+    /// Tmux client. The tmux actor owns the primary copy and runs
+    /// all timed / notification-driven tmux work; we keep this
+    /// secondary handle so the app task itself can do synchronous
+    /// `capture_pane` calls — currently used at embed spawn to
+    /// prime the parser with the session's current screen, and at
+    /// detach exit (v0.4.1) to snap the polled preview to current
+    /// state before the next draw.
+    client: Arc<dyn TmuxClient>,
 }
 
 impl App {
@@ -1254,6 +1262,7 @@ impl App {
             input_handle: Some(input_handle),
             embed: None,
             embed_enabled: config.embed_enabled,
+            client,
         }
     }
 
@@ -1292,13 +1301,46 @@ impl App {
             // routing through `apply()`. Stale chunks from a previous
             // embed (session was switched between read and delivery)
             // are silently dropped. Render still happens at the
-            // bottom of the loop so the new vt100 grid state shows
+            // bottom of the branch so the new vt100 grid state shows
             // up on screen.
+            //
+            // Burst coalescing: when this chunk is the first of many
+            // (tmux attach -r's initial pane repaint, a `cargo build`
+            // flood, a Claude response that arrives in 20 chunks),
+            // draining the rest of the queue into the parser before
+            // drawing collapses the burst into one repaint instead
+            // of N. Without coalescing the user sees the burst
+            // animate over a couple of seconds; with it the final
+            // screen state appears in a single frame. Non-embed
+            // messages encountered during the drain are preserved
+            // and re-sent so the normal flow handles them on the
+            // next iteration.
             if let AppMsg::EmbedBytes { session, bytes } = msg {
                 if let Some(embed) = self.embed.as_mut() {
                     if embed.session() == session {
                         embed.feed(&bytes);
                     }
+                }
+                let mut preserved: Vec<AppMsg> = Vec::new();
+                use tokio::sync::mpsc::error::TryRecvError;
+                loop {
+                    match self.evt_rx.try_recv() {
+                        Ok(AppMsg::EmbedBytes {
+                            session: s2,
+                            bytes: b2,
+                        }) => {
+                            if let Some(embed) = self.embed.as_mut() {
+                                if embed.session() == s2 {
+                                    embed.feed(&b2);
+                                }
+                            }
+                        }
+                        Ok(other) => preserved.push(other),
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for m in preserved {
+                    let _ = self.evt_tx.send(m);
                 }
                 terminal
                     .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
@@ -1527,8 +1569,10 @@ impl App {
             // Reconcile the embed against the current selection
             // (spawn / drop / resize on focus change or terminal
             // resize). Runs once per AppMsg, which covers every
-            // selection-changing key + every Resize event.
-            self.sync_embed();
+            // selection-changing key + every Resize event. Awaits
+            // because spawn now primes the parser with a
+            // synchronous capture-pane snapshot.
+            self.sync_embed().await;
 
             terminal
                 .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
@@ -1600,7 +1644,7 @@ impl App {
     /// but is non-fatal — the preview falls back to the v0.4 polled
     /// snapshot path automatically (it's still drawn from
     /// `SessionView.preview`, which the fast-tick keeps populated).
-    fn sync_embed(&mut self) {
+    async fn sync_embed(&mut self) {
         if !self.embed_enabled {
             if self.embed.is_some() {
                 self.embed = None;
@@ -1619,11 +1663,31 @@ impl App {
             self.embed = None;
             if let Some(t) = target {
                 let (rows, cols) = self.preview_dims();
+                // Synchronously snapshot the session's current pane
+                // before spawning the embed, then prime the parser
+                // with those bytes. Without this, the parser would
+                // start blank and tmux's `attach -r` would stream
+                // its initial repaint of the existing pane content
+                // — the user sees that repaint render top-to-bottom
+                // over a couple of seconds (visible "scrollback
+                // replay" animation). Priming makes the very first
+                // post-switch frame show the current state. Any
+                // intermediate redraws caused by tmux's repaint
+                // bytes resolve to the same final screen, so the
+                // animation is invisible.
+                let snapshot = match self.client.capture_pane(&t).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::debug!("embed prime capture-pane({t}): {e}");
+                        None
+                    }
+                };
                 match crate::ui::embed_terminal::EmbedTerminal::spawn(
                     self.socket.as_deref(),
                     &t,
                     rows,
                     cols,
+                    snapshot.as_deref(),
                     self.evt_tx.clone(),
                 ) {
                     Ok(e) => self.embed = Some(e),

@@ -75,11 +75,21 @@ impl EmbedTerminal {
     /// `socket` (None = tmux default socket). Sized to (rows, cols),
     /// clamped to (MIN_ROWS, MIN_COLS). Forwards every PTY byte
     /// chunk to `evt_tx` as `AppMsg::EmbedBytes { session, bytes }`.
+    ///
+    /// `initial_snapshot` (typically the bytes from
+    /// `tmux capture-pane -p -e -J`) is fed into the vt100 parser
+    /// before the reader thread starts. The parser's screen begins
+    /// at the session's current state, so the first frame the user
+    /// sees after spawn is a coherent snapshot rather than an empty
+    /// grid being filled in by tmux's initial `attach -r` repaint.
+    /// Passing `None` is harmless — the parser just starts blank
+    /// and tmux's relay paints it over the next few hundred ms.
     pub fn spawn(
         socket: Option<&str>,
         session: &str,
         rows: u16,
         cols: u16,
+        initial_snapshot: Option<&[u8]>,
         evt_tx: mpsc::UnboundedSender<AppMsg>,
     ) -> std::io::Result<Self> {
         let rows = rows.max(MIN_ROWS);
@@ -157,9 +167,19 @@ impl EmbedTerminal {
             })
             .map_err(io_err("spawn reader"))?;
 
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        if let Some(snap) = initial_snapshot {
+            // Feed the capture-pane snapshot synchronously, before
+            // the first frame is rendered. The parser's screen now
+            // matches what the user would see if they attached
+            // directly — so the immediate draw shows a coherent
+            // view instead of an empty grid being filled in.
+            parser.process(snap);
+        }
+
         Ok(Self {
             session: session.to_string(),
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser,
             master: pair.master,
             child,
             stop,
