@@ -1,8 +1,70 @@
 # Bosun 2.0 — Implementation Plan
 
 **Branch:** `2.0`
-**Status:** Active
+**Status:** Active — Steps 0–4 landed; iterating on input + UX polish
 **Companion doc:** `EMBEDDED_TERMINAL_FEASIBILITY.md`
+
+## Status (rolling — most recent first)
+
+Branch is at `origin/2.0`, ahead of `main` by all commits below. Local
+release binary (`make install` → `~/.local/bin/bosun`) is in active
+A/B use against `0.4.1`.
+
+**Shipped on 2.0 (in order):**
+
+- **Single-window focus border** — accent-colored 1-cell outline
+  around the pane that currently has keyboard focus (list when
+  detached, embed when in single-window focus). Only drawn when
+  `single_window_mode` is on. Overlays perimeter cells; PTY dims
+  stay stable across focus toggles.
+- **DECCKM (cursor-key application mode)** in `key_encode` — arrow
+  keys emit SS3 (`\eOA`) form when the embed's vt100 parser has
+  application-cursor mode on, CSI (`\e[A`) otherwise. Fixes Vim /
+  fzf / Claude Code arrow handling inside the embed.
+- **Input layer arc** — modifyOtherKeys for Enter/Tab/Backspace with
+  Shift/Ctrl/Alt (Shift+Enter newline in Claude Code etc.),
+  bracketed paste forwarding (image drop produces `[Image #N]`),
+  SGR 1006 mouse forwarding (click-to-cursor, scrollback wheel).
+- **Window-size cleanup** — dropped `force_resize_window` /
+  `ignore-size` strategy; bosun clients now participate in
+  `window-size=latest` negotiation, with a one-shot
+  `tmux set-option window-size latest` on embed spawn to clear any
+  stale `manual` pinning from older bosun runs.
+- **Single-window mode toggle (`s`)** — global "preview pane is the
+  workspace" mode replaces the per-session `f` focus key. Enter /
+  Right attaches inside the preview rather than going full-screen
+  tmux; sidebar stays visible the whole time. Persisted via
+  `Command::SaveSingleWindow`.
+- **Step 4 MVP — focus mode** — `enter_focus` / `exit_focus` plumbed
+  through `App::run`; Ctrl-Q detaches.
+- **Step 3 — Level 1 embed** — `EmbedTerminal` with `portable-pty` +
+  `vt100` + `tui-term`. Parser primed with sync `capture-pane`
+  snapshot; byte bursts drained before each draw to avoid the
+  multi-second scrollback replay we saw on first attach.
+- **Step 2 decision** — recorded GO on Step 3 in `decision.md`.
+- **Step 1 perf spike** — `examples/spike_term.rs` confirmed the
+  PTY/vt100/tui-term stack sustains realistic loads; spike feels
+  ~indistinguishable from native tmux for the test workloads.
+- **Step 0 fast preview polling** — `preview_tick_ms` (default 200,
+  env `BOSUN_PREVIEW_TICK_MS`); cherry-picked separately to `main`
+  and shipped as v0.4.0.
+
+**Deferred (documented in commit messages, not yet started):**
+
+- modifyOtherKeys mode tracking (parse DECSET 2027 / 1037 from byte
+  stream so we only emit the extended encoding when the application
+  asked for it).
+- Kitty keyboard protocol (CSI u).
+- Application keypad mode (DECPAM) handling for numpad.
+- Workspaces (`bosun.toml` per project, auto-launch N agents).
+- Broadcast / macros, RPC, snapshot scrubber, cost telemetry — see
+  "2.0 ideas backlog" below.
+
+**Open polish question:** the focus border currently overlays the
+embed's perimeter cells. If that ends up bothering us in real use,
+the alternative is to shrink the embed inner area + resize the PTY
+by 1 on each side. Stable dims either way, just different trade-off
+on whether the outline masks content vs. occupies dedicated space.
 
 ## What 2.0 is about
 

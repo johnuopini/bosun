@@ -71,7 +71,7 @@ fn render(state: &AppState, width: u16, height: u16) -> String {
     let mut terminal = Terminal::new(backend).unwrap();
     let theme = Theme::default_opencode();
     terminal
-        .draw(|f| bosun::ui::draw(f, state, &theme, None))
+        .draw(|f| bosun::ui::draw(f, state, &theme, None, false))
         .unwrap();
     // TestBackend exposes a Buffer; dump the visible characters.
     let buf = terminal.backend().buffer();

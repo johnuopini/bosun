@@ -1328,7 +1328,15 @@ impl App {
         }
 
         terminal
-            .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+            .draw(|f| {
+                ui::draw(
+                    f,
+                    &self.state,
+                    &self.theme,
+                    self.embed.as_ref(),
+                    self.embed_focused,
+                )
+            })
             .map_err(term_err)?;
 
         while !self.state.quit {
@@ -1480,7 +1488,15 @@ impl App {
                     let _ = self.evt_tx.send(m);
                 }
                 terminal
-                    .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
                     .map_err(term_err)?;
                 continue;
             }
@@ -1661,7 +1677,15 @@ impl App {
                 if want_single_window {
                     self.enter_focus().await;
                     terminal
-                        .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                        .draw(|f| {
+                            ui::draw(
+                                f,
+                                &self.state,
+                                &self.theme,
+                                self.embed.as_ref(),
+                                self.embed_focused,
+                            )
+                        })
                         .map_err(term_err)?;
                     continue;
                 }
@@ -1751,7 +1775,15 @@ impl App {
             self.sync_embed().await;
 
             terminal
-                .draw(|f| ui::draw(f, &self.state, &self.theme, self.embed.as_ref()))
+                .draw(|f| {
+                    ui::draw(
+                        f,
+                        &self.state,
+                        &self.theme,
+                        self.embed.as_ref(),
+                        self.embed_focused,
+                    )
+                })
                 .map_err(term_err)?;
         }
 
