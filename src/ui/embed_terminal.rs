@@ -304,6 +304,16 @@ impl EmbedTerminal {
         )
     }
 
+    /// True iff the inner app has enabled DECCKM (cursor-key
+    /// application mode, DECSET 1). When on, arrow keys are
+    /// expected as SS3 sequences (`\eOA/B/C/D`) instead of the
+    /// default CSI form (`\e[A/B/C/D`). vim in command mode,
+    /// readline, and some TUI apps care about this distinction;
+    /// most modern terminals/apps handle both forms gracefully.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
     pub fn session(&self) -> &str {
         &self.session
     }

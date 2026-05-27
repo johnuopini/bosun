@@ -1351,11 +1351,19 @@ impl App {
                         && k.modifiers.contains(KeyModifiers::CONTROL);
                     if is_ctrl_q {
                         self.exit_focus().await;
-                    } else if let Some(bytes) = crate::ui::key_encode::encode(*k) {
-                        if let Some(embed) = self.embed.as_mut() {
-                            if let Err(e) = embed.write(&bytes) {
-                                tracing::warn!("embed write: {}", e);
-                                self.state.warning = Some(format!("focus: write failed: {e}"));
+                    } else {
+                        let ctx = crate::ui::key_encode::EncodeContext {
+                            application_cursor: self
+                                .embed
+                                .as_ref()
+                                .is_some_and(|e| e.application_cursor()),
+                        };
+                        if let Some(bytes) = crate::ui::key_encode::encode(*k, ctx) {
+                            if let Some(embed) = self.embed.as_mut() {
+                                if let Err(e) = embed.write(&bytes) {
+                                    tracing::warn!("embed write: {}", e);
+                                    self.state.warning = Some(format!("focus: write failed: {e}"));
+                                }
                             }
                         }
                     }

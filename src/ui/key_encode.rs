@@ -32,11 +32,25 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+/// Encoding context — knobs the inner app has communicated
+/// through its DECSET stream that change the right byte sequence
+/// for a given key press. Currently a single field; held as a
+/// struct so future additions (modifyOtherKeys mode tracking,
+/// kitty keyboard flags, application keypad) slot in without
+/// churning every call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeContext {
+    /// DECCKM (cursor-key application mode). When true, arrow
+    /// keys and Home/End use the SS3 form (`\eOA` etc.) instead
+    /// of the default CSI form (`\e[A` etc.).
+    pub application_cursor: bool,
+}
+
 /// Encode a `KeyEvent` into the byte sequence to write to the
 /// child's PTY. Returns `None` for events we explicitly don't
 /// forward — currently key-release events on terminals that report
 /// them, and Null / unmapped function keys.
-pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
+pub fn encode(key: KeyEvent, ctx: EncodeContext) -> Option<Vec<u8>> {
     // Only forward presses. Some terminals (kitty, foot, recent
     // alacritty with kitty keyboard) also emit Release events;
     // forwarding those would double every keystroke from the
@@ -67,12 +81,12 @@ pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Backspace => Some(modified_or(127, shift, ctrl, alt, b"\x7f")),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
-        KeyCode::Left => Some(arrow_seq(b'D', shift, ctrl, alt)),
-        KeyCode::Right => Some(arrow_seq(b'C', shift, ctrl, alt)),
-        KeyCode::Up => Some(arrow_seq(b'A', shift, ctrl, alt)),
-        KeyCode::Down => Some(arrow_seq(b'B', shift, ctrl, alt)),
-        KeyCode::Home => Some(arrow_seq(b'H', shift, ctrl, alt)),
-        KeyCode::End => Some(arrow_seq(b'F', shift, ctrl, alt)),
+        KeyCode::Left => Some(arrow_seq(b'D', shift, ctrl, alt, ctx.application_cursor)),
+        KeyCode::Right => Some(arrow_seq(b'C', shift, ctrl, alt, ctx.application_cursor)),
+        KeyCode::Up => Some(arrow_seq(b'A', shift, ctrl, alt, ctx.application_cursor)),
+        KeyCode::Down => Some(arrow_seq(b'B', shift, ctrl, alt, ctx.application_cursor)),
+        KeyCode::Home => Some(arrow_seq(b'H', shift, ctrl, alt, ctx.application_cursor)),
+        KeyCode::End => Some(arrow_seq(b'F', shift, ctrl, alt, ctx.application_cursor)),
         KeyCode::PageUp => Some(tilde_seq(b"5", shift, ctrl, alt)),
         KeyCode::PageDown => Some(tilde_seq(b"6", shift, ctrl, alt)),
         KeyCode::Insert => Some(tilde_seq(b"2", shift, ctrl, alt)),
@@ -167,12 +181,20 @@ fn modified_or(keycode: u16, shift: bool, ctrl: bool, alt: bool, bare: &[u8]) ->
 }
 
 /// CSI-letter sequences (`ESC [ <mods> <letter>`) used by arrow
-/// keys, Home, End. Bare form is `CSI A`; with mods it's
-/// `CSI 1; <code> A` per xterm's encoding.
-fn arrow_seq(letter: u8, shift: bool, ctrl: bool, alt: bool) -> Vec<u8> {
+/// keys, Home, End. With no modifiers, the bare form depends on
+/// DECCKM (cursor-key application mode): SS3 `ESC O <letter>` when
+/// the inner app has enabled it (vim command mode, readline,
+/// etc.), CSI `ESC [ <letter>` otherwise. With modifiers it's
+/// always `CSI 1; <code> <letter>` regardless of DECCKM — xterm's
+/// modified-arrow encoding is the same in both modes.
+fn arrow_seq(letter: u8, shift: bool, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
     let code = modifier_code(shift, ctrl, alt);
     if code == 1 {
-        vec![0x1b, b'[', letter]
+        if app_cursor {
+            vec![0x1b, b'O', letter]
+        } else {
+            vec![0x1b, b'[', letter]
+        }
     } else {
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(b"\x1b[1;");
@@ -252,6 +274,14 @@ mod tests {
 
     fn k(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// Encode shim that fills in a default (cursor-mode off)
+    /// context so the bulk of the existing tests don't need to
+    /// pass it explicitly. DECCKM-specific tests construct the
+    /// context themselves.
+    fn encode(key: KeyEvent) -> Option<Vec<u8>> {
+        super::encode(key, EncodeContext::default())
     }
 
     #[test]
@@ -351,6 +381,58 @@ mod tests {
         assert_eq!(
             encode(k(KeyCode::Left, KeyModifiers::NONE)),
             Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_bare_application_cursor_mode() {
+        // DECCKM on: SS3 form instead of CSI.
+        let ctx = EncodeContext {
+            application_cursor: true,
+        };
+        assert_eq!(
+            super::encode(k(KeyCode::Up, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            super::encode(k(KeyCode::Down, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            super::encode(k(KeyCode::Right, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOC".to_vec())
+        );
+        assert_eq!(
+            super::encode(k(KeyCode::Left, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOD".to_vec())
+        );
+    }
+
+    #[test]
+    fn arrow_with_modifier_ignores_application_cursor() {
+        // Modified arrows use the same `\e[1;<code>X` form in
+        // both modes — DECCKM only affects the bare form.
+        let ctx = EncodeContext {
+            application_cursor: true,
+        };
+        assert_eq!(
+            super::encode(k(KeyCode::Up, KeyModifiers::SHIFT), ctx),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+    }
+
+    #[test]
+    fn home_end_obey_application_cursor() {
+        let ctx = EncodeContext {
+            application_cursor: true,
+        };
+        assert_eq!(
+            super::encode(k(KeyCode::Home, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            super::encode(k(KeyCode::End, KeyModifiers::NONE), ctx),
+            Some(b"\x1bOF".to_vec())
         );
     }
 
