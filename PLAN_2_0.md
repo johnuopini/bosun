@@ -134,12 +134,20 @@ Only execute if Step 3 is solid and we still want focus.
   `f` to enter, `Ctrl-B Esc` or `Ctrl-Q` to exit — the latter
   collides with the existing detach binding, needs a design pass).
 - Swap the read-only attach for a real attach when entering focus.
-  Two strategies:
-  - (a) Detach the `-r` client and spawn a new client without `-r`.
-    Simpler. One client at a time. Race window during the swap.
-  - (b) Keep a long-lived non-`-r` client and gate input forwarding
-    on focus state. Cleaner runtime but tmux attach-mode juggling is
-    fiddly.
+  **Strategy from RESEARCH_2_0.md:** keep a single long-lived client
+  and use `switch-client -r` to *toggle* its `read-only` + `ignore-size`
+  flags in place. No detach/reattach race, no second PTY spawn —
+  tmux exposes this exact toggle as a first-class operation. Original
+  strategies (detach-and-reattach; or maintain two clients) are
+  retained below as fallbacks if the toggle approach hits a tmux
+  3.x version gap or a quirk under load.
+  - (fallback a) Detach the `-r` client and spawn a new client
+    without `-r`. Simpler API surface, but a race window during the
+    swap.
+  - (fallback b) Keep a long-lived non-`-r` client and gate input
+    forwarding on focus state. Cleaner runtime but tmux attach-mode
+    juggling is fiddly and the client appears as a permanent
+    attached presence on the session.
 - Forward crossterm `KeyEvent` to PTY's input fd as the right escape
   sequences. Account for:
   - Cursor key application mode (`DECCKM`)
@@ -159,8 +167,13 @@ in a real terminal.
 These were flagged in the review of the feasibility doc. Each is
 something we explicitly de-risk before committing to the next step.
 
-1. **tmux `attach -r` window-size negotiation.** Probably the single
-   biggest correctness risk. Validated in Step 1.
+1. **tmux `attach -r` window-size negotiation.** Originally flagged
+   as the single biggest correctness risk. **Resolved by RESEARCH_2_0.md:**
+   `-r` is documented as `-f read-only,ignore-size`; the `ignore-size`
+   flag means the read-only preview client is *excluded* from
+   window-size negotiation, so a small bosun preview will not
+   shrink a larger real client. Empirical confirmation still
+   wanted from the Step 1 spike.
 2. **Level 2 needs a real attach, not `-r`.** Designed for in Step 4.
 3. **Scrollback is not free.** Prime parser with `capture-pane -p -S -`
    on session switch. Designed for in Step 3.
