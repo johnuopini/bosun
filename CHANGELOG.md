@@ -4,6 +4,153 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-05-28
+
+The 2.0 release turns bosun from a session *picker* into a session
+*workspace*. The preview pane is now a real embedded terminal, the
+focused session is interactive from inside bosun, and each sidebar
+row can hold multiple tabs.
+
+### Added — Embedded terminal preview
+
+- **Live embedded preview.** The selected session renders from a
+  real PTY (`portable-pty` + `vt100` + `tui-term`), not a polled
+  snapshot. The vt100 parser is primed with a `capture-pane`
+  snapshot on every switch so the first frame is correct — no
+  multi-second scrollback replay animation.
+- **Single-window focus mode (`s` toggles, persisted).** Press
+  Enter on a session and it opens *inside* the preview pane in
+  writable mode; the sidebar stays visible. `Ctrl+Q` exits focus,
+  same chord as the classic full-screen detach.
+- **Focus border.** Accent-colored 1-cell outline around whichever
+  pane has the keyboard. Single-window mode reserves the border's
+  space on both panes so the layout doesn't shift when focus
+  toggles.
+- **Two-way mouse navigation.** Click a session row to jump and
+  exit focus. Click inside the preview to enter focus on the
+  selected session. The triggering click isn't forwarded into the
+  embed; subsequent clicks pass through.
+- **Input correctness in the embed.** DECCKM cursor-key
+  application mode, modifyOtherKeys for Shift+Enter / Ctrl+Tab /
+  Ctrl+Backspace, bracketed paste forwarding (drag-drop an image
+  → Claude Code sees `[Image #N]`), SGR 1006 mouse forwarding for
+  click-to-cursor and scrollback.
+- **Divider drag survives the cursor crossing into the preview**
+  even when the inner app has mouse tracking on.
+
+### Added — Tabs (multi-session containers per sidebar row)
+
+- **Container abstraction.** Each sidebar row is now a `Container`
+  that owns 1..N tmux sessions ("tabs"). Single-tab containers
+  behave identically to the pre-2.0 single-session rows.
+- **Browser-style tab strip.** Pill tabs above the embed (always
+  visible while a container is selected so the `+` is always
+  reachable). Active tab uses the same accent-chip styling as the
+  `bosun` / `SW` status-bar pills. Each tab carries a per-tab
+  status glyph so background tabs surface Running / Waiting state
+  without focus.
+- **`(N)` tab-count badge** on multi-tab sidebar rows; small
+  accent dot when any non-active tab is busy.
+- **Add-tab modal.** `Ctrl+T` (sidebar) or click the `+` button
+  opens a slimmed new-session modal with the path field locked to
+  the container's path. Submit stamps `@bosun_container_id` onto
+  the new tmux session so siblings regroup correctly after a tmux
+  server restart.
+- **Auto-detach when opening the modal from focused mode** so
+  keystrokes reach the form; auto-restore focus on the new tab
+  after submit (or the original tab on Esc).
+- **Tab keybindings.** `Shift+→ / ←` cycles the active tab,
+  `Shift+↓ / ↑` cycles sessions in sidebar order — identical
+  chords in both sidebar and focused-embed modes. Sidebar-only
+  `]` / `[` mirrors the tab cycle. `Shift+D` kills the whole
+  container; plain `d` kills the active tab (drops the container
+  when the last tab goes).
+- **Tab-strip windowing.** When tabs overflow the available
+  width, the strip slides so the active tab stays visible —
+  earlier tabs scroll off the left edge instead of being silently
+  dropped.
+
+### Added — Sessions / sections
+
+- **Sections** for grouping sessions into named, collapsible
+  buckets (`g` to create, `Tab` to collapse). Persisted in
+  `config.toml`. Banner fonts cyclable per-section (`f` on a
+  header).
+- **Modify-session modal (`m`).** Pre-fills from the highlighted
+  session's stored `@bosun_*` metadata. Save-only: the running
+  agent keeps its current flags; the next `R` (restart) picks up
+  the new spec.
+- **Editor key (`e`).** Opens the session's path in your
+  configured editor. Set with `bosun editor <cmd>`.
+- **Sidebar-order session cycle** in both sidebar and focused
+  modes (was added as Shift+→/← in focused mode in 2.0, then
+  moved to Shift+↓/↑ to free Shift+→/← for tab cycling).
+- **Live per-session status detection at the fast tick.** The
+  `●◐○✕` sidebar glyphs update at ~5 Hz across **every** managed
+  session (not just the focused one), driven off the same fast
+  cadence as the preview. Claude and Codex detectors rewritten to
+  scope substring scans to the bottom ~12 visible lines and to
+  recognize Claude's box-drawn prompt directly — kills the "stale
+  Thinking… pegs Running forever" failure mode.
+
+### Changed
+
+- **Sidebar persistence is now eager.** `SidebarModel::reconcile`
+  reports whether it mutated the model; the `SessionsRefreshed`
+  handler saves `config.toml` whenever a fresh session shows up
+  via reconcile (not just on explicit organize actions). Fixes
+  the long-standing bug where users who never reorganized would
+  find `config.toml` had only `theme = "..."` and no `[sidebar]`
+  block — after a reboot the sidebar would come up empty instead
+  of preserving dead rows for re-attach.
+- **Shift-arrow chord layout.** Plain `Shift+arrows` is now
+  reserved for tab/session navigation (`Shift+→/←` tabs,
+  `Shift+↓/↑` sessions) — same in sidebar and focused modes. The
+  reorder / move-to-bucket actions moved to `Ctrl+Shift+arrows`
+  (with `Shift+J/K` still working for vim-style row reorder).
+
+### Fixed
+
+- Mouse coordinates inside the focused embed were one row + one
+  column off because the click-to-local-coord translation used
+  the outer preview rect instead of the focus-border-inset embed
+  rect. Click-to-cursor and drag-to-select now land on the actual
+  click position.
+- Focus border drawing through the tab strip (border now starts
+  one row below the preview rect when a tab strip is shown).
+- Sidebar's first-row title getting clipped by the focus border
+  in single-window mode (sidebar content insets by one cell so
+  the border has its own perimeter).
+- Add-tab modal: `name` field starts empty instead of pre-filling
+  with the container's internal tmux name.
+- Clicks outside an open modal could activate the background
+  preview pane — focus enter / click-out / tab-strip click paths
+  are all gated on `modals.is_empty()` now.
+
+### Internal
+
+- New `Container { id, name, members, active }` struct;
+  `SidebarModel.ungrouped` and `Section.members` migrated from
+  `Vec<String>` to `Vec<Container>`. `VisibleEntry` carries
+  `&Container`. Backwards-compat `#[serde(untagged)]` deserialize
+  so 0.x configs (bare-string members) load unchanged and save
+  in the new table form on first write.
+- New `@bosun_container_id` tmux user option carries the
+  container assignment across tmux server restarts.
+- `tab_strip` module owns layout + render + click hit-test
+  (pure-function `compute` shared by render and `app::run`).
+- `AttachMode::Preview` vs `Focused` selection now flows through
+  `sync_embed` based on `embed_focused` so an active-tab change
+  while attached respawns in the right mode automatically.
+
+## [0.4.1] — 2026-05-27
+
+### Fixed
+
+- Synchronous `capture_pane` on attach exit so the preview snapshot
+  is current the moment focus returns to bosun — a stale snapshot
+  used to flash for one tick before the next refresh overwrote it.
+
 ## [0.4.0] — 2026-05-27
 
 ### Added
