@@ -1621,6 +1621,15 @@ pub struct App {
     /// embed's PTY writer instead of bosun's reducer. Ctrl-Q is
     /// intercepted to exit focus.
     embed_focused: bool,
+    /// Set when a modal was opened from focused mode (today: the
+    /// add-tab modal triggered by `Ctrl+T` or clicking `+` while
+    /// the embed has focus). Causes the run loop to auto-detach
+    /// the embed on modal open so the user can type into the
+    /// modal, and to re-attach on modal close (landing on the new
+    /// tab if a `CreateSession` went through — `sync_embed`
+    /// follows the active-tab change once `SessionsRefreshed`
+    /// reconciles).
+    restore_focus_after_modal: bool,
     /// Tmux client. The tmux actor owns the primary copy and runs
     /// all timed / notification-driven tmux work; we keep this
     /// secondary handle so the app task itself can do synchronous
@@ -1694,6 +1703,7 @@ impl App {
             embed: None,
             embed_enabled: config.embed_enabled,
             embed_focused: false,
+            restore_focus_after_modal: false,
             client,
         }
     }
@@ -2232,6 +2242,20 @@ impl App {
                         container_name: _,
                         container_path,
                     } => {
+                        // If the modal opens from focused mode
+                        // (user pressed `Ctrl+T` or clicked `+` while
+                        // attached), auto-detach so keyboard input
+                        // reaches the modal — otherwise the user
+                        // ends up typing into the inner tmux pane
+                        // and the modal looks ignored. Remember the
+                        // focus state so we can restore it once the
+                        // modal closes; `sync_embed` then follows the
+                        // active-tab change after `SessionsRefreshed`
+                        // hands us the new tab.
+                        if self.embed_focused {
+                            self.exit_focus().await;
+                            self.restore_focus_after_modal = true;
+                        }
                         let recents = self.store.list_recents(50).unwrap_or_default();
                         self.state
                             .modals
@@ -2241,6 +2265,21 @@ impl App {
                                 recents,
                             )));
                     }
+                }
+            }
+
+            // Add-tab modal closed (Esc or submit): if it was opened
+            // from focused mode, re-enter focus on the currently-
+            // active tab. On submit the active tab is still the old
+            // one at this point — `SessionsRefreshed` from the
+            // freshly-created tmux session arrives later and
+            // `sync_embed` follows the active-tab change, respawning
+            // the embed in `Focused` mode (since `embed_focused` is
+            // back on by then).
+            if self.restore_focus_after_modal && self.state.modals.is_empty() {
+                self.restore_focus_after_modal = false;
+                if self.state.selected_session_name().is_some() {
+                    self.enter_focus().await;
                 }
             }
 
@@ -2493,12 +2532,22 @@ impl App {
                 // `App::set_embed_focus`, which respawns with
                 // `AttachMode::Focused` while preserving the
                 // currently-focused session.
+                // Spawn in the mode that matches the user's intent:
+                // Focused when the embed currently has keyboard
+                // focus (e.g. the user was attached and the active
+                // tab just changed under them via add-tab landing
+                // or `]` / `[` from sidebar mode); Preview otherwise.
+                let mode = if self.embed_focused {
+                    crate::ui::embed_terminal::AttachMode::Focused
+                } else {
+                    crate::ui::embed_terminal::AttachMode::Preview
+                };
                 match crate::ui::embed_terminal::EmbedTerminal::spawn(
                     self.socket.as_deref(),
                     &t,
                     rows,
                     cols,
-                    crate::ui::embed_terminal::AttachMode::Preview,
+                    mode,
                     snapshot.as_deref(),
                     self.evt_tx.clone(),
                 ) {
