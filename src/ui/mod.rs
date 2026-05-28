@@ -8,6 +8,7 @@ pub mod preview;
 pub mod section_preview;
 pub mod session_list;
 pub mod statusbar;
+pub mod tab_strip;
 pub mod theme;
 
 use ratatui::buffer::Buffer;

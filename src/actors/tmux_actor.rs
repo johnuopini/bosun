@@ -307,6 +307,39 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::KillContainer { tabs } => {
+                    // Multi-kill: iterate each tab serially so a
+                    // failure on one doesn't abort the rest. The
+                    // sidebar reconcile after the final refresh
+                    // drops the now-tab-less container.
+                    let mut failed = Vec::new();
+                    for tab in &tabs {
+                        if let Err(e) = client.kill_session(tab).await {
+                            failed.push(format!("{}: {}", tab, e));
+                        } else if focused.as_deref() == Some(tab.as_str()) {
+                            focused = None;
+                        }
+                    }
+                    if !failed.is_empty() {
+                        let _ = evt_tx.send(AppMsg::Warn(format!(
+                            "kill container: {}",
+                            failed.join(", ")
+                        )));
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::DeleteRecent(id) => {
                     if let Err(e) = store.delete_recent(id) {
                         tracing::warn!("delete_recent({}): {}", id, e);
@@ -849,6 +882,7 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         },
         claude_skip_permissions: spec.options.claude.skip_permissions,
         codex_yolo: spec.options.codex.yolo,
+        container_id: spec.container_id.clone(),
     }
 }
 
@@ -874,6 +908,7 @@ fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
                 yolo: meta.codex_yolo,
             },
         },
+        container_id: meta.container_id,
     }
 }
 

@@ -2,9 +2,9 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
-   ●  build  1w               │                                                 
-       claude · /tmp/work     │  preview: capturing…                            
- ▌ ◐  review  1w  •attached   │                                                 
+   ●  build  1w               │ ◐ review                                      + 
+       claude · /tmp/work     │                                                 
+ ▌ ◐  review  1w  •attached   │  preview: capturing…                            
        claude · /tmp/work     │                                                 
    ○  shell  1w               │                                                 
        claude · /tmp/work     │                                                 

@@ -50,18 +50,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
         let selected = i == state.selected;
         let start = out.len();
         match entry {
-            VisibleEntry::Ungrouped(c) => match state.session_by_name(&c.active) {
-                Some(v) => {
-                    out.push(render_primary_line(v, selected, false, area.width, theme));
-                    out.push(render_meta_line(v, selected, false, area.width, theme));
+            VisibleEntry::Ungrouped(c) => {
+                let tabs = c.members.len() as u16;
+                match state.session_by_name(&c.active) {
+                    Some(v) => {
+                        out.push(render_primary_line(
+                            v, selected, false, tabs, area.width, theme,
+                        ));
+                        out.push(render_meta_line(v, selected, false, area.width, theme));
+                    }
+                    None => {
+                        let label = state.dead_display_for(&c.active);
+                        out.push(render_missing_line(
+                            &label, selected, false, area.width, theme,
+                        ));
+                    }
                 }
-                None => {
-                    let label = state.dead_display_for(&c.active);
-                    out.push(render_missing_line(
-                        &label, selected, false, area.width, theme,
-                    ));
-                }
-            },
+            }
             VisibleEntry::SectionHeader(s) => {
                 let jump_key = if section_idx < 9 {
                     Some((section_idx as u8 + b'1') as char)
@@ -74,9 +79,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 section_idx += 1;
             }
             VisibleEntry::Member { container, .. } => {
+                let tabs = container.members.len() as u16;
                 match state.session_by_name(&container.active) {
                     Some(v) => {
-                        out.push(render_primary_line(v, selected, true, area.width, theme));
+                        out.push(render_primary_line(
+                            v, selected, true, tabs, area.width, theme,
+                        ));
                         out.push(render_meta_line(v, selected, true, area.width, theme));
                     }
                     None => {
@@ -269,6 +277,7 @@ fn render_primary_line(
     view: &SessionView,
     selected: bool,
     indented: bool,
+    tabs: u16,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -292,6 +301,14 @@ fn render_primary_line(
 
     let glyph = view.status.glyph().to_string();
     let name = view.display().to_string();
+    // `(N)` tab-count badge for multi-tab containers. Hidden when
+    // tabs <= 1 so single-tab rows render identically to the
+    // pre-tabs sidebar.
+    let tab_label = if tabs > 1 {
+        format!("  ({})", tabs)
+    } else {
+        String::new()
+    };
     let windows_label = format!("  {}w", view.session.windows);
     let attached_label = if view.session.attached {
         "  •attached"
@@ -305,6 +322,7 @@ fn render_primary_line(
         + glyph.chars().count()
         + 2
         + name.chars().count()
+        + tab_label.chars().count()
         + windows_label.chars().count()
         + attached_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
@@ -315,8 +333,17 @@ fn render_primary_line(
         Span::styled(glyph, status_style),
         Span::styled("  ", Style::default().bg(bg)),
         Span::styled(name, name_style),
-        Span::styled(windows_label, Style::default().fg(theme.text_muted).bg(bg)),
     ];
+    if !tab_label.is_empty() {
+        spans.push(Span::styled(
+            tab_label,
+            Style::default().fg(theme.text_muted).bg(bg),
+        ));
+    }
+    spans.push(Span::styled(
+        windows_label,
+        Style::default().fg(theme.text_muted).bg(bg),
+    ));
     if view.session.attached {
         spans.push(Span::styled(
             attached_label,

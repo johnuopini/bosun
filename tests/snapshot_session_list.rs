@@ -56,6 +56,7 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
             last_activity: Some(stable_activity),
             current_path: Some("/tmp".into()),
             agent: Some("claude".into()),
+            container_id: None,
             // `/tmp/work` is chosen deliberately: the session_list meta
             // line runs `shorten_path` which replaces a `$HOME` prefix
             // with `~`. Any path under a real home dir would become

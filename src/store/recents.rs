@@ -40,6 +40,7 @@ impl Recent {
                 claude: self.claude.clone(),
                 codex: self.codex.clone(),
             },
+            container_id: None,
         }
     }
 }
@@ -204,6 +205,7 @@ mod tests {
             agent: agent.to_string(),
             args: String::new(),
             options: SpecOptions::default(),
+            container_id: None,
         }
     }
 

@@ -32,6 +32,13 @@ pub struct TmuxSession {
     /// which is more stable than `current_path` (which tracks the
     /// shell's cwd and can drift). `None` for non-bosun sessions.
     pub spec_path: Option<String>,
+    /// Container ID stored in `@bosun_container_id` at create time.
+    /// Identifies which sidebar container this tmux session belongs
+    /// to ("tab" semantics — multiple sessions sharing one sidebar
+    /// row). `None` for non-bosun sessions and for older bosun
+    /// sessions from before the container feature shipped; those
+    /// reconcile into their own fresh single-tab containers.
+    pub container_id: Option<String>,
 }
 
 impl TmuxSession {

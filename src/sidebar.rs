@@ -91,6 +91,30 @@ impl Container {
         }
     }
 
+    /// Construct a single-tab container with a caller-supplied
+    /// id — used by `reconcile` when a freshly-seen tmux session
+    /// already advertises a `@bosun_container_id` for which we
+    /// have no existing container (server-side first sighting).
+    pub fn with_id(id: String, internal: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            active: internal.clone(),
+            members: vec![internal],
+        }
+    }
+
+    /// Append `internal` as a new tab and switch the active tab
+    /// to it. No-op if the name is already a tab.
+    pub fn add_tab(&mut self, internal: String) {
+        if self.members.iter().any(|m| m == &internal) {
+            self.active = internal;
+            return;
+        }
+        self.active = internal.clone();
+        self.members.push(internal);
+    }
+
     /// True iff `internal` is one of this container's tabs.
     pub fn contains_internal(&self, internal: &str) -> bool {
         self.members.iter().any(|m| m == internal)
@@ -386,7 +410,7 @@ impl SidebarModel {
     /// grouping and ordering work. Dead containers render as
     /// "missing" rows; the user can recreate them from the recents
     /// store or `d` to remove.
-    pub fn reconcile(&mut self, live: &[String]) {
+    pub fn reconcile(&mut self, live: &[(String, Option<String>)]) {
         let mut seen = std::collections::HashSet::new();
         for c in &mut self.ungrouped {
             c.members.retain(|m| seen.insert(m.clone()));
@@ -411,12 +435,96 @@ impl SidebarModel {
             }
             s.members.retain(|c| !c.members.is_empty());
         }
-        for n in live {
-            if !seen.contains(n) {
-                self.ungrouped.push(Container::single(n.clone(), n.clone()));
-                seen.insert(n.clone());
+        // For every new live session: if its `@bosun_container_id`
+        // matches an existing container, join it as a tab; if it
+        // matches no container but carries an id, create a new
+        // container with that id (so the next refresh recognizes
+        // siblings); else fall back to a fresh anonymous
+        // single-tab container.
+        for (n, cid) in live {
+            if seen.contains(n) {
+                continue;
+            }
+            let joined = match cid {
+                Some(id) => self.add_tab_to_container(id, n.clone()),
+                None => false,
+            };
+            if !joined {
+                let container = match cid {
+                    Some(id) => Container::with_id(id.clone(), n.clone(), n.clone()),
+                    None => Container::single(n.clone(), n.clone()),
+                };
+                self.ungrouped.push(container);
+            }
+            seen.insert(n.clone());
+        }
+    }
+
+    /// Append `internal` as a new tab on the container identified
+    /// by `container_id`. Returns true if a container was found.
+    /// Switches the container's active tab to the new one — adding
+    /// a tab is normally followed by the user wanting to look at
+    /// it.
+    pub fn add_tab_to_container(&mut self, container_id: &str, internal: String) -> bool {
+        for c in &mut self.ungrouped {
+            if c.id == container_id {
+                c.add_tab(internal);
+                return true;
             }
         }
+        for s in &mut self.sections {
+            for c in &mut s.members {
+                if c.id == container_id {
+                    c.add_tab(internal);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Switch the active tab on the container identified by
+    /// `container_id`. Returns true if both container and tab were
+    /// found. No-op if `internal` isn't a tab on that container.
+    pub fn set_active_tab(&mut self, container_id: &str, internal: &str) -> bool {
+        for c in &mut self.ungrouped {
+            if c.id == container_id {
+                if c.contains_internal(internal) {
+                    c.active = internal.to_string();
+                    return true;
+                }
+                return false;
+            }
+        }
+        for s in &mut self.sections {
+            for c in &mut s.members {
+                if c.id == container_id {
+                    if c.contains_internal(internal) {
+                        c.active = internal.to_string();
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// Look up a container by id.
+    pub fn find_container(&self, container_id: &str) -> Option<&Container> {
+        for c in &self.ungrouped {
+            if c.id == container_id {
+                return Some(c);
+            }
+        }
+        for s in &self.sections {
+            for c in &s.members {
+                if c.id == container_id {
+                    return Some(c);
+                }
+            }
+        }
+        None
     }
 
     /// Replace one internal name with another, in place. Used by
@@ -552,6 +660,14 @@ mod tests {
         s.members.iter().map(|c| c.active.clone()).collect()
     }
 
+    /// Build the `live` list shape reconcile expects from a flat
+    /// slice of internal names — no container_id, matching pre-
+    /// tabs behavior. Tests that exercise container_id grouping
+    /// build the tuple list inline.
+    fn live(names: &[&str]) -> Vec<(String, Option<String>)> {
+        names.iter().map(|n| (n.to_string(), None)).collect()
+    }
+
     #[test]
     fn flat_index_matches_visible_iteration() {
         let m = model(
@@ -579,7 +695,7 @@ mod tests {
     #[test]
     fn reconcile_keeps_dead_sessions_appends_new() {
         let mut m = model(&["a"], vec![sec("g1", "W", &["b", "gone"])]);
-        m.reconcile(&["a".into(), "b".into(), "newbie".into()]);
+        m.reconcile(&live(&["a", "b", "newbie"]));
         // "gone" stays in the section even though it's not live;
         // "newbie" lands in ungrouped as a fresh single-tab container.
         assert_eq!(
@@ -615,12 +731,47 @@ mod tests {
         // would happen only via hand-edited config, but reconcile
         // must collapse cleanly.
         let mut m = model(&["a", "b"], vec![sec("g1", "W", &["b", "c"])]);
-        m.reconcile(&["a".into(), "b".into(), "c".into()]);
+        m.reconcile(&live(&["a", "b", "c"]));
         assert_eq!(ungrouped_names(&m), vec!["a".to_string(), "b".to_string()]);
         // "b" stayed in ungrouped (visible-order earliest); the
         // section's "b" container loses its only tab and is
         // dropped, leaving just "c".
         assert_eq!(section_names(&m.sections[0]), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_groups_new_session_by_container_id() {
+        // Two existing single-tab containers in ungrouped; a third
+        // live session arrives advertising the second container's id.
+        // It should join that container as a tab, not get its own row.
+        let mut m = model(&["a", "b"], vec![]);
+        let target_id = m.ungrouped[1].id.clone();
+        m.reconcile(&[
+            ("a".into(), None),
+            ("b".into(), None),
+            ("b2".into(), Some(target_id.clone())),
+        ]);
+        assert_eq!(m.ungrouped.len(), 2);
+        assert_eq!(m.ungrouped[1].id, target_id);
+        assert_eq!(
+            m.ungrouped[1].members,
+            vec!["b".to_string(), "b2".to_string()]
+        );
+        // add_tab switches the active tab — opening the modal to
+        // create a new tab implies the user wants to see it.
+        assert_eq!(m.ungrouped[1].active, "b2");
+    }
+
+    #[test]
+    fn reconcile_unknown_container_id_creates_keyed_container() {
+        // First sighting of a session whose container_id refers to
+        // no existing container — create a fresh container *with*
+        // that id so the next refresh recognizes siblings.
+        let mut m = model(&[], vec![]);
+        m.reconcile(&[("new".into(), Some("con-external".into()))]);
+        assert_eq!(m.ungrouped.len(), 1);
+        assert_eq!(m.ungrouped[0].id, "con-external");
+        assert_eq!(m.ungrouped[0].active, "new");
     }
 
     #[test]

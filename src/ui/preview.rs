@@ -23,7 +23,7 @@ use ratatui::Frame;
 use crate::app::AppState;
 use crate::sidebar::{Location, VisibleKind};
 use crate::ui::embed_terminal::EmbedTerminal;
-use crate::ui::{banner, section_preview, Theme};
+use crate::ui::{banner, section_preview, tab_strip, Theme};
 
 pub fn render(
     frame: &mut Frame<'_>,
@@ -45,6 +45,37 @@ pub fn render(
         section_preview::render_empty(frame.buffer_mut(), area, font, theme);
         return;
     }
+
+    // If the cursor is on a container, carve a 1-row tab strip off
+    // the top of the preview rect. Single-tab containers get the
+    // strip too so the `+` add-tab button is always reachable
+    // without having to first create a second tab. The strip lives
+    // above the focus border, so embed-area math (focus-border
+    // inset) operates on the *remaining* rect.
+    let mut working_area = area;
+    if let Some(container) = state
+        .sidebar
+        .visible()
+        .get(state.selected)
+        .and_then(|e| e.container())
+    {
+        if area.height > 0 && area.width > 0 {
+            let strip_area = Rect::new(area.x, area.y, area.width, 1);
+            let tab_views: Vec<Option<&crate::tmux::session::SessionView>> = container
+                .members
+                .iter()
+                .map(|m| state.session_by_name(m))
+                .collect();
+            tab_strip::render(frame.buffer_mut(), strip_area, container, &tab_views, theme);
+            working_area = Rect::new(
+                area.x,
+                area.y + 1,
+                area.width,
+                area.height.saturating_sub(1),
+            );
+        }
+    }
+    let area = working_area;
 
     // Section header selected: render banner + per-section table.
     // The cursor location tells us which section, regardless of how

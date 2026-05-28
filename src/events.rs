@@ -14,6 +14,13 @@ pub struct SessionSpec {
     pub agent: String,
     pub args: String,
     pub options: SpecOptions,
+    /// When `Some`, the actor stamps this container ID onto the
+    /// new tmux session's `@bosun_container_id` user option so the
+    /// freshly-created session appears as a tab inside the named
+    /// sidebar container. `None` (the default) creates a session
+    /// that gets its own fresh single-tab container on reconcile,
+    /// matching the pre-tabs behavior.
+    pub container_id: Option<String>,
 }
 
 /// Agent-specific flags the user toggled in the new-session modal.
@@ -86,6 +93,12 @@ pub enum Command {
     CreateSession(SessionSpec),
     /// Kill a session by its internal tmux name. `tmux kill-session -t`.
     KillSession(String),
+    /// Kill every tmux session named in `tabs` in one batch — used
+    /// by `Shift+D` to tear down all tabs in a container at once.
+    /// The actor iterates `KillSession` for each name; sidebar
+    /// reconcile drops the now-empty container on the next
+    /// refresh.
+    KillContainer { tabs: Vec<String> },
     /// Rename the pretty display name of a session. The internal tmux
     /// name never changes (we only update the `@bosun_display` user
     /// option); the UI picks up the new label on the next refresh.

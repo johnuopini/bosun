@@ -2,9 +2,9 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
- ▌ ○  alpha  1w               │                                                 
-       claude · /tmp/work     │  preview: capturing…                            
-                              │                                                 
+ ▌ ○  alpha  1w               │ ○ alpha                                       + 
+       claude · /tmp/work     │                                                 
+                              │  preview: capturing…                            
                               │                                                 
                               │                                                 
  bosun  v0.4.0 list: tmux not running↵ attach · s single-win · n new · e edit ·

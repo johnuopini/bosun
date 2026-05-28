@@ -262,9 +262,21 @@ fn build_rows() -> Vec<Row> {
             "m",
             "Modify session (path, agent, flags) — applies on next R",
         ),
-        Binding("d", "Kill session (on header: delete section)"),
+        Binding(
+            "d",
+            "Kill active tab (on header: delete section; last tab kills container)",
+        ),
+        Binding("Shift+D", "Kill whole container — every tab at once"),
         Binding("e", "Open session's path in configured editor"),
         Binding("Ctrl+R", "Force immediate refresh"),
+        Blank,
+        Section("Tabs"),
+        Binding("Ctrl+T", "Add a tab to the selected container"),
+        Binding("] / [", "Cycle next / previous tab within container"),
+        Binding(
+            "Click tab / +",
+            "Mouse: switch active tab or open the add-tab modal",
+        ),
         Blank,
         Section("Organize"),
         Binding(

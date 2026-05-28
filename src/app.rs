@@ -215,6 +215,16 @@ pub enum ModalRequest {
     /// Open the key-bindings help / cheat-sheet modal. Pure UI; the
     /// app loop just constructs a `HelpModal` with no extra data.
     Help,
+    /// Open the new-session modal in add-tab mode: path is locked
+    /// to the container's, name is seeded with the container's
+    /// label, and submit stamps `container_id` onto the emitted
+    /// `SessionSpec` so the new session joins the container as
+    /// another tab.
+    AddTab {
+        container_id: String,
+        container_name: String,
+        container_path: String,
+    },
 }
 
 impl AppState {
@@ -403,6 +413,122 @@ impl AppState {
         out.push(Command::SaveSessionHistory(self.session_history.clone()));
     }
 
+    /// Resolve a click landing in the tab strip rect to a tab pill
+    /// or the `+` button and react: tab → switch active tab +
+    /// persist; `+` → queue the add-tab modal. The `strip` rect
+    /// must be the same one the renderer used, so the hit-test
+    /// matches what the user actually saw on screen.
+    pub fn handle_tab_strip_click(
+        &mut self,
+        strip: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+        out: &mut Vec<Command>,
+    ) {
+        let Some(entry) = self.sidebar.visible().get(self.selected).copied() else {
+            return;
+        };
+        let Some(container) = entry.container() else {
+            return;
+        };
+        let labels: Vec<String> = container
+            .members
+            .iter()
+            .map(|m| {
+                self.session_by_name(m)
+                    .map(|v| v.display().to_string())
+                    .unwrap_or_else(|| m.clone())
+            })
+            .collect();
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let layout = crate::ui::tab_strip::compute(strip, &label_refs);
+        let Some(slot) = layout.hit(col, row) else {
+            return;
+        };
+        if slot.key == "+" {
+            self.request_add_tab();
+            return;
+        }
+        // Tab click — switch the container's active tab. Persist
+        // so the choice survives restart.
+        let new_active = slot.key.clone();
+        let container_id = container.id.clone();
+        if self.sidebar.set_active_tab(&container_id, &new_active) {
+            self.save_sidebar(out);
+        }
+    }
+
+    /// Resolve the container under the cursor (if any) and queue
+    /// an add-tab modal request. The modal opens with the
+    /// container's path locked and its display label seeded; submit
+    /// emits `Command::CreateSession` with `container_id` stamped
+    /// so the new tmux session joins the container as a tab.
+    fn request_add_tab(&mut self) {
+        let entry = self.sidebar.visible().get(self.selected).copied();
+        let Some(container) = entry.and_then(|e| e.container()) else {
+            return;
+        };
+        // Path: prefer the live session's `best_path` (handles
+        // both `@bosun_path` and the shell cwd fallback), then fall
+        // back to the container's name as a last resort.
+        let path = self
+            .session_by_name(&container.active)
+            .and_then(|v| v.session.best_path().map(|s| s.to_string()))
+            .unwrap_or_else(|| container.name.clone());
+        self.pending_modal = Some(ModalRequest::AddTab {
+            container_id: container.id.clone(),
+            container_name: container.name.clone(),
+            container_path: path,
+        });
+    }
+
+    /// Walk the active tab one position forward (`step = 1`) or
+    /// backward (`step = -1`), wrapping at the bounds. Persists
+    /// the new active-tab choice so it survives restart.
+    fn cycle_active_tab(&mut self, step: i32, out: &mut Vec<Command>) {
+        let Some(loc) = self.selected_location() else {
+            return;
+        };
+        let container = match loc {
+            Location::Ungrouped(i) => self.sidebar.ungrouped.get_mut(i),
+            Location::Member(si, mi) => self
+                .sidebar
+                .sections
+                .get_mut(si)
+                .and_then(|s| s.members.get_mut(mi)),
+            Location::Header(_) => None,
+        };
+        let Some(c) = container else {
+            return;
+        };
+        if c.members.len() <= 1 {
+            return;
+        }
+        let cur = c.members.iter().position(|m| m == &c.active).unwrap_or(0);
+        let len = c.members.len() as i32;
+        let next = ((cur as i32 + step).rem_euclid(len)) as usize;
+        c.active = c.members[next].clone();
+        self.save_sidebar(out);
+    }
+
+    /// Emit a confirm-modal that, on accept, kills every tmux
+    /// session inside the selected container. The sidebar row
+    /// disappears once `remove_session` walks all the way through
+    /// the container's tabs.
+    fn request_kill_container(&mut self, _out: &mut [Command]) {
+        let entry = self.sidebar.visible().get(self.selected).copied();
+        let Some(container) = entry.and_then(|e| e.container()) else {
+            return;
+        };
+        let display = container.name.clone();
+        let tabs = container.members.clone();
+        let title = "Kill all tabs in container?";
+        let msg = format!("This will kill all {} tab(s) in '{}'.", tabs.len(), display);
+        let cmd = Command::KillContainer { tabs };
+        self.modals
+            .push(Box::new(ConfirmModal::new(title, msg, cmd).destructive()));
+    }
+
     /// Pure reducer. Returns a list of Commands the caller should dispatch.
     pub fn apply(&mut self, msg: AppMsg) -> Vec<Command> {
         let mut out = Vec::new();
@@ -470,8 +596,11 @@ impl AppState {
                     false
                 };
 
-                let live: Vec<String> =
-                    self.sessions.iter().map(|v| v.name().to_string()).collect();
+                let live: Vec<(String, Option<String>)> = self
+                    .sessions
+                    .iter()
+                    .map(|v| (v.name().to_string(), v.session.container_id.clone()))
+                    .collect();
                 self.sidebar.reconcile(&live);
                 if swap_applied {
                     self.save_sidebar(&mut out);
@@ -895,6 +1024,33 @@ impl AppState {
                 if self.modals.top_id() != Some("new_session") =>
             {
                 self.pending_modal = Some(ModalRequest::NewSession);
+            }
+            // Ctrl+T: add a tab to the currently-selected container.
+            // Opens the new-session modal in add-tab mode (path
+            // locked to the container's). No-op on a section header
+            // or when no container is selected. Active path picks
+            // the container's existing path; the new tmux session
+            // joins the container via `@bosun_container_id`.
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                self.request_add_tab();
+            }
+            // `]` / `[`: cycle the active tab within the selected
+            // container, wrapping at the ends. No-op for single-tab
+            // containers or section headers — the existing cursor
+            // movement keys handle cross-container navigation.
+            (KeyCode::Char(']'), KeyModifiers::NONE) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Char('['), KeyModifiers::NONE) => {
+                self.cycle_active_tab(-1, out);
+            }
+            // Shift+D: kill the whole container — every tab plus
+            // the container itself. Distinct from plain `d` which
+            // only kills the active tab (and removes the container
+            // only when the last tab is gone). Mirrors how
+            // delete-section already works on headers.
+            (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
+                self.request_kill_container(out);
             }
             (KeyCode::Char('g'), KeyModifiers::NONE) if self.modals.top_id() != Some("section") => {
                 self.pending_modal = Some(ModalRequest::Section { editing: None });
@@ -1504,6 +1660,33 @@ impl App {
                 None => break,
             };
 
+            // Tab-strip click handling runs *before* the focus
+            // branch so clicks on a tab or the `+` button are
+            // recognized regardless of whether the embed is focused.
+            // The strip lives in the row above the embed, outside
+            // `embed_rect`, so it never collides with mouse
+            // forwarding into the inner app. Click on a tab →
+            // switch active tab + persist; click on `+` → queue
+            // the add-tab modal. Both swallow the event.
+            if let AppMsg::Mouse(m) = &msg {
+                use crossterm::event::{MouseButton, MouseEventKind};
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.state.dragging_divider
+                {
+                    if let Some(strip) = self.tab_strip_rect() {
+                        if point_in_rect(strip, m.column, m.row) {
+                            let mut out = Vec::new();
+                            self.state
+                                .handle_tab_strip_click(strip, m.column, m.row, &mut out);
+                            for cmd in out {
+                                let _ = self.cmd_tx.send(cmd);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Step 4 focus mode: while the embed is focused, all
             // `AppMsg::Key` events go directly into the embed's PTY
             // writer instead of bosun's reducer. Ctrl-Q is the
@@ -1935,6 +2118,21 @@ impl App {
                     ModalRequest::Help => {
                         self.state.modals.push(Box::new(HelpModal::new()));
                     }
+                    ModalRequest::AddTab {
+                        container_id,
+                        container_name,
+                        container_path,
+                    } => {
+                        let recents = self.store.list_recents(50).unwrap_or_default();
+                        self.state
+                            .modals
+                            .push(Box::new(NewSessionModal::for_add_tab(
+                                container_id,
+                                container_name,
+                                container_path,
+                                recents,
+                            )));
+                    }
                 }
             }
 
@@ -2335,14 +2533,39 @@ impl App {
     fn preview_dims(&self) -> (u16, u16) {
         match self.preview_rect() {
             Some(p) => {
+                let tabs = self.tab_strip_height();
                 if self.state.single_window_mode {
-                    (p.height.saturating_sub(2), p.width.saturating_sub(2))
+                    (
+                        p.height.saturating_sub(2).saturating_sub(tabs),
+                        p.width.saturating_sub(2),
+                    )
                 } else {
-                    (p.height, p.width)
+                    (p.height.saturating_sub(tabs), p.width)
                 }
             }
             None => (4, 20),
         }
+    }
+
+    /// 1 row whenever the cursor sits on a container (so a tab
+    /// strip is drawn above the embed), else 0. The strip lives
+    /// outside the focus border, so it consumes one row from the
+    /// preview rect before the focus-border inset math runs.
+    fn tab_strip_height(&self) -> u16 {
+        match self.state.sidebar.visible().get(self.state.selected) {
+            Some(e) if e.container().is_some() => 1,
+            _ => 0,
+        }
+    }
+
+    /// On-screen rectangle the tab strip occupies, or `None` when
+    /// the cursor isn't on a container (no strip is drawn).
+    fn tab_strip_rect(&self) -> Option<ratatui::layout::Rect> {
+        let p = self.preview_rect()?;
+        if self.tab_strip_height() == 0 {
+            return None;
+        }
+        Some(ratatui::layout::Rect::new(p.x, p.y, p.width, 1))
     }
 
     /// Full preview rectangle (in terminal coords) for the current
@@ -2364,20 +2587,27 @@ impl App {
     /// Rectangle the embed actually renders into. Matches the
     /// dimensions the PTY is sized for via `preview_dims`, so mouse
     /// forwarding translates click coords against the same origin
-    /// the inner app's terminal grid was sized against. In
-    /// single-window mode this is `preview_rect` inset by one cell
-    /// on every side (the focus-border reservation); otherwise it's
-    /// the full preview rect.
+    /// the inner app's terminal grid was sized against. The tab
+    /// strip (when drawn) lives above the embed and is excluded;
+    /// in single-window mode the result is further inset by one
+    /// cell on every side for the focus-border reservation.
     fn embed_rect(&self) -> Option<ratatui::layout::Rect> {
         use ratatui::layout::Rect;
         let p = self.preview_rect()?;
+        let tabs = self.tab_strip_height();
+        let after_tabs = Rect::new(p.x, p.y + tabs, p.width, p.height.saturating_sub(tabs));
         if self.state.single_window_mode {
-            if p.width < 2 || p.height < 2 {
-                return Some(Rect::new(p.x, p.y, 0, 0));
+            if after_tabs.width < 2 || after_tabs.height < 2 {
+                return Some(Rect::new(after_tabs.x, after_tabs.y, 0, 0));
             }
-            Some(Rect::new(p.x + 1, p.y + 1, p.width - 2, p.height - 2))
+            Some(Rect::new(
+                after_tabs.x + 1,
+                after_tabs.y + 1,
+                after_tabs.width - 2,
+                after_tabs.height - 2,
+            ))
         } else {
-            Some(p)
+            Some(after_tabs)
         }
     }
 }
@@ -2412,6 +2642,7 @@ mod tests {
                 current_path: None,
                 agent: None,
                 spec_path: None,
+                container_id: None,
             },
             Status::Idle,
             None,

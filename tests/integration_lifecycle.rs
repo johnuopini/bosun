@@ -142,6 +142,7 @@ async fn metadata_round_trips_through_tmux_options() {
         claude_session_mode: "Resume".into(),
         claude_skip_permissions: true,
         codex_yolo: false,
+        container_id: None,
     };
     client
         .create_session(&CreateSpec {
