@@ -144,6 +144,17 @@ pub struct AppState {
     /// persisted via `Command::SaveSingleWindow` so the preference
     /// survives across bosun restarts.
     pub single_window_mode: bool,
+    /// Internal names of sessions the user just killed via `d`.
+    /// Suppresses the "re-add via reconcile" race where a 1Hz
+    /// `do_refresh` already inflight at confirm time emits a
+    /// `SessionsRefreshed` containing the still-alive session
+    /// before the actor gets a chance to process `KillSession` —
+    /// without this set, the dead row would briefly reappear in
+    /// ungrouped as `? <name>` until the next refresh. Entries
+    /// clear the moment a refresh confirms the session is gone
+    /// from the live list, so the set never grows unbounded and
+    /// can't shadow a future create with the same internal name.
+    pub recently_killed: std::collections::HashSet<String>,
 }
 
 /// Number of wheel events that must accumulate in one direction before
@@ -259,6 +270,63 @@ impl AppState {
         self.sessions.iter().find(|v| v.name() == name)
     }
 
+    /// Ordered list of live internal session names for the
+    /// Shift+Left/Right cycle. Uses the sidebar's display order
+    /// (ungrouped first, then each section's members) rather than
+    /// MRU — sidebar order is stable until the user explicitly
+    /// reorders, which is what muscle memory needs. Collapsed
+    /// sections still contribute their members so cycling can reach
+    /// hidden sessions. Dead sidebar rows (entries whose tmux
+    /// session no longer exists) are filtered out — we never want
+    /// to cycle to a name `switch-client` can't resolve.
+    pub fn cycle_order(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in &self.sidebar.ungrouped {
+            if self.session_by_name(n).is_some() {
+                out.push(n.clone());
+            }
+        }
+        for s in &self.sidebar.sections {
+            for m in &s.members {
+                if self.session_by_name(m).is_some() {
+                    out.push(m.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Internal name of the session that should be activated when
+    /// the user presses Shift+Right from `current` (or, when no
+    /// current is provided, from the start of the cycle). Returns
+    /// `None` only when there are zero live sessions to cycle
+    /// through. Wraps around at the end of the order so the
+    /// gesture stays continuous.
+    pub fn cycle_next(&self, current: Option<&str>) -> Option<String> {
+        let order = self.cycle_order();
+        if order.is_empty() {
+            return None;
+        }
+        let idx = current
+            .and_then(|c| order.iter().position(|n| n == c))
+            .map(|i| (i + 1) % order.len())
+            .unwrap_or(0);
+        order.into_iter().nth(idx)
+    }
+
+    /// Mirror of `cycle_next` for Shift+Left.
+    pub fn cycle_prev(&self, current: Option<&str>) -> Option<String> {
+        let order = self.cycle_order();
+        if order.is_empty() {
+            return None;
+        }
+        let idx = current
+            .and_then(|c| order.iter().position(|n| n == c))
+            .map(|i| if i == 0 { order.len() - 1 } else { i - 1 })
+            .unwrap_or_else(|| order.len() - 1);
+        order.into_iter().nth(idx)
+    }
+
     /// If the cursor is on a section header or one of its members,
     /// return that section's name. Otherwise (ungrouped or empty), None.
     /// Used to remember which group a new session should land in.
@@ -349,6 +417,31 @@ impl AppState {
                     .get(self.selected)
                     .map(|v| v.identity().to_string());
 
+                // Race guard: the actor's 1Hz `do_refresh` can have
+                // started capturing the session list *before* it
+                // reached our `KillSession` in `cmd_rx`, so the
+                // SessionsRefreshed we're holding can still contain
+                // the freshly-killed session. Filter both the
+                // session view list and the live-name list used for
+                // reconcile so the dead row doesn't briefly
+                // reappear in ungrouped as `? <name>`.
+                //
+                // Any name that's NOT in this incoming live list is
+                // confirmed gone — drop it from the suppression set
+                // so the entry can never shadow a future create
+                // that happens to land on the same internal name.
+                let sessions: Vec<SessionView> = if self.recently_killed.is_empty() {
+                    sessions
+                } else {
+                    let live_names: std::collections::HashSet<String> =
+                        sessions.iter().map(|v| v.name().to_string()).collect();
+                    self.recently_killed.retain(|n| live_names.contains(n));
+                    sessions
+                        .into_iter()
+                        .filter(|v| !self.recently_killed.contains(v.name()))
+                        .collect()
+                };
+
                 self.sessions = sessions;
 
                 // Restart-swap (dead-row restart-from-recents only —
@@ -435,6 +528,16 @@ impl AppState {
                     view.preview = Some(bytes);
                 }
             }
+            AppMsg::StatusRefreshed { name, status } => {
+                // Sibling of `PreviewRefreshed` — push-style status
+                // update from the actor's fast tick. Updates the
+                // matching SessionView's `status` field in place; no
+                // reconcile or statusbar work. A no-op if the named
+                // session was killed between detect and delivery.
+                if let Some(view) = self.sessions.iter_mut().find(|v| v.name() == name) {
+                    view.status = status;
+                }
+            }
             AppMsg::EmbedBytes { .. } => {
                 // The reducer is pure and AppState doesn't own the
                 // embed (the App struct does — embed has runtime
@@ -483,8 +586,22 @@ impl AppState {
                                     // the user's groups), so the only
                                     // way an entry leaves the sidebar
                                     // is via this explicit-action path.
+                                    //
+                                    // Also record the internal name in
+                                    // `recently_killed` so a
+                                    // `SessionsRefreshed` already in
+                                    // flight (the 1Hz `do_refresh` can
+                                    // fire just before the actor
+                                    // processes our `KillSession`)
+                                    // doesn't reconcile-re-add the
+                                    // still-momentarily-alive session
+                                    // as a fresh ungrouped row. The
+                                    // refresh handler clears the entry
+                                    // the first time the live list
+                                    // confirms the session is gone.
                                     if let Command::KillSession(internal) = &c {
                                         self.sidebar.remove_session(internal);
+                                        self.recently_killed.insert(internal.clone());
                                         self.clamp_selection();
                                         self.save_sidebar(&mut out);
                                     }
@@ -556,6 +673,13 @@ impl AppState {
             AppMsg::Resume => { /* redraw happens unconditionally below */ }
             AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
                 // Phase 1: attach is done inline; these arms are for future use.
+            }
+            AppMsg::ModifySpecReady { .. } => {
+                // Handled directly in `App::run` (it needs the recents
+                // store, which lives on the App, not AppState). If a
+                // message reaches here the intercept upstream is
+                // broken — log and drop.
+                tracing::warn!("ModifySpecReady reached reducer — App::run intercept is broken");
             }
         }
         out
@@ -740,6 +864,26 @@ impl AppState {
                             internal
                         ));
                     }
+                }
+            }
+            // `m`: modify the selected live session's stored spec.
+            // Opens the new-session modal in modify mode, pre-filled
+            // from the session's persisted `@bosun_*` metadata so the
+            // user can adjust flags (e.g. add `--resume`), rename,
+            // change path, or switch agent. Save only — the running
+            // pane keeps its current agent; the next `R` picks up
+            // the new spec.
+            //
+            // The pre-fill is async (tmux read), so we just emit the
+            // open command here; the actor responds with
+            // `AppMsg::ModifySpecReady` and the app loop opens the
+            // modal from that. No-op on a section header or a dead
+            // row (no live spec to read).
+            (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                if let Some(sel) = self.selected_session() {
+                    out.push(Command::OpenModifySession {
+                        internal: sel.name().to_string(),
+                    });
                 }
             }
             (KeyCode::Char('n'), KeyModifiers::NONE)
@@ -1136,6 +1280,16 @@ impl AppState {
             {
                 self.dragging_divider = true;
             }
+            // Click on a session-list row: jump the selection straight
+            // there. Modal-open is filtered by `point_in_list` so a
+            // click in the dimmed list underneath a confirm dialog
+            // doesn't silently move the cursor.
+            MouseEventKind::Down(MouseButton::Left) if self.point_in_list(&layouts, m) => {
+                if let Some(idx) = crate::ui::session_list::entry_at_row(self, layouts.list, m.row)
+                {
+                    self.selected = idx;
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
                 // Raw column — `layout::compute` clamps it to the
                 // allowed range (MIN_LIST_WIDTH..body - MIN_PREVIEW_WIDTH - 1).
@@ -1357,8 +1511,51 @@ impl App {
                     use crossterm::event::{KeyCode, KeyModifiers};
                     let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
                         && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Shift+Left / Shift+Right cycle the focused
+                    // embed across sessions in sidebar order. We
+                    // intercept here (before the embed write) so the
+                    // chord never reaches the inner tmux's own
+                    // S-Left/S-Right binding — bosun owns the
+                    // session selection, picks the next/prev live
+                    // session in a stable order the user actually
+                    // sees (sidebar order, not MRU), and respawns
+                    // the embed on it. Side effect: the sidebar
+                    // cursor and focus border follow the switch
+                    // automatically because we move
+                    // `self.state.selected` first.
+                    let is_shift_left = matches!(k.code, KeyCode::Left)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_right = matches!(k.code, KeyCode::Right)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
                     if is_ctrl_q {
                         self.exit_focus().await;
+                    } else if is_shift_left || is_shift_right {
+                        let cur = self.state.selected_session_name();
+                        let target = if is_shift_right {
+                            self.state.cycle_next(cur.as_deref())
+                        } else {
+                            self.state.cycle_prev(cur.as_deref())
+                        };
+                        if let Some(name) = target {
+                            // Skip the no-op single-session case so
+                            // we don't pay for a respawn just to
+                            // land on the same session.
+                            if Some(name.as_str()) != cur.as_deref() {
+                                if let Some(idx) = self.state.sidebar.find_identity(&name) {
+                                    self.state.selected = idx;
+                                }
+                                if let Err(e) = self
+                                    .respawn_embed(
+                                        &name,
+                                        crate::ui::embed_terminal::AttachMode::Focused,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("cycle respawn: {}", e);
+                                    self.state.warning = Some(format!("cycle: {e}"));
+                                }
+                            }
+                        }
                     } else {
                         let ctx = crate::ui::key_encode::EncodeContext {
                             application_cursor: self
@@ -1402,20 +1599,53 @@ impl App {
                     continue;
                 }
                 if let AppMsg::Mouse(m) = &msg {
+                    // Click outside the embed area while focused =
+                    // "click out": auto-exit focus so the sidebar
+                    // takes the focus border and keystrokes return
+                    // to bosun's reducer. Mirrors the desktop habit
+                    // of clicking out of a text field to defocus.
+                    // Falls through to the normal mouse pipeline
+                    // (handle_mouse) so the same click can still
+                    // update the list selection or start a divider
+                    // drag — the user gets both effects from one
+                    // gesture, no second click required.
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                        && !self.state.dragging_divider
+                    {
+                        let in_preview = self
+                            .preview_rect()
+                            .map(|a| point_in_rect(a, m.column, m.row))
+                            .unwrap_or(false);
+                        if !in_preview {
+                            self.exit_focus().await;
+                        }
+                    }
                     // Forward mouse events to the PTY only when:
                     //   (a) the inner app has enabled mouse tracking
                     //       (otherwise we'd dump SGR-1006 escape
                     //       bytes into a shell that interprets them
-                    //       as literal text), and
+                    //       as literal text),
                     //   (b) the event lands inside the preview /
                     //       embed rectangle (mouse over the sidebar
                     //       or status bar still goes to bosun for
-                    //       divider drag etc).
+                    //       divider drag etc), and
+                    //   (c) the user isn't currently mid-drag on the
+                    //       divider — once a divider drag is in
+                    //       progress, every Drag/Up event must reach
+                    //       `handle_mouse` so divider_x tracks the
+                    //       cursor and Up ends the drag, even when
+                    //       the cursor crosses into the preview
+                    //       pane. Without this, dragging the divider
+                    //       rightward (toward the preview) silently
+                    //       feeds drag events to the inner app
+                    //       (which has mouse tracking on) and the
+                    //       divider stops moving the moment the
+                    //       cursor leaves the list side.
                     // Coordinates are translated to embed-local
                     // 0-based; the encoder converts to the 1-based
                     // form SGR 1006 expects.
                     let wants = self.embed.as_ref().is_some_and(|e| e.wants_mouse());
-                    if wants {
+                    if wants && !self.state.dragging_divider {
                         if let Some(area) = self.preview_rect() {
                             if point_in_rect(area, m.column, m.row) {
                                 let local_col = m.column - area.x;
@@ -1434,9 +1664,29 @@ impl App {
                         }
                     }
                     // Mouse outside the embed area (or app doesn't
-                    // want mouse): fall through to bosun's normal
-                    // handler so divider drag etc. still works
-                    // even while focused.
+                    // want mouse, or divider drag in progress): fall
+                    // through to bosun's normal handler so divider
+                    // drag etc. still works even while focused.
+                }
+            } else if let AppMsg::Mouse(m) = &msg {
+                // Click inside the preview while unfocused = "click
+                // in": enter focus on the currently selected session
+                // — the mirror of the click-out handler above. Lets
+                // the user move between sidebar and embed entirely
+                // with the mouse (sidebar click → defocus + select,
+                // preview click → enter focus). The triggering click
+                // itself isn't forwarded into the embed; subsequent
+                // clicks under the new Focused mode are.
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.state.dragging_divider
+                {
+                    let in_preview = self
+                        .preview_rect()
+                        .map(|a| point_in_rect(a, m.column, m.row))
+                        .unwrap_or(false);
+                    if in_preview {
+                        self.enter_focus().await;
+                    }
                 }
             }
 
@@ -1460,6 +1710,34 @@ impl App {
             // messages encountered during the drain are preserved
             // and re-sent so the normal flow handles them on the
             // next iteration.
+            // Modify-session: the actor has finished the JIT
+            // metadata read; open the new-session modal in modify
+            // mode pre-filled from `spec`. Lives here (not in
+            // `apply`) because the modal needs the recents store
+            // (owned by `App`) for its Ctrl+R picker, and an
+            // explicit redraw afterward so the modal renders this
+            // frame instead of waiting for the next event.
+            if let AppMsg::ModifySpecReady { internal, spec } = msg {
+                let recents = self.store.list_recents(50).unwrap_or_default();
+                self.state.modals.push(Box::new(
+                    crate::ui::modal::new_session::NewSessionModal::for_modify(
+                        internal, spec, recents,
+                    ),
+                ));
+                terminal
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
+                    .map_err(term_err)?;
+                continue;
+            }
+
             if let AppMsg::EmbedBytes { session, bytes } = msg {
                 if let Some(embed) = self.embed.as_mut() {
                     if embed.session() == session {
@@ -1944,14 +2222,24 @@ impl App {
             // failed), focus mode has nothing to attach to.
             return;
         }
+        // Flip the focus flag *before* the respawn so `preview_dims`
+        // (called inside `respawn_embed`) returns the shrunk
+        // dimensions that account for the focus border that's about
+        // to appear. If we did this after, the new PTY would be
+        // sized to the full preview rect and the inner app would
+        // wrap lines into the cells the border is about to claim —
+        // the same "Here's → ere's" clipping we're trying to fix.
+        self.embed_focused = true;
         if let Err(e) = self
             .respawn_embed(&session, crate::ui::embed_terminal::AttachMode::Focused)
             .await
         {
+            // Revert the flag so the UI doesn't sit in a focused
+            // state with no working PTY behind it.
+            self.embed_focused = false;
             self.state.warning = Some(format!("focus: {e}"));
             return;
         }
-        self.embed_focused = true;
         self.state.warning = Some("focus mode — Ctrl-Q to exit".to_string());
     }
 
@@ -2022,9 +2310,25 @@ impl App {
     /// in the narrow-terminal case where there's no preview area at
     /// all — the embed grid stays sized to something `vt100` accepts
     /// even though no rendering happens.
+    ///
+    /// In single-window mode, shrink by 2 rows + 2 cols regardless
+    /// of focus state. The focused branch is the obvious case (the
+    /// focus border occupies the perimeter cells); the unfocused
+    /// branch reserves the same space as a blank "transparent
+    /// border" so the inner app's wrap width doesn't change when
+    /// the user toggles focus. Without this, every line would
+    /// reflow by one column on attach/detach and paragraphs would
+    /// visibly jump. The matching render-area shrink lives in
+    /// `ui::preview::render`.
     fn preview_dims(&self) -> (u16, u16) {
         match self.preview_rect() {
-            Some(p) => (p.height, p.width),
+            Some(p) => {
+                if self.state.single_window_mode {
+                    (p.height.saturating_sub(2), p.width.saturating_sub(2))
+                } else {
+                    (p.height, p.width)
+                }
+            }
             None => (4, 20),
         }
     }
@@ -2741,6 +3045,56 @@ mod tests {
         assert_eq!(
             s.session_history.get("bosun-abc"),
             Some(&"WorkStuff".to_string())
+        );
+    }
+
+    /// Regression: a `SessionsRefreshed` that the actor had already
+    /// captured before processing our `KillSession` must not bring
+    /// the just-killed session back into the sidebar as a phantom
+    /// dead row. Without the `recently_killed` guard, the
+    /// still-momentarily-alive session would land in ungrouped as
+    /// `? <name>` for the brief window between confirm and the
+    /// next refresh — exactly the bug the user reported.
+    #[test]
+    fn refresh_in_flight_after_kill_does_not_resurrect_session() {
+        let mut s = AppState::default();
+        s.sidebar = model(&["bosun-keep", "bosun-doomed"], vec![]);
+        // Simulate the modal's KillSession bookkeeping that the run
+        // loop normally does: remove from sidebar + mark recently
+        // killed. (The full path runs through StackDispatch::Closed
+        // in the App, which we don't drive in this pure-reducer
+        // test.)
+        s.sidebar.remove_session("bosun-doomed");
+        s.recently_killed.insert("bosun-doomed".to_string());
+
+        // An in-flight refresh still has the doomed session alive.
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-keep"), ses("bosun-doomed")],
+            select_after: None,
+        });
+
+        assert_eq!(
+            s.sidebar.ungrouped,
+            vec!["bosun-keep".to_string()],
+            "killed session must not reappear in ungrouped"
+        );
+        assert!(
+            s.sessions.iter().all(|v| v.name() != "bosun-doomed"),
+            "killed session must be filtered out of the sessions view"
+        );
+        assert!(
+            s.recently_killed.contains("bosun-doomed"),
+            "guard stays armed until the live list confirms the kill"
+        );
+
+        // Next refresh: kill confirmed (doomed gone from live).
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-keep")],
+            select_after: None,
+        });
+        assert!(
+            s.recently_killed.is_empty(),
+            "guard clears once the kill is observable in the live list"
         );
     }
 

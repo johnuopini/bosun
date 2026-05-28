@@ -82,10 +82,26 @@ pub fn render(
     // alignment inside its screen grid. Falls through to the polled
     // snapshot path for non-focused sessions, when the embed is
     // disabled, or when the spawn failed.
+    //
+    // Shrink by 1 cell on each side whenever single-window mode is
+    // on — focused or not. When focused the focus border occupies
+    // those reserved cells; when unfocused they stay blank, acting
+    // as a transparent placeholder. Reserving the space in both
+    // states keeps the inner app's wrap width constant across focus
+    // toggles, so attaching / detaching no longer shifts every line
+    // by a column (which used to reflow paragraphs and look like
+    // the content was jumping). The matching PTY shrink lives in
+    // `App::preview_dims` so the inner app's terminal dimensions
+    // match the area we actually render into.
     if let Some(embed) = embed {
         if let Some(name) = state.selected_session_name() {
             if embed.session() == name {
-                embed.render(frame.buffer_mut(), area);
+                let render_area = if state.single_window_mode {
+                    shrink_for_focus_border(area)
+                } else {
+                    area
+                };
+                embed.render(frame.buffer_mut(), render_area);
                 return;
             }
         }
@@ -117,6 +133,17 @@ pub fn render(
     Paragraph::new(text)
         .scroll((scroll_y, 0))
         .render(area, frame.buffer_mut());
+}
+
+/// Inset `area` by one cell on every side. Returns a zero-sized
+/// rect if the area is too small to inset safely — callers should
+/// already have wider minimum-rect handling, so this is a last-line
+/// guard rather than a meaningful fallback.
+fn shrink_for_focus_border(area: Rect) -> Rect {
+    if area.width < 2 || area.height < 2 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
 }
 
 fn reset_area(buf: &mut Buffer, area: Rect) {

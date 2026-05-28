@@ -121,6 +121,83 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     frame.render_widget(p, area);
 }
 
+/// Lines a single visible entry occupies in the rendered list.
+/// Sessions render as two lines (primary + meta); section headers
+/// and dead-row sessions are single-line. Kept as a small shared
+/// helper so [`entry_at_row`] stays in lockstep with [`render`].
+fn entry_line_count(state: &AppState, entry: &VisibleEntry<'_>) -> u16 {
+    match entry {
+        VisibleEntry::UngroupedSession(n) => {
+            if state.session_by_name(n).is_some() {
+                2
+            } else {
+                1
+            }
+        }
+        VisibleEntry::SectionHeader(_) => 1,
+        VisibleEntry::SectionMember { internal, .. } => {
+            if state.session_by_name(internal).is_some() {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// Same scroll heuristic as [`render`] but computed from line
+/// counts only — no rendered `Line`s needed. Centers the selected
+/// entry at roughly the top third of the viewport while keeping
+/// its last line on-screen.
+fn compute_scroll(counts: &[u16], selected: usize, viewport: u16) -> u16 {
+    let total_lines: u16 = counts.iter().copied().fold(0u16, u16::saturating_add);
+    if total_lines <= viewport || viewport == 0 {
+        return 0;
+    }
+    let sel = selected.min(counts.len().saturating_sub(1));
+    let first: u16 = counts
+        .iter()
+        .take(sel)
+        .copied()
+        .fold(0u16, u16::saturating_add);
+    let last = first.saturating_add(counts.get(sel).copied().unwrap_or(0).saturating_sub(1));
+    let max_scroll = total_lines.saturating_sub(viewport);
+    let target = viewport / 3;
+    let mut s = first.saturating_sub(target);
+    if last >= s.saturating_add(viewport) {
+        s = last.saturating_add(1).saturating_sub(viewport);
+    }
+    s.min(max_scroll)
+}
+
+/// Map an absolute terminal row (mouse Y coord) to a visible-entry
+/// index in the sidebar. Returns `None` when the row is outside the
+/// list rect or past the last entry's last line. Used by the click
+/// handler so a mouse-down on a session row jumps the selection
+/// straight to it (same effect as pressing j/k until the cursor
+/// lands).
+pub fn entry_at_row(state: &AppState, list_area: Rect, abs_row: u16) -> Option<usize> {
+    if abs_row < list_area.y || abs_row >= list_area.y.saturating_add(list_area.height) {
+        return None;
+    }
+    let visible = state.sidebar.visible();
+    if visible.is_empty() {
+        return None;
+    }
+    let counts: Vec<u16> = visible.iter().map(|e| entry_line_count(state, e)).collect();
+    let scroll = compute_scroll(&counts, state.selected, list_area.height);
+    let local_row = abs_row - list_area.y;
+    let target_line = local_row.saturating_add(scroll);
+    let mut acc: u16 = 0;
+    for (i, c) in counts.iter().enumerate() {
+        if target_line >= acc && target_line < acc + c {
+            return Some(i);
+        }
+        acc = acc.saturating_add(*c);
+    }
+    None
+}
+
 fn status_color(status: Status, theme: &Theme) -> Color {
     match status {
         Status::Running => theme.status_running,
