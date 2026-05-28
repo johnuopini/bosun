@@ -1,7 +1,7 @@
 # Bosun 2.0 — Implementation Plan
 
 **Branch:** `2.0`
-**Status:** Active — Steps 0–4 landed; iterating on input + UX polish
+**Status:** Active — Steps 0–4 landed; iterating on input + mouse UX polish
 **Companion doc:** `EMBEDDED_TERMINAL_FEASIBILITY.md`
 
 ## Status (rolling — most recent first)
@@ -12,6 +12,38 @@ A/B use against `0.4.1`.
 
 **Shipped on 2.0 (in order):**
 
+- **Live per-session status detection.** Status detection moved from
+  the 1Hz full-refresh tick onto the fast preview tick (default
+  200ms) and now runs for every managed session, not just the
+  focused one. Sidebar glyphs (`●◐○✕`) update for all agents
+  simultaneously at ~5Hz instead of taking up to a full second. New
+  lightweight `AppMsg::StatusRefreshed` mirrors the
+  `PreviewRefreshed` push pattern so the hot path stays
+  reconcile-free. Smoother retuned for the faster cadence — any
+  transition *to* Running or Waiting is instant (user-visible
+  events), only demotion *to* Idle keeps hysteresis to filter brief
+  quiet windows between agent bursts. Claude and Codex detectors
+  rewritten to scope their substring scans to the bottom ~12 visible
+  lines (where the prompt UI actually lives) and to recognize
+  Claude's box-drawn prompt directly, which kills the "stale
+  Thinking… in scrollback pegs me to Running forever" failure mode.
+- **Mouse two-way nav between sidebar and embed.** Click on a
+  session row → exit focus + jump selection to that row in one
+  gesture. Click inside the preview while unfocused → enter focus
+  on the selected session. The triggering click isn't forwarded
+  into the embed (macOS click-to-focus convention); subsequent
+  clicks under the new Focused mode go through to the inner app
+  as normal. `ui::session_list::entry_at_row` mirrors the
+  renderer's line-count + scroll math so a click resolves to the
+  entry actually under the cursor.
+- **Divider drag right-direction fix.** When the embed had mouse
+  tracking on (Claude Code, vim, etc.), drag events that crossed
+  into the preview pane were being forwarded to the inner app and
+  `handle_mouse` never saw them — the divider stopped moving the
+  moment the cursor left the list side. Fixed by gating the embed
+  mouse-forwarding path on `!dragging_divider` so an in-flight
+  divider drag receives every Drag/Up event regardless of cursor
+  position.
 - **Single-window focus border** — accent-colored 1-cell outline
   around the pane that currently has keyboard focus (list when
   detached, embed when in single-window focus). Only drawn when
@@ -49,22 +81,33 @@ A/B use against `0.4.1`.
   env `BOSUN_PREVIEW_TICK_MS`); cherry-picked separately to `main`
   and shipped as v0.4.0.
 
-**Deferred (documented in commit messages, not yet started):**
+**Deferred — input correctness tail (Step 4 cleanup):**
 
 - modifyOtherKeys mode tracking (parse DECSET 2027 / 1037 from byte
   stream so we only emit the extended encoding when the application
-  asked for it).
-- Kitty keyboard protocol (CSI u).
+  asked for it). Currently always-on, which is fine for the apps
+  we've tested but technically out-of-spec.
+- Kitty keyboard protocol (CSI u). Stretch — nothing in active use
+  needs it yet.
 - Application keypad mode (DECPAM) handling for numpad.
-- Workspaces (`bosun.toml` per project, auto-launch N agents).
-- Broadcast / macros, RPC, snapshot scrubber, cost telemetry — see
-  "2.0 ideas backlog" below.
 
-**Open polish question:** the focus border currently overlays the
-embed's perimeter cells. If that ends up bothering us in real use,
-the alternative is to shrink the embed inner area + resize the PTY
-by 1 on each side. Stable dims either way, just different trade-off
-on whether the outline masks content vs. occupies dedicated space.
+**Deferred — headline features (see "2.0 ideas backlog" below):**
+
+- Workspaces (`bosun.toml` per project, auto-launch N agents) —
+  strongest post-embed narrative.
+- Broadcast / macros, RPC, snapshot scrubber, cost telemetry.
+
+**Open polish questions:**
+
+- The focus border currently overlays the embed's perimeter cells.
+  If that ends up bothering us in real use, the alternative is to
+  shrink the embed inner area + resize the PTY by 1 on each side.
+  Stable dims either way, just different trade-off on whether the
+  outline masks content vs. occupies dedicated space.
+- Should the click that enters focus also pass through to the embed
+  (macOS-style click-through)? Currently it's swallowed and a second
+  click is needed to interact. Easy to revisit if real use shows
+  it's annoying.
 
 ## What 2.0 is about
 
