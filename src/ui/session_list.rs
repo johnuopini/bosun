@@ -52,10 +52,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
         match entry {
             VisibleEntry::Ungrouped(c) => {
                 let tabs = c.members.len() as u16;
+                let bg_busy = background_activity(state, c);
                 match state.session_by_name(&c.active) {
                     Some(v) => {
                         out.push(render_primary_line(
-                            v, selected, false, tabs, area.width, theme,
+                            v, selected, false, tabs, bg_busy, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, false, area.width, theme));
                     }
@@ -80,10 +81,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
             }
             VisibleEntry::Member { container, .. } => {
                 let tabs = container.members.len() as u16;
+                let bg_busy = background_activity(state, container);
                 match state.session_by_name(&container.active) {
                     Some(v) => {
                         out.push(render_primary_line(
-                            v, selected, true, tabs, area.width, theme,
+                            v, selected, true, tabs, bg_busy, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, true, area.width, theme));
                     }
@@ -273,11 +275,28 @@ fn render_section_line(
     ])
 }
 
+/// True iff at least one **background** tab (anything other than
+/// `container.active`) is currently Running or Waiting — i.e. a
+/// tab the user can't see is doing work right now. Used to render
+/// a small accent dot on the sidebar row so multi-tab containers
+/// surface background activity without the user having to cycle
+/// through tabs.
+fn background_activity(state: &AppState, container: &crate::sidebar::Container) -> bool {
+    use crate::tmux::detector::Status;
+    container
+        .members
+        .iter()
+        .filter(|m| *m != &container.active)
+        .filter_map(|m| state.session_by_name(m))
+        .any(|v| matches!(v.status, Status::Running | Status::Waiting))
+}
+
 fn render_primary_line(
     view: &SessionView,
     selected: bool,
     indented: bool,
     tabs: u16,
+    bg_busy: bool,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -309,6 +328,10 @@ fn render_primary_line(
     } else {
         String::new()
     };
+    // Single accent dot when a non-active tab is busy. Same row,
+    // right after the (N) badge, so the user can tell at a glance
+    // whether a background tab is doing work.
+    let activity_label = if tabs > 1 && bg_busy { " ●" } else { "" };
     let windows_label = format!("  {}w", view.session.windows);
     let attached_label = if view.session.attached {
         "  •attached"
@@ -323,6 +346,7 @@ fn render_primary_line(
         + 2
         + name.chars().count()
         + tab_label.chars().count()
+        + activity_label.chars().count()
         + windows_label.chars().count()
         + attached_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
@@ -338,6 +362,12 @@ fn render_primary_line(
         spans.push(Span::styled(
             tab_label,
             Style::default().fg(theme.text_muted).bg(bg),
+        ));
+    }
+    if !activity_label.is_empty() {
+        spans.push(Span::styled(
+            activity_label,
+            Style::default().fg(theme.accent).bg(bg),
         ));
     }
     spans.push(Span::styled(

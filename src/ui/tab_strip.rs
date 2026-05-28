@@ -36,6 +36,13 @@ pub struct Slot {
 pub struct Layout {
     pub tabs: Vec<Slot>,
     pub plus: Option<Slot>,
+    /// Index (into the caller's `tab_labels` slice) of the leftmost
+    /// visible tab. Useful for renderers that need to map slot
+    /// positions back to original tab data, and for click handlers
+    /// that need to resolve a slot to its internal tmux name.
+    pub first_visible: usize,
+    /// Index (exclusive) one past the rightmost visible tab.
+    pub last_visible: usize,
 }
 
 impl Layout {
@@ -62,13 +69,20 @@ fn contains(r: Rect, col: u16, row: u16) -> bool {
 /// Compute the on-screen rectangles for each tab pill and the
 /// add-tab `+` button. Tabs are laid out left-to-right starting at
 /// `area.x`; the `+` button always reserves its 3 columns at the
-/// right edge so overflow can't push it off-screen. Any tab that
-/// won't fit in the remaining width is dropped from the layout —
-/// for phase 2 that's an acceptable degradation; phase 3 can add
-/// scroll arrows.
-pub fn compute(area: Rect, tab_labels: &[&str]) -> Layout {
+/// right edge so overflow can't push it off-screen.
+///
+/// When more tabs exist than fit, the window slides so the active
+/// tab (`active_idx`) stays visible — dropped tabs come from the
+/// LEFT, with the active tab landing as the rightmost-visible
+/// pill. The returned `Layout.first_visible` and
+/// `Layout.last_visible` index back into the caller's `tab_labels`
+/// slice; the caller uses them to render the slot keys correctly.
+/// `active_idx = None` falls back to "fit from the front" — the
+/// original phase 2 behavior.
+pub fn compute(area: Rect, tab_labels: &[&str], active_idx: Option<usize>) -> Layout {
     let mut out = Layout::default();
-    if area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || tab_labels.is_empty() {
+        out.plus = plus_slot(area);
         return out;
     }
     let plus_w = PLUS_LABEL.chars().count() as u16;
@@ -76,28 +90,69 @@ pub fn compute(area: Rect, tab_labels: &[&str]) -> Layout {
         return out;
     }
     let plus_rect = Rect::new(area.right().saturating_sub(plus_w), area.y, plus_w, 1);
-    let mut available = area.width.saturating_sub(plus_w);
-    let mut x = area.x;
-    for label in tab_labels {
-        let label_w = label.chars().count() as u16;
-        // Pill content: " <glyph> <label> " — 1 pad + 1 glyph + 1
-        // space + label_w + 1 pad.
-        let tab_w = TAB_PAD * 2 + 2 + label_w;
-        if tab_w > available {
+    let available = area.width.saturating_sub(plus_w);
+
+    let widths: Vec<u16> = tab_labels
+        .iter()
+        .map(|l| TAB_PAD * 2 + 2 + l.chars().count() as u16)
+        .collect();
+
+    // First pass: fit from the front. Common case (few tabs) ends here.
+    let mut first = 0usize;
+    let mut last_excl = 0usize;
+    let mut acc: u16 = 0;
+    for (i, w) in widths.iter().enumerate() {
+        if acc.saturating_add(*w) > available {
             break;
         }
-        out.tabs.push(Slot {
-            key: String::new(), // caller stamps the internal name in render()
-            rect: Rect::new(x, area.y, tab_w, 1),
-        });
-        x = x.saturating_add(tab_w);
-        available = available.saturating_sub(tab_w);
+        acc = acc.saturating_add(*w);
+        last_excl = i + 1;
     }
+
+    // If active falls outside the visible window, slide so active
+    // is the rightmost-visible tab. Earlier tabs scroll off the
+    // left edge; the user can press `[` to bring them back.
+    if let Some(a) = active_idx {
+        if a >= last_excl {
+            last_excl = a + 1;
+            let mut acc2: u16 = 0;
+            first = a + 1;
+            for i in (0..last_excl).rev() {
+                if acc2.saturating_add(widths[i]) > available {
+                    break;
+                }
+                acc2 = acc2.saturating_add(widths[i]);
+                first = i;
+            }
+        }
+    }
+
+    let mut x = area.x;
+    for w in widths.iter().take(last_excl).skip(first) {
+        out.tabs.push(Slot {
+            key: String::new(),
+            rect: Rect::new(x, area.y, *w, 1),
+        });
+        x = x.saturating_add(*w);
+    }
+    out.first_visible = first;
+    out.last_visible = last_excl;
     out.plus = Some(Slot {
         key: "+".to_string(),
         rect: plus_rect,
     });
     out
+}
+
+fn plus_slot(area: Rect) -> Option<Slot> {
+    let plus_w = PLUS_LABEL.chars().count() as u16;
+    if area.width < plus_w || area.height == 0 {
+        return None;
+    }
+    Some(Slot {
+        key: "+".to_string(),
+        rect: Rect::new(area.right().saturating_sub(plus_w), area.y, plus_w, 1),
+    })
 }
 
 /// Render the tab strip into `area` and return the layout for
@@ -126,7 +181,11 @@ pub fn render(
         })
         .collect();
     let label_refs: Vec<&str> = resolved.iter().map(|(l, _)| l.as_str()).collect();
-    let mut layout = compute(area, &label_refs);
+    let active_idx = container
+        .members
+        .iter()
+        .position(|m| m == &container.active);
+    let mut layout = compute(area, &label_refs, active_idx);
 
     // Paint the strip background so we never bleed onto whatever
     // was under it previously (the embed redraws every frame too,
@@ -138,15 +197,16 @@ pub fn render(
         cell.set_style(bg_style);
     }
 
-    // Draw each tab pill in slot order.
-    for (slot, internal) in layout.tabs.iter_mut().zip(container.members.iter()) {
+    // Draw each tab pill in slot order. The visible window maps
+    // `layout.tabs[i]` → `container.members[first_visible + i]`.
+    for (i, slot) in layout.tabs.iter_mut().enumerate() {
+        let member_idx = layout.first_visible + i;
+        let internal = match container.members.get(member_idx) {
+            Some(m) => m,
+            None => continue,
+        };
         slot.key = internal.clone();
-        let idx = container
-            .members
-            .iter()
-            .position(|m| m == internal)
-            .unwrap_or(0);
-        let (label, status) = &resolved[idx];
+        let (label, status) = &resolved[member_idx];
         let active = internal == &container.active;
         let style = if active {
             Style::default().bg(theme.selection_bg).fg(theme.text)
@@ -192,13 +252,15 @@ mod tests {
     #[test]
     fn compute_lays_tabs_left_to_right_with_plus_at_right() {
         let area = Rect::new(0, 5, 40, 1);
-        let layout = compute(area, &["one", "two"]);
+        let layout = compute(area, &["one", "two"], Some(0));
         assert_eq!(layout.tabs.len(), 2);
         // " ● one " = 1+1+1+3+1 = 7 cols; same for "two".
         assert_eq!(layout.tabs[0].rect, Rect::new(0, 5, 7, 1));
         assert_eq!(layout.tabs[1].rect, Rect::new(7, 5, 7, 1));
         // " + " always at the right edge (3 cols).
         assert_eq!(layout.plus.as_ref().unwrap().rect, Rect::new(37, 5, 3, 1));
+        assert_eq!(layout.first_visible, 0);
+        assert_eq!(layout.last_visible, 2);
     }
 
     #[test]
@@ -206,15 +268,27 @@ mod tests {
         // Five tabs at 7 cols each = 35, plus button = 3 → need
         // 38 cols. With only 25 cols, only 3 tabs fit.
         let area = Rect::new(0, 0, 25, 1);
-        let layout = compute(area, &["one", "two", "thr", "fou", "fiv"]);
+        let layout = compute(area, &["one", "two", "thr", "fou", "fiv"], Some(0));
         assert_eq!(layout.tabs.len(), 3);
         assert!(layout.plus.is_some());
     }
 
     #[test]
+    fn compute_scrolls_window_to_keep_active_visible() {
+        // 5 tabs, only 3 fit. Active is index 4 (rightmost). The
+        // window should slide so active is the rightmost-visible
+        // pill and tabs 2..5 are shown.
+        let area = Rect::new(0, 0, 25, 1);
+        let layout = compute(area, &["one", "two", "thr", "fou", "fiv"], Some(4));
+        assert_eq!(layout.first_visible, 2);
+        assert_eq!(layout.last_visible, 5);
+        assert_eq!(layout.tabs.len(), 3);
+    }
+
+    #[test]
     fn hit_resolves_plus_then_tabs() {
         let area = Rect::new(0, 0, 40, 1);
-        let layout = compute(area, &["one", "two"]);
+        let layout = compute(area, &["one", "two"], Some(0));
         // Click inside the first tab.
         let hit = layout.hit(3, 0).unwrap();
         assert_eq!(hit.rect, Rect::new(0, 0, 7, 1));

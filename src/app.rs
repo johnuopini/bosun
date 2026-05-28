@@ -441,7 +441,11 @@ impl AppState {
             })
             .collect();
         let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-        let layout = crate::ui::tab_strip::compute(strip, &label_refs);
+        let active_idx = container
+            .members
+            .iter()
+            .position(|m| m == &container.active);
+        let layout = crate::ui::tab_strip::compute(strip, &label_refs, active_idx);
         let Some(slot) = layout.hit(col, row) else {
             return;
         };
@@ -449,9 +453,19 @@ impl AppState {
             self.request_add_tab();
             return;
         }
-        // Tab click — switch the container's active tab. Persist
-        // so the choice survives restart.
-        let new_active = slot.key.clone();
+        // Resolve slot → container.members[i]. The renderer stamps
+        // slot.key with the internal name; the windowing scheme
+        // only ever shows visible tabs, so the keys match members
+        // 1:1 within the visible window.
+        let slot_idx = layout
+            .tabs
+            .iter()
+            .position(|s| s.rect.x == slot.rect.x && s.rect.width == slot.rect.width)
+            .unwrap_or(0);
+        let member_idx = layout.first_visible + slot_idx;
+        let Some(new_active) = container.members.get(member_idx).cloned() else {
+            return;
+        };
         let container_id = container.id.clone();
         if self.sidebar.set_active_tab(&container_id, &new_active) {
             self.save_sidebar(out);
