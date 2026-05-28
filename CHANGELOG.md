@@ -4,6 +4,20 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] — 2026-05-28
+
+### Fixed
+- **Narrow-terminal embed handling.** The embedded terminal and
+  preview pane are now gated on the same width threshold as the
+  preview split (`PREVIEW_MIN_WIDTH`, raised 72 → 80 cols). On a
+  terminal too narrow to render the preview, single-window mode
+  refuses to turn ON (with a warning showing the required width),
+  and an already-focused embed drops out of focus automatically so
+  keystrokes stop routing into an invisible PTY. The
+  `single_window_mode` preference is preserved across the resize, so
+  focus re-enters normally once the terminal grows back. Both checks
+  are resize-driven and react live without a restart.
+
 ## [2.0.0] — 2026-05-28
 
 The 2.0 release turns bosun from a session *picker* into a session

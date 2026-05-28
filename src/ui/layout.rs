@@ -3,13 +3,13 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 /// Below this total terminal width, the preview pane is hidden and
-/// the session list takes the full body width. Threshold chosen so
-/// that iPad-portrait tmux panes (typically ~80 cols) still get the
-/// split view, but iPhone / mosh terminals (~40-60 cols) fall back
-/// to list-only. With the preview showing at this width the list
-/// gets ~27 cols and the preview gets ~45, which is the narrowest
-/// I'm willing to call usable.
-const PREVIEW_MIN_WIDTH: u16 = 72;
+/// the session list takes the full body width. The same threshold
+/// also gates the embedded terminal (single-window mode, focused
+/// attach) — there's no point spinning up a PTY for a pane that
+/// won't render. Chosen at 80 cols so phones / small SSH clients
+/// fall back to list-only; standard 80-col terminals still get the
+/// split.
+pub const PREVIEW_MIN_WIDTH: u16 = 80;
 
 /// Minimum width for the session list pane when the user is
 /// dragging the divider. Prevents the user from collapsing the

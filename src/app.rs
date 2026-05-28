@@ -1128,13 +1128,28 @@ impl AppState {
             // loop on the next iteration via `sync_embed`-style
             // reconciliation.
             (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                self.single_window_mode = !self.single_window_mode;
-                out.push(Command::SaveSingleWindow(self.single_window_mode));
-                self.warning = Some(if self.single_window_mode {
-                    "single-window mode ON — Enter opens in preview pane".to_string()
+                // Refuse to turn single-window ON when the terminal is too
+                // narrow to render the preview pane — there's no embed to
+                // open `Enter` into, so the toggle would look broken.
+                // Turning OFF is always allowed so a user who already had
+                // it on (from a wider terminal) can clear the state.
+                if !self.single_window_mode
+                    && self.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH
+                {
+                    self.warning = Some(format!(
+                        "single-window mode needs ≥{} cols (current: {})",
+                        crate::ui::layout::PREVIEW_MIN_WIDTH,
+                        self.term_size.0,
+                    ));
                 } else {
-                    "single-window mode OFF — Enter attaches full-screen".to_string()
-                });
+                    self.single_window_mode = !self.single_window_mode;
+                    out.push(Command::SaveSingleWindow(self.single_window_mode));
+                    self.warning = Some(if self.single_window_mode {
+                        "single-window mode ON — Enter opens in preview pane".to_string()
+                    } else {
+                        "single-window mode OFF — Enter attaches full-screen".to_string()
+                    });
+                }
             }
             // `/` opens the type-ahead session picker. Mirrors fzf/
             // vim's convention for "start a filter". The app loop
@@ -2268,6 +2283,20 @@ impl App {
                 }
             }
 
+            // Terminal too narrow to render the preview pane (phone /
+            // small mosh): drop out of focused embed so the user's
+            // keys stop being routed into an invisible PTY. The
+            // `single_window_mode` preference is left alone — when
+            // the terminal grows back, the next `Enter` re-enters
+            // focus normally.
+            if self.embed_focused && self.state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH {
+                self.exit_focus().await;
+                self.state.warning = Some(format!(
+                    "terminal narrowed below {} cols — exited focus",
+                    crate::ui::layout::PREVIEW_MIN_WIDTH,
+                ));
+            }
+
             // Add-tab modal closed (Esc or submit): if it was opened
             // from focused mode, re-enter focus on the currently-
             // active tab. On submit the active tab is still the old
@@ -2304,6 +2333,7 @@ impl App {
             if let Some(name) = self.state.pending_attach.take() {
                 let want_single_window = self.state.single_window_mode
                     && self.embed_enabled
+                    && self.state.term_size.0 >= crate::ui::layout::PREVIEW_MIN_WIDTH
                     && self
                         .embed
                         .as_ref()
