@@ -434,6 +434,79 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::OpenModifySession { internal } => {
+                    // JIT read of the live `@bosun_*` metadata so
+                    // the modify modal pre-fills against the
+                    // current state of the session (not whatever
+                    // was last cached in the recents store).
+                    // Surfacing this as a warning is fine because
+                    // the only way to land here is `m` on a session
+                    // that bosun didn't create — recoverable.
+                    match client.get_session_metadata(&internal).await {
+                        Ok(Some(meta)) => {
+                            let spec = metadata_to_spec(meta);
+                            let _ = evt_tx.send(AppMsg::ModifySpecReady {
+                                internal,
+                                spec,
+                            });
+                        }
+                        Ok(None) => {
+                            let _ = evt_tx.send(AppMsg::Warn(
+                                "modify: session predates metadata support".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(AppMsg::Warn(format!("modify read: {}", e)));
+                        }
+                    }
+                }
+                Command::ModifySession { internal, spec } => {
+                    // Write the new spec back as `@bosun_*` user
+                    // options on the live session. The agent
+                    // process keeps running with its old flags;
+                    // the next `R` (restart) picks the new spec up
+                    // via the same `get_session_metadata` path
+                    // RestartSession already uses.
+                    let meta = spec_to_metadata(&spec);
+                    let mut any_err = false;
+                    if let Err(e) =
+                        client.set_display_name(&internal, &meta.display_name).await
+                    {
+                        any_err = true;
+                        let _ = evt_tx
+                            .send(AppMsg::Warn(format!("modify display: {}", e)));
+                    }
+                    if let Err(e) =
+                        client.set_session_metadata(&internal, &meta).await
+                    {
+                        any_err = true;
+                        let _ = evt_tx
+                            .send(AppMsg::Warn(format!("modify metadata: {}", e)));
+                    }
+                    if let Err(e) = store.upsert_recent(&spec) {
+                        tracing::warn!("modify upsert_recent: {}", e);
+                    }
+                    if !any_err {
+                        let _ = evt_tx.send(AppMsg::Warn(format!(
+                            "modified {} — press R to apply",
+                            spec.name
+                        )));
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::Attach { .. } => {
                     tracing::warn!("tmux_actor received Attach — ignored; app task handles attach");
                 }
@@ -543,29 +616,80 @@ pub fn spawn(
                         None => { std::future::pending::<()>().await; }
                     }
                 } => {
-                    // Cheap focused-session-only preview refresh.
-                    // Captures one pane (the focused session), packages
-                    // the bytes into an Arc, and sends a lightweight
-                    // PreviewRefreshed. Skipped entirely when no
-                    // session is focused (the empty-state and
-                    // section-header views don't need pane data).
-                    if let Some(name) = focused.as_deref() {
-                        match client.capture_pane(name).await {
-                            Ok(bytes) => {
-                                let arc: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-                                let _ = evt_tx.send(AppMsg::PreviewRefreshed {
-                                    name: name.to_string(),
-                                    bytes: arc,
+                    // Fast tick: live status for every managed session,
+                    // plus a preview refresh for the focused one.
+                    //
+                    // Status detection used to ride only the 1Hz
+                    // `preview_tick` (do_refresh), so an agent flipping
+                    // between Running and Waiting could take a full
+                    // second to reflect in the sidebar — long enough
+                    // for users to question whether the glyph was
+                    // accurate. Moving it here drops latency to
+                    // `preview_tick_ms` (default 200ms) across the
+                    // whole sidebar, not just the focused row.
+                    //
+                    // We re-list sessions every tick (one cheap tmux
+                    // query) rather than caching to avoid stale
+                    // membership: a session killed between ticks
+                    // would otherwise hang around as a phantom row.
+                    // capture-pane failures are silently dropped —
+                    // the next 1Hz `do_refresh` reconciles
+                    // membership properly.
+                    match client.list_sessions().await {
+                        Ok(raw) => {
+                            let now = SystemTime::now();
+                            for s in raw.into_iter().filter(|s| config.manages(&s.name)) {
+                                let bytes = match client.capture_pane(&s.name).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "fast capture {}: {}", s.name, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let plain = crate::tmux::detector::strip_ansi(&bytes);
+                                let prev = smoothers
+                                    .get(&s.name)
+                                    .map(|sm| sm.current());
+                                let ctx = DetectContext::from_parts(
+                                    &bytes,
+                                    &plain,
+                                    s.last_activity,
+                                    now,
+                                    prev,
+                                    &s.name,
+                                );
+                                let detected = registry.detect(&ctx);
+                                let smoothed = smoothers
+                                    .entry(s.name.clone())
+                                    .or_default()
+                                    .observe(detected);
+                                let publish = if smoothed == Status::Unknown {
+                                    Status::Idle
+                                } else {
+                                    smoothed
+                                };
+                                let _ = evt_tx.send(AppMsg::StatusRefreshed {
+                                    name: s.name.clone(),
+                                    status: publish,
                                 });
+                                // Focused session also gets the
+                                // preview bytes so the right-pane
+                                // capture (and any non-embed preview
+                                // path) stays live at this cadence.
+                                if Some(s.name.as_str()) == focused.as_deref() {
+                                    let arc: Arc<[u8]> =
+                                        Arc::from(bytes.into_boxed_slice());
+                                    let _ = evt_tx.send(AppMsg::PreviewRefreshed {
+                                        name: s.name.clone(),
+                                        bytes: arc,
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                // Capture can fail if the session died
-                                // between focus and the next tick.
-                                // The next full refresh will drop the
-                                // session from the list; nothing
-                                // urgent to do here.
-                                tracing::debug!("fast capture {}: {}", name, e);
-                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("fast list-sessions: {}", e);
                         }
                     }
                 }

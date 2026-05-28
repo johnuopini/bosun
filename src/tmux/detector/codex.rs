@@ -1,14 +1,24 @@
 //! Codex CLI detector.
 //!
-//! Heuristic stack, cheapest first:
-//!   1. Plain-text anchors that identify the pane as a Codex session.
-//!   2. Prompt markers — Codex waiting for user input.
-//!   3. Activity markers — Codex actively working.
+//! Same bottom-region strategy as the Claude detector: most signals
+//! that distinguish "thinking" from "waiting" live near the prompt,
+//! so scoping the substring scans to the trailing visible lines
+//! keeps the older "Working…" lines that scrolled past from pinning
+//! the glyph to Running. Whole-screen scans are kept only for anchor
+//! detection (deciding "is this even a Codex pane").
 //!
-//! If none match we return `Unknown` and let the generic detector take
-//! over.
+//! Stack, cheapest first:
+//!   1. Pane-identity anchor (`Codex` / `OpenAI Codex` / `codex-cli`,
+//!      or `codex` in the bottom region to avoid false positives
+//!      from random shell history mentioning the word).
+//!   2. Confirmation prompts in the bottom region → Waiting.
+//!   3. Activity verbs in the bottom region OR braille spinner in
+//!      the OSC title → Running.
+//!   4. Recent `session_activity` as a final tie-breaker.
 
 use super::{DetectContext, Status, StatusDetector};
+
+const BOTTOM_REGION_LINES: usize = 12;
 
 pub struct CodexDetector;
 
@@ -22,22 +32,20 @@ impl StatusDetector for CodexDetector {
     }
 
     fn detect(&self, ctx: &DetectContext<'_>) -> Status {
-        if !looks_like_codex(ctx.plain) {
+        let bottom = bottom_region(ctx.plain);
+
+        if !looks_like_codex(ctx.plain, &bottom) {
             return Status::Unknown;
         }
 
-        // Prompt markers — user needs to answer.
-        if has_prompt_marker(ctx.plain) {
+        if has_prompt_marker(&bottom) {
             return Status::Waiting;
         }
 
-        // Activity markers — busy working.
-        if has_activity_marker(ctx.plain) || has_spinner_title(ctx.ansi) {
+        if has_activity_marker(&bottom) || has_spinner_title(ctx.ansi) {
             return Status::Running;
         }
 
-        // Looks like Codex but no explicit marker — use activity age
-        // as a tie-breaker.
         if ctx.activity_age < std::time::Duration::from_secs(3) {
             return Status::Running;
         }
@@ -46,14 +54,30 @@ impl StatusDetector for CodexDetector {
     }
 }
 
-fn looks_like_codex(plain: &str) -> bool {
-    plain.contains("codex")
-        || plain.contains("Codex")
-        || plain.contains("OpenAI Codex")
-        || plain.contains("codex-cli")
+fn bottom_region(plain: &str) -> String {
+    let mut lines: Vec<&str> = plain
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(BOTTOM_REGION_LINES)
+        .collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
-fn has_prompt_marker(plain: &str) -> bool {
+fn looks_like_codex(plain: &str, bottom: &str) -> bool {
+    // Strong anchors can appear anywhere in the capture (splash,
+    // banner, version line) — those don't fade.
+    if plain.contains("OpenAI Codex") || plain.contains("codex-cli") || plain.contains("Codex") {
+        return true;
+    }
+    // The bare "codex" word is too generic to allow a whole-capture
+    // match (someone's shell history could contain it). Require it
+    // to appear in the live bottom region.
+    bottom.contains("codex")
+}
+
+fn has_prompt_marker(region: &str) -> bool {
     const PROMPTS: &[&str] = &[
         "Do you want to",
         "Would you like to",
@@ -65,10 +89,10 @@ fn has_prompt_marker(plain: &str) -> bool {
         "deny",
         "Deny",
     ];
-    PROMPTS.iter().any(|p| plain.contains(p))
+    PROMPTS.iter().any(|p| region.contains(p))
 }
 
-fn has_activity_marker(plain: &str) -> bool {
+fn has_activity_marker(region: &str) -> bool {
     const MARKERS: &[&str] = &[
         "Thinking",
         "Working",
@@ -79,10 +103,11 @@ fn has_activity_marker(plain: &str) -> bool {
         "Searching",
         "Reading",
         "Writing",
+        "Reasoning",
     ];
     MARKERS
         .iter()
-        .any(|v| plain.contains(&format!("{v}…")) || plain.contains(&format!("{v}...")))
+        .any(|v| region.contains(&format!("{v}…")) || region.contains(&format!("{v}...")))
 }
 
 fn has_spinner_title(ansi: &[u8]) -> bool {
