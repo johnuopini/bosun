@@ -67,9 +67,24 @@ you can click into and drive without leaving bosun.
   path, agent, or flags (e.g. add `--resume` after the fact).
   Save-only: the running agent keeps its current flags; the next
   `R` (restart) picks up the new spec.
-- **Sidebar-order session cycle.** Shift+Right / Shift+Left while
-  in single-window focus mode walk the next / previous live
-  session in sidebar order (stable, not MRU-shuffled). Sidebar
+- **Tabs inside a sidebar entry.** Each sidebar row is now a
+  *container* that can hold multiple tmux sessions ("tabs"),
+  surfaced as a browser-style strip above the embed with a `+`
+  button on the right. Single-tab containers behave identically
+  to a session row. `Ctrl+T` (or click `+`) opens a slimmed-down
+  new-session modal with the path locked to the container; the
+  new session joins the container and survives a tmux server
+  restart via the `@bosun_container_id` user option. Tab status
+  glyphs render next to each pill so background tabs surface
+  Running / Waiting state without focus; the sidebar row picks
+  up a small accent dot when any background tab is busy.
+  `Shift+→ / Shift+←` cycle tabs, `Shift+↓ / Shift+↑` cycle
+  sessions — same chord in both sidebar and focused modes.
+  `Shift+D` kills a whole container at once; plain `d` kills the
+  active tab (drops the container when the last tab goes).
+- **Sidebar-order session cycle.** Shift+↓ / Shift+↑ walk the
+  next / previous live session in sidebar order (stable, not
+  MRU-shuffled), in both sidebar and focused modes. Sidebar
   selection follows the embed switch automatically.
 - **Input correctness for agents in the embed.** DECCKM cursor-key
   application mode, bracketed paste forwarding (drag-drop an image →
@@ -87,6 +102,10 @@ you can click into and drive without leaving bosun.
   every managed session at the fast-preview cadence
 - Embedded live preview of the selected session — real PTY in the
   right pane, focusable in place via single-window mode
+- Tabs (multi-session containers) per sidebar row with a browser-
+  style tab strip, `Ctrl+T` / `+` to add, `Shift+D` to nuke the
+  whole container, per-tab status glyphs, and survival across tmux
+  restart via `@bosun_container_id`
 - Sections for organizing sessions, collapsible, persisted in
   `config.toml`
 - Create new bosun-managed sessions from a modal form: name, path, agent
@@ -189,17 +208,34 @@ The full list is available at any time inside bosun with `?` or `h`.
 | `r` | Rename selected session (on a header: rename the section) |
 | `R` | Restart — kill + recreate with the same spec |
 | `m` | Modify session (name, path, agent, flags) — applies on next `R` |
-| `d` | Kill session (on a header: delete the section) |
+| `d` | Kill active tab (on a header: delete the section; killing the last tab removes the container) |
+| `Shift+D` | Kill the whole container — every tab at once |
 | `e` | Open the session's path in your configured editor |
 | `Ctrl+R` | Force immediate refresh |
+
+### Main list — tabs
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+T` | Add a tab to the selected container (opens add-tab modal with path locked) |
+| `]` / `[` | Cycle next / previous tab within the current container |
+| `Shift+→` / `Shift+←` | Same as `]` / `[` — cycle tab in container |
+| Click tab | Switch active tab |
+| Click `+` | Open the add-tab modal |
+
+### Main list — navigate
+
+| Key | Action |
+|-----|--------|
+| `Shift+↓` / `Shift+↑` | Cycle next / previous session in sidebar order (skips section headers and dead rows) |
 
 ### Main list — organize
 
 | Key | Action |
 |-----|--------|
-| `Shift+↑` / `Shift+↓` / `K` / `J` | Reorder within section (or move section block) |
-| `Shift+→` | Move session to the next section |
-| `Shift+←` | Move session to the previous section |
+| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` / `K` / `J` | Reorder within section (or move section block) |
+| `Ctrl+Shift+→` | Move session to the next section |
+| `Ctrl+Shift+←` | Move session to the previous section |
 | `1` … `9` | Move session to section N |
 | `0` | Move session to the ungrouped bucket |
 | `g` | New section |
@@ -219,7 +255,8 @@ The full list is available at any time inside bosun with `?` or `h`.
 | Key | Action |
 |-----|--------|
 | `Ctrl+Q` | Detach back to bosun (same chord in classic full-screen attach and single-window focus) |
-| `Shift+→` / `Shift+←` | Cycle to next / previous live session in sidebar order (single-window focus). Sidebar selection follows automatically. |
+| `Shift+→` / `Shift+←` | Cycle next / previous tab within the current container |
+| `Shift+↓` / `Shift+↑` | Cycle next / previous live session in sidebar order. Sidebar selection follows automatically. |
 | Click sidebar row | Exit focus and jump to that row |
 
 ### Preview pane (mouse)

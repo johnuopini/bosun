@@ -410,30 +410,49 @@ impl SidebarModel {
     /// grouping and ordering work. Dead containers render as
     /// "missing" rows; the user can recreate them from the recents
     /// store or `d` to remove.
-    pub fn reconcile(&mut self, live: &[(String, Option<String>)]) {
+    pub fn reconcile(&mut self, live: &[(String, Option<String>)]) -> bool {
+        let mut changed = false;
         let mut seen = std::collections::HashSet::new();
         for c in &mut self.ungrouped {
+            let before = c.members.len();
             c.members.retain(|m| seen.insert(m.clone()));
+            if c.members.len() != before {
+                changed = true;
+            }
             if !c.members.iter().any(|m| m == &c.active) {
                 if let Some(first) = c.members.first() {
                     c.active = first.clone();
+                    changed = true;
                 }
             }
         }
         // Drop ungrouped containers whose last tab was deduped
         // away — a container with zero tabs has no sidebar
         // identity left to render.
+        let before = self.ungrouped.len();
         self.ungrouped.retain(|c| !c.members.is_empty());
+        if self.ungrouped.len() != before {
+            changed = true;
+        }
         for s in &mut self.sections {
             for c in &mut s.members {
+                let before = c.members.len();
                 c.members.retain(|m| seen.insert(m.clone()));
+                if c.members.len() != before {
+                    changed = true;
+                }
                 if !c.members.iter().any(|m| m == &c.active) {
                     if let Some(first) = c.members.first() {
                         c.active = first.clone();
+                        changed = true;
                     }
                 }
             }
+            let before = s.members.len();
             s.members.retain(|c| !c.members.is_empty());
+            if s.members.len() != before {
+                changed = true;
+            }
         }
         // For every new live session: if its `@bosun_container_id`
         // matches an existing container, join it as a tab; if it
@@ -457,7 +476,9 @@ impl SidebarModel {
                 self.ungrouped.push(container);
             }
             seen.insert(n.clone());
+            changed = true;
         }
+        changed
     }
 
     /// Append `internal` as a new tab on the container identified

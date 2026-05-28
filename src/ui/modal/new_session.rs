@@ -188,20 +188,15 @@ impl NewSessionModal {
 
     /// Construct the modal in add-tab mode: pre-fill the path from
     /// the container (rendered read-only — all tabs share one
-    /// path), seed `name` from the container's display label so the
-    /// user just types a tab suffix, and remember `container_id` so
-    /// submit stamps it onto the new session's
-    /// `@bosun_container_id` and reconcile routes the new tmux
-    /// session as a tab on the container instead of a fresh
-    /// sidebar row.
-    pub fn for_add_tab(
-        container_id: String,
-        container_name: String,
-        container_path: String,
-        recents: Vec<Recent>,
-    ) -> Self {
+    /// path) and remember `container_id` so submit stamps it onto
+    /// the new session's `@bosun_container_id` and reconcile routes
+    /// the new tmux session as a tab on the container instead of a
+    /// fresh sidebar row. The `name` field starts empty so the user
+    /// types a fresh tab label — the container's existing internal
+    /// tmux name is not a useful seed.
+    pub fn for_add_tab(container_id: String, container_path: String, recents: Vec<Recent>) -> Self {
         let mut modal = Self {
-            name: container_name,
+            name: String::new(),
             path: container_path,
             agent_idx: 0,
             args: String::new(),

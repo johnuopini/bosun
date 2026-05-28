@@ -209,7 +209,11 @@ pub fn render(
         let (label, status) = &resolved[member_idx];
         let active = internal == &container.active;
         let style = if active {
-            Style::default().bg(theme.selection_bg).fg(theme.text)
+            // Accent bg with regular text fg — same pill recipe as
+            // the `bosun` and `SW` chips in the status bar, so the
+            // active tab reads as a mode/selection indicator that's
+            // visually tied to the focus border.
+            Style::default().bg(theme.accent).fg(theme.text)
         } else {
             Style::default().bg(theme.panel).fg(theme.text_muted)
         };

@@ -499,7 +499,7 @@ impl AppState {
     /// Walk the active tab one position forward (`step = 1`) or
     /// backward (`step = -1`), wrapping at the bounds. Persists
     /// the new active-tab choice so it survives restart.
-    fn cycle_active_tab(&mut self, step: i32, out: &mut Vec<Command>) {
+    pub fn cycle_active_tab(&mut self, step: i32, out: &mut Vec<Command>) {
         let Some(loc) = self.selected_location() else {
             return;
         };
@@ -615,8 +615,18 @@ impl AppState {
                     .iter()
                     .map(|v| (v.name().to_string(), v.session.container_id.clone()))
                     .collect();
-                self.sidebar.reconcile(&live);
-                if swap_applied {
+                let reconcile_changed = self.sidebar.reconcile(&live);
+                // Persist whenever reconcile mutated the model
+                // (added an auto-discovered session, deduped a
+                // duplicate, or dropped an empty container) so the
+                // new shape — including container ids assigned to
+                // brand-new sessions — survives a restart. Without
+                // this, a fresh container had its id only in memory
+                // and the next launch would regenerate a different
+                // id, leaving the container's sibling tabs
+                // (`@bosun_container_id` already pointing at the
+                // original) stranded as top-level rows.
+                if swap_applied || reconcile_changed {
                     self.save_sidebar(&mut out);
                 }
 
@@ -861,21 +871,58 @@ impl AppState {
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
-            // Shift+Down / Shift+J: reorder within bucket (session)
-            // or move whole group (section header).
-            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Char('J'), _) => {
+            // Ctrl+Shift+Down / Shift+J: reorder within bucket
+            // (session) or move whole group (section header). Plain
+            // Shift+Down is now session-cycle to match the in-focus
+            // chord, so reorder moved to Ctrl+Shift.
+            (KeyCode::Down, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_down_within(out);
             }
-            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _) => {
+            (KeyCode::Char('J'), _) => {
+                self.move_down_within(out);
+            }
+            (KeyCode::Up, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_up_within(out);
             }
-            // Shift+Right / Shift+Left: cross-bucket moves. Only
-            // meaningful on session rows.
-            (KeyCode::Right, KeyModifiers::SHIFT) => {
+            (KeyCode::Char('K'), _) => {
+                self.move_up_within(out);
+            }
+            // Ctrl+Shift+Right / Ctrl+Shift+Left: cross-bucket
+            // moves (session → next / prev section). Plain
+            // Shift+Right/Left is now tab-cycle.
+            (KeyCode::Right, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_to_next_bucket(out);
             }
-            (KeyCode::Left, KeyModifiers::SHIFT) => {
+            (KeyCode::Left, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_to_prev_bucket(out);
+            }
+            // Shift+Right / Shift+Left: cycle the active tab within
+            // the current container. Same as `]` / `[`, exposed on
+            // arrow keys so the chord matches the in-focus binding.
+            (KeyCode::Right, KeyModifiers::SHIFT) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Left, KeyModifiers::SHIFT) => {
+                self.cycle_active_tab(-1, out);
+            }
+            // Shift+Down / Shift+Up: cycle to next / previous
+            // session in sidebar order (skips section headers and
+            // dead rows). Mirrors the in-focus chord.
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                let cur = self.selected_session_name();
+                if let Some(name) = self.cycle_next(cur.as_deref()) {
+                    if let Some(idx) = self.sidebar.find_identity(&name) {
+                        self.selected = idx;
+                    }
+                }
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                let cur = self.selected_session_name();
+                if let Some(name) = self.cycle_prev(cur.as_deref()) {
+                    if let Some(idx) = self.sidebar.find_identity(&name) {
+                        self.selected = idx;
+                    }
+                }
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                 let len = self.sidebar.len();
@@ -1460,7 +1507,21 @@ impl AppState {
             // click in the dimmed list underneath a confirm dialog
             // doesn't silently move the cursor.
             MouseEventKind::Down(MouseButton::Left) if self.point_in_list(&layouts, m) => {
-                if let Some(idx) = crate::ui::session_list::entry_at_row(self, layouts.list, m.row)
+                // Click rows are resolved against the same rect the
+                // renderer drew into — in single-window mode that's
+                // the inset content rect (1 cell padded for the
+                // focus border), not the full `layouts.list`.
+                let content_rect = if self.single_window_mode {
+                    let p = layouts.list;
+                    if p.width >= 2 && p.height >= 2 {
+                        ratatui::layout::Rect::new(p.x + 1, p.y + 1, p.width - 2, p.height - 2)
+                    } else {
+                        p
+                    }
+                } else {
+                    layouts.list
+                };
+                if let Some(idx) = crate::ui::session_list::entry_at_row(self, content_rect, m.row)
                 {
                     self.selected = idx;
                 }
@@ -1686,6 +1747,7 @@ impl App {
                 use crossterm::event::{MouseButton, MouseEventKind};
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
                     && !self.state.dragging_divider
+                    && self.state.modals.is_empty()
                 {
                     if let Some(strip) = self.tab_strip_rect() {
                         if point_in_rect(strip, m.column, m.row) {
@@ -1713,35 +1775,60 @@ impl App {
                     use crossterm::event::{KeyCode, KeyModifiers};
                     let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
                         && k.modifiers.contains(KeyModifiers::CONTROL);
-                    // Shift+Left / Shift+Right cycle the focused
-                    // embed across sessions in sidebar order. We
-                    // intercept here (before the embed write) so the
-                    // chord never reaches the inner tmux's own
-                    // S-Left/S-Right binding — bosun owns the
-                    // session selection, picks the next/prev live
-                    // session in a stable order the user actually
-                    // sees (sidebar order, not MRU), and respawns
-                    // the embed on it. Side effect: the sidebar
-                    // cursor and focus border follow the switch
-                    // automatically because we move
-                    // `self.state.selected` first.
+                    // In-focus navigation chords:
+                    //   * Shift+Left  / Shift+Right → cycle the
+                    //     active *tab* within the current container,
+                    //     respawning the embed on the new active tab.
+                    //   * Shift+Up    / Shift+Down  → cycle the
+                    //     focused *session* in sidebar order (the
+                    //     pre-tabs cross-container navigation; moved
+                    //     here so left/right is free for tabs).
+                    // bosun intercepts the chord before the embed
+                    // write so the inner app never sees it.
                     let is_shift_left = matches!(k.code, KeyCode::Left)
                         && k.modifiers.contains(KeyModifiers::SHIFT);
                     let is_shift_right = matches!(k.code, KeyCode::Right)
                         && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_up =
+                        matches!(k.code, KeyCode::Up) && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_down = matches!(k.code, KeyCode::Down)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
                     if is_ctrl_q {
                         self.exit_focus().await;
                     } else if is_shift_left || is_shift_right {
+                        // Tab cycle within the current container.
+                        let prev = self.state.selected_session_name();
+                        let mut out_cmds: Vec<Command> = Vec::new();
+                        self.state
+                            .cycle_active_tab(if is_shift_right { 1 } else { -1 }, &mut out_cmds);
+                        for cmd in out_cmds {
+                            let _ = self.cmd_tx.send(cmd);
+                        }
+                        let next = self.state.selected_session_name();
+                        if next != prev {
+                            if let Some(name) = next {
+                                if let Err(e) = self
+                                    .respawn_embed(
+                                        &name,
+                                        crate::ui::embed_terminal::AttachMode::Focused,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("tab respawn: {}", e);
+                                    self.state.warning = Some(format!("tab: {e}"));
+                                }
+                            }
+                        }
+                    } else if is_shift_up || is_shift_down {
+                        // Session cycle in sidebar order (moved off
+                        // Shift+Left/Right so tabs own that chord).
                         let cur = self.state.selected_session_name();
-                        let target = if is_shift_right {
+                        let target = if is_shift_down {
                             self.state.cycle_next(cur.as_deref())
                         } else {
                             self.state.cycle_prev(cur.as_deref())
                         };
                         if let Some(name) = target {
-                            // Skip the no-op single-session case so
-                            // we don't pay for a respawn just to
-                            // land on the same session.
                             if Some(name.as_str()) != cur.as_deref() {
                                 if let Some(idx) = self.state.sidebar.find_identity(&name) {
                                     self.state.selected = idx;
@@ -1813,6 +1900,7 @@ impl App {
                     // gesture, no second click required.
                     if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
                         && !self.state.dragging_divider
+                        && self.state.modals.is_empty()
                     {
                         let in_preview = self
                             .preview_rect()
@@ -1886,8 +1974,15 @@ impl App {
                 // preview click → enter focus). The triggering click
                 // itself isn't forwarded into the embed; subsequent
                 // clicks under the new Focused mode are.
+                //
+                // Gated on `!modals.is_empty()` so a stray click that
+                // lands in the preview pane while the add-tab /
+                // new-session modal is open doesn't activate the
+                // background pane (which left the modal looking dim
+                // and unrecoverable from the keyboard).
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
                     && !self.state.dragging_divider
+                    && self.state.modals.is_empty()
                 {
                     let in_preview = self
                         .preview_rect()
@@ -2134,7 +2229,7 @@ impl App {
                     }
                     ModalRequest::AddTab {
                         container_id,
-                        container_name,
+                        container_name: _,
                         container_path,
                     } => {
                         let recents = self.store.list_recents(50).unwrap_or_default();
@@ -2142,7 +2237,6 @@ impl App {
                             .modals
                             .push(Box::new(NewSessionModal::for_add_tab(
                                 container_id,
-                                container_name,
                                 container_path,
                                 recents,
                             )));
@@ -3039,7 +3133,8 @@ mod tests {
         s.sidebar = model(&["a", "b"], vec![section("g1", "First", &["c"])]);
         s.selected = 0; // ungrouped a
 
-        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        let shift_right =
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         s.apply(AppMsg::Key(shift_right));
 
         assert_eq!(
@@ -3061,7 +3156,7 @@ mod tests {
         // flat: 0=a, 1=g1 header, 2=b
         s.selected = 2;
 
-        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         s.apply(AppMsg::Key(shift_left));
 
         assert_eq!(
@@ -3227,7 +3322,7 @@ mod tests {
         );
         s.selected = 0; // bosun in ungrouped
 
-        let sr = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        let sr = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
 
         s.apply(AppMsg::Key(sr));
         assert!(s.sidebar.ungrouped.is_empty());

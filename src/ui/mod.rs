@@ -29,7 +29,17 @@ pub fn draw(
 ) {
     let area = frame.area();
     let l = layout::compute(area, state.divider_x);
-    session_list::render(frame, l.list, state, theme);
+    // In single-window mode the sidebar can pick up the focus
+    // border (when the embed isn't focused). Inset the content rect
+    // by one cell on every side so the border's perimeter doesn't
+    // overdraw session rows — the top edge used to slice through
+    // the first row's name and status glyph.
+    let list_content = if state.single_window_mode {
+        inset_one(l.list)
+    } else {
+        l.list
+    };
+    session_list::render(frame, list_content, state, theme);
     // Preview is hidden on narrow terminals (mobile / mosh).
     if let Some(preview_area) = l.preview {
         preview::render(frame, preview_area, state, theme, embed);
@@ -49,7 +59,19 @@ pub fn draw(
     // cells but stays underneath any open modal.
     if state.single_window_mode {
         let active = if embed_focused {
-            l.preview
+            // The focus border surrounds the embed area. When a tab
+            // strip is drawn (1 row at the top of the preview rect
+            // for any container), the border starts one row lower so
+            // the strip stays visible above the border — without
+            // this shrink, the top edge of the focus border drew
+            // straight through the tab labels.
+            l.preview.map(|p| {
+                if has_tabstrip(state) && p.height >= 2 {
+                    Rect::new(p.x, p.y + 1, p.width, p.height - 1)
+                } else {
+                    p
+                }
+            })
         } else {
             Some(l.list)
         };
@@ -61,6 +83,31 @@ pub fn draw(
     // stack handles dimming the background and rendering one or more
     // modals top-down.
     state.modals.render(frame, area, theme);
+}
+
+/// Inset `area` by one cell on every side. Zero-sized fallback if
+/// the rect is too small to inset safely; callers always wrap a
+/// larger pane so this is a guard rather than a meaningful
+/// degradation.
+fn inset_one(area: Rect) -> Rect {
+    if area.width < 2 || area.height < 2 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
+}
+
+/// True when the cursor sits on a container (sidebar entry) — the
+/// preview pane carves a 1-row tab strip off the top in that case.
+/// Used by the focus-border code so the border doesn't overdraw
+/// the strip, and by `App::tab_strip_height` so the embed-area
+/// math stays in sync.
+fn has_tabstrip(state: &AppState) -> bool {
+    state
+        .sidebar
+        .visible()
+        .get(state.selected)
+        .map(|e| e.container().is_some())
+        .unwrap_or(false)
 }
 
 fn draw_focus_border(buf: &mut Buffer, area: Rect, fg: Color, bg: Color) {

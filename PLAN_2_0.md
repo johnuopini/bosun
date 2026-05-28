@@ -1,7 +1,7 @@
 # Bosun 2.0 — Implementation Plan
 
 **Branch:** `2.0`
-**Status:** Active — Steps 0–4 landed; iterating on input + mouse UX polish
+**Status:** Active — Steps 0–4 landed; tabs (containers) shipped through Phase 3; iterating on UX polish
 **Companion doc:** `EMBEDDED_TERMINAL_FEASIBILITY.md`
 
 ## Status (rolling — most recent first)
@@ -12,6 +12,25 @@ A/B use against `0.4.1`.
 
 **Shipped on 2.0 (in order):**
 
+- **Tabs (multi-session containers per sidebar row), phases 1–3.**
+  Each sidebar entry is now a `Container` that owns 1..N tmux
+  sessions, rendered with a browser-style tab strip above the
+  embed and a `+` button on the right. Single-tab containers are
+  visually unchanged for users who never opt in. Phase 1 landed
+  the data model + backwards-compat serde (legacy `Vec<String>`
+  configs auto-upgrade on load, save in the new shape). Phase 2
+  landed the visible feature: tab strip rendering, `(N)` badge,
+  add-tab modal (`Ctrl+T` / click `+`), `]` / `[` cycle,
+  `Shift+D` to kill a whole container, per-tab status glyphs,
+  `@bosun_container_id` so multi-tab containers survive a tmux
+  restart. Phase 3 polish: background-tab activity dot on the
+  sidebar row, tab-strip overflow windowing that keeps the
+  active tab visible. Follow-up fixes: persist sidebar after
+  reconcile-discovered containers, focus-border-vs-tab-strip
+  collision, sidebar content inset for the focus border,
+  modal-open guard on click-out-of-focus, symmetric Shift+arrow
+  semantics in sidebar and focused mode (Shift+→/← = tabs,
+  Shift+↓/↑ = sessions; reorder moved to Ctrl+Shift).
 - **Live per-session status detection.** Status detection moved from
   the 1Hz full-refresh tick onto the fast preview tick (default
   200ms) and now runs for every managed session, not just the
