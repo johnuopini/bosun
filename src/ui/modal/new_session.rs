@@ -90,6 +90,14 @@ pub struct NewSessionModal {
     /// Whether the path dropdown overlay is showing. Dismissed by
     /// Escape; re-activated by typing, backspace, or arrow-down.
     path_dropdown_active: bool,
+    /// Internal session name this modal is editing in modify mode.
+    /// `None` is the standard "create new session" flow that emits
+    /// `Command::CreateSession`. `Some(internal)` switches the
+    /// submit path to `Command::ModifySession` against that
+    /// session — pre-filled from its stored metadata. The internal
+    /// name is never user-editable, so we stash it once at
+    /// construction and read it back on submit.
+    modify_for: Option<String>,
 }
 
 /// One row in the filesystem dropdown. `name` is the last path
@@ -128,8 +136,35 @@ impl NewSessionModal {
             path_suggestion_idx: None,
             path_suggestion_scroll: 0,
             path_dropdown_active: true,
+            modify_for: None,
         };
         modal.apply_remembered_options();
+        modal
+    }
+
+    /// Construct the modal in modify mode: pre-fill every field
+    /// from `spec` and remember `internal` so submit emits
+    /// `Command::ModifySession` against the right tmux session
+    /// instead of a fresh `CreateSession`. Recents are still
+    /// passed in for Ctrl+R access — modifying lets the user pull
+    /// flags from a past session just like creating does.
+    pub fn for_modify(internal: String, spec: SessionSpec, recents: Vec<Recent>) -> Self {
+        let mut modal = Self {
+            name: String::new(),
+            path: String::new(),
+            agent_idx: 0,
+            args: String::new(),
+            claude: ClaudeOptions::default(),
+            codex: CodexOptions::default(),
+            field: Field::Name,
+            error: None,
+            recents,
+            path_suggestion_idx: None,
+            path_suggestion_scroll: 0,
+            path_dropdown_active: false,
+            modify_for: Some(internal),
+        };
+        modal.fill_from_spec(spec);
         modal
     }
 
@@ -424,7 +459,16 @@ impl Modal for NewSessionModal {
                     }
                 }
                 match self.build_spec() {
-                    Ok(spec) => ModalResult::Close(Some(Command::CreateSession(spec))),
+                    Ok(spec) => {
+                        let cmd = match &self.modify_for {
+                            Some(internal) => Command::ModifySession {
+                                internal: internal.clone(),
+                                spec,
+                            },
+                            None => Command::CreateSession(spec),
+                        };
+                        ModalResult::Close(Some(cmd))
+                    }
                     Err(e) => {
                         self.error = Some(e);
                         ModalResult::Consumed

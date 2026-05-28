@@ -84,6 +84,14 @@ pub trait TmuxClient: Send + Sync {
     /// rebuild the original spec.
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>>;
 
+    /// Overwrite the `@bosun_*` metadata user options on a live
+    /// session. Used by the modify-session modal to update the
+    /// stored spec without recreating the session. The next
+    /// `RestartSession` will read these back via
+    /// `get_session_metadata` and spawn the agent with the new
+    /// flags.
+    async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()>;
+
     /// Restart the agent inside a live session without killing the
     /// session itself. Sends Ctrl-C twice (covers agents that swallow
     /// the first interrupt to confirm), then types the new launch
@@ -444,6 +452,35 @@ impl TmuxClient for TokioTmuxClient {
             claude_skip_permissions: parts[5] == "1",
             codex_yolo: parts[6] == "1",
         }))
+    }
+
+    async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()> {
+        // Re-uses the same key/value mapping the create path writes
+        // on session birth, so a modify produces options
+        // byte-identical to what the create path would have
+        // produced for the same spec. Errors on the first failed
+        // option write so the caller can surface a single message
+        // — partial-update state is rare enough (it would mean
+        // tmux died mid-call) that we'd rather fail loudly.
+        for (key, value) in metadata_options(metadata) {
+            let mut cmd = self.cmd();
+            cmd.arg("set-option")
+                .arg("-t")
+                .arg(session)
+                .arg(key)
+                .arg(&value);
+            let output = cmd.output().await.map_err(BosunError::Io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(BosunError::Tmux(format!(
+                    "set {} on {}: {}",
+                    key,
+                    session,
+                    stderr.trim()
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
