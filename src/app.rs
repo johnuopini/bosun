@@ -1646,7 +1646,14 @@ impl App {
                     // form SGR 1006 expects.
                     let wants = self.embed.as_ref().is_some_and(|e| e.wants_mouse());
                     if wants && !self.state.dragging_divider {
-                        if let Some(area) = self.preview_rect() {
+                        // `embed_rect` (not `preview_rect`) — the PTY
+                        // is sized for the inner area in single-
+                        // window mode and the inner app's terminal
+                        // grid starts at (1,1) within the preview
+                        // rect. Using the outer rect here put every
+                        // click/drag one row + one column past where
+                        // the user actually clicked.
+                        if let Some(area) = self.embed_rect() {
                             if point_in_rect(area, m.column, m.row) {
                                 let local_col = m.column - area.x;
                                 let local_row = m.row - area.y;
@@ -2335,9 +2342,9 @@ impl App {
 
     /// Full preview rectangle (in terminal coords) for the current
     /// layout. `None` on narrow terminals where the preview is
-    /// hidden. Used by mouse forwarding to decide whether an event
-    /// lands inside the embed area and to translate to local
-    /// coordinates.
+    /// hidden. Used by hit-tests that should treat the focus-border
+    /// reservation as still part of the preview region (e.g. "click
+    /// anywhere in the preview to enter focus").
     fn preview_rect(&self) -> Option<ratatui::layout::Rect> {
         use ratatui::layout::Rect;
         let area = Rect {
@@ -2347,6 +2354,26 @@ impl App {
             height: self.state.term_size.1,
         };
         crate::ui::layout::compute(area, self.state.divider_x).preview
+    }
+
+    /// Rectangle the embed actually renders into. Matches the
+    /// dimensions the PTY is sized for via `preview_dims`, so mouse
+    /// forwarding translates click coords against the same origin
+    /// the inner app's terminal grid was sized against. In
+    /// single-window mode this is `preview_rect` inset by one cell
+    /// on every side (the focus-border reservation); otherwise it's
+    /// the full preview rect.
+    fn embed_rect(&self) -> Option<ratatui::layout::Rect> {
+        use ratatui::layout::Rect;
+        let p = self.preview_rect()?;
+        if self.state.single_window_mode {
+            if p.width < 2 || p.height < 2 {
+                return Some(Rect::new(p.x, p.y, 0, 0));
+            }
+            Some(Rect::new(p.x + 1, p.y + 1, p.width - 2, p.height - 2))
+        } else {
+            Some(p)
+        }
     }
 }
 
