@@ -1,32 +1,36 @@
 //! Sidebar ordering + grouping (explicit-membership model).
 //!
 //! The sidebar is two ordered lists: an `ungrouped` bucket and a
-//! `sections` list. Each section has its own ordered `members` list
-//! of internal tmux session names. Membership is explicit — creating
-//! a new section produces an empty header that claims no existing
-//! sessions. A session is in exactly one bucket.
+//! `sections` list. Each entry is a `Container` — a Bosun-side
+//! grouping that owns 1..N tmux sessions ("tabs"). Phase 1 always
+//! has exactly one tab per container; the shape is plumbed through
+//! ahead of phase 2's tab strip UI so the rest of the codebase can
+//! migrate in one move.
 //!
 //! The rendered sidebar flattens this model into a single list:
-//! every ungrouped session, followed by each section's header and
-//! its members. `AppState::selected` indexes into that flattened
-//! list.
+//! every ungrouped container, followed by each section's header
+//! and its members. `AppState::selected` indexes into that
+//! flattened list.
 //!
-//! Persisted in `config.toml` as `[sidebar]` (tables + arrays). The
-//! tmux actor doesn't touch this — it's pure UI state owned by
-//! `AppState`.
+//! Persisted in `config.toml` as `[sidebar]`. Containers
+//! deserialize from either the new table shape **or** a bare
+//! string (legacy single-tab sessions); on save they always emit
+//! the table shape, so first save after upgrade migrates the file
+//! in place.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// A named section that groups a set of sessions. `members` holds
-/// internal tmux names in the user's chosen order.
+/// A named section that groups a set of containers. `members`
+/// holds containers in the user's chosen order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Section {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub members: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_containers")]
+    pub members: Vec<Container>,
     /// When true, the section's members are hidden from the rendered
     /// sidebar (only the header is visible). Toggled by Tab on the
     /// header. Persisted in `config.toml` so the open/closed state
@@ -47,12 +51,8 @@ fn is_false(b: &bool) -> bool {
 
 impl Section {
     pub fn new(name: impl Into<String>) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         Self {
-            id: format!("sec-{:08x}", nanos as u32),
+            id: next_id("sec"),
             name: name.into(),
             members: Vec::new(),
             collapsed: false,
@@ -61,12 +61,92 @@ impl Section {
     }
 }
 
-/// Full sidebar state. `ungrouped` holds session names with no
-/// section; `sections` is an ordered list of sections.
+/// One sidebar entry. Owns an ordered list of tmux session names
+/// (its "tabs") and tracks which one is currently active. Phase 1
+/// always has exactly one tab; phase 2's tab strip starts using
+/// `members.len() > 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Container {
+    pub id: String,
+    /// Display label for the sidebar row, independent of any
+    /// individual tab's name. Phase 1 seeds this with the single
+    /// tab's internal name as a placeholder; phase 2's render path
+    /// starts reading it directly.
+    pub name: String,
+    pub members: Vec<String>,
+    /// Internal tmux name of the currently-active tab. Always one
+    /// of `members`; invariant maintained by all mutators.
+    pub active: String,
+}
+
+impl Container {
+    /// Construct a single-tab container wrapping `internal` as the
+    /// only tab. `name` is the sidebar label.
+    pub fn single(internal: String, name: String) -> Self {
+        Self {
+            id: next_id("con"),
+            name,
+            active: internal.clone(),
+            members: vec![internal],
+        }
+    }
+
+    /// True iff `internal` is one of this container's tabs.
+    pub fn contains_internal(&self, internal: &str) -> bool {
+        self.members.iter().any(|m| m == internal)
+    }
+}
+
+/// On-disk shape for a container entry: either the new table form
+/// (proper `Container` table) or a legacy bare string (1.x configs
+/// pre-containers). Normalized into `Container` on load; never
+/// serialized — saves always emit the table form so an upgraded
+/// config migrates on its first write.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StoredContainer {
+    Legacy(String),
+    Container(Container),
+}
+
+impl From<StoredContainer> for Container {
+    fn from(s: StoredContainer) -> Self {
+        match s {
+            StoredContainer::Legacy(internal) => Container::single(internal.clone(), internal),
+            StoredContainer::Container(c) => c,
+        }
+    }
+}
+
+fn deserialize_containers<'de, D>(de: D) -> Result<Vec<Container>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored: Vec<StoredContainer> = Vec::deserialize(de)?;
+    Ok(stored.into_iter().map(Container::from).collect())
+}
+
+/// Monotonic 32-bit suffix generator for new IDs. Nanos alone can
+/// collide when many entries are created in a tight loop (legacy
+/// config upgrade is the obvious case), so we xor in a per-process
+/// sequence to keep collisions astronomically unlikely without
+/// reaching for a UUID dependency.
+fn next_id(prefix: &str) -> String {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(0);
+    format!("{}-{:08x}", prefix, nanos.wrapping_add(seq))
+}
+
+/// Full sidebar state. `ungrouped` holds top-level containers;
+/// `sections` is an ordered list of sections.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SidebarModel {
-    #[serde(default)]
-    pub ungrouped: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_containers")]
+    pub ungrouped: Vec<Container>,
     #[serde(default)]
     pub sections: Vec<Section>,
 }
@@ -92,41 +172,58 @@ pub enum Location {
 }
 
 /// A single visible entry produced by flattening the model. Carries
-/// references into the model for rendering.
+/// references into the model for rendering. Container rows hand
+/// back the whole `&Container` so renderers can read both the
+/// active tab (for status / preview lookup) and the tab count (for
+/// the `(N)` badge in phase 2).
 #[derive(Debug, Clone, Copy)]
 pub enum VisibleEntry<'a> {
-    UngroupedSession(&'a str),
+    Ungrouped(&'a Container),
     SectionHeader(&'a Section),
-    SectionMember {
+    Member {
         section: &'a Section,
-        internal: &'a str,
+        container: &'a Container,
     },
 }
 
 impl<'a> VisibleEntry<'a> {
     pub fn kind(&self) -> VisibleKind {
         match self {
-            Self::UngroupedSession(_) => VisibleKind::Ungrouped,
+            Self::Ungrouped(_) => VisibleKind::Ungrouped,
             Self::SectionHeader(_) => VisibleKind::Header,
-            Self::SectionMember { .. } => VisibleKind::Member,
+            Self::Member { .. } => VisibleKind::Member,
         }
     }
 
-    /// For session rows, the internal tmux name. `None` for headers.
+    /// For container rows, the active tab's internal tmux name.
+    /// `None` for section headers. This is what most callers want
+    /// when they ask "what session is under the cursor."
     pub fn session_name(&self) -> Option<&'a str> {
         match self {
-            Self::UngroupedSession(n) => Some(n),
-            Self::SectionMember { internal, .. } => Some(internal),
+            Self::Ungrouped(c) => Some(c.active.as_str()),
+            Self::Member { container, .. } => Some(container.active.as_str()),
+            Self::SectionHeader(_) => None,
+        }
+    }
+
+    /// The full container under the cursor, if any. Section
+    /// headers return `None`.
+    pub fn container(&self) -> Option<&'a Container> {
+        match self {
+            Self::Ungrouped(c) => Some(c),
+            Self::Member { container, .. } => Some(container),
             Self::SectionHeader(_) => None,
         }
     }
 
     /// Stable identity for selection-preservation across refreshes.
+    /// Container rows use `container.id` (stable across tab
+    /// switches and renames); section rows use `section.id`.
     pub fn identity(&self) -> &'a str {
         match self {
-            Self::UngroupedSession(n) => n,
+            Self::Ungrouped(c) => &c.id,
             Self::SectionHeader(s) => &s.id,
-            Self::SectionMember { internal, .. } => internal,
+            Self::Member { container, .. } => &container.id,
         }
     }
 }
@@ -161,16 +258,16 @@ impl SidebarModel {
     /// is emitted for those.
     pub fn visible(&self) -> Vec<VisibleEntry<'_>> {
         let mut out = Vec::with_capacity(self.len());
-        for n in &self.ungrouped {
-            out.push(VisibleEntry::UngroupedSession(n.as_str()));
+        for c in &self.ungrouped {
+            out.push(VisibleEntry::Ungrouped(c));
         }
         for s in &self.sections {
             out.push(VisibleEntry::SectionHeader(s));
             if !s.collapsed {
-                for m in &s.members {
-                    out.push(VisibleEntry::SectionMember {
+                for c in &s.members {
+                    out.push(VisibleEntry::Member {
                         section: s,
-                        internal: m.as_str(),
+                        container: c,
                     });
                 }
             }
@@ -230,23 +327,43 @@ impl SidebarModel {
         }
     }
 
-    /// Find an entry by identity (section id OR session internal name).
-    /// Returns the flattened index. Section ids beat session names if
-    /// both exist (they shouldn't — ids use a `sec-` prefix).
+    /// Find an entry by identity. Accepts:
+    /// - a section id (`sec-…`) → header row,
+    /// - a container id (`con-…`) → container row,
+    /// - or an internal tmux name → the container that holds it
+    ///   as one of its tabs.
+    ///
+    /// The three id namespaces don't overlap in practice (each has
+    /// its own prefix; internal names use the bosun- prefix from
+    /// `Config::session_prefix`). Section ids beat container ids
+    /// beat internal-name lookup if a collision ever did happen.
     pub fn find_identity(&self, ident: &str) -> Option<usize> {
         for (si, s) in self.sections.iter().enumerate() {
             if s.id == ident {
                 return Some(self.flat_index(Location::Header(si)));
             }
         }
-        for (i, n) in self.ungrouped.iter().enumerate() {
-            if n == ident {
+        for (i, c) in self.ungrouped.iter().enumerate() {
+            if c.id == ident {
                 return Some(self.flat_index(Location::Ungrouped(i)));
             }
         }
         for (si, s) in self.sections.iter().enumerate() {
-            for (mi, n) in s.members.iter().enumerate() {
-                if n == ident {
+            for (mi, c) in s.members.iter().enumerate() {
+                if c.id == ident {
+                    return Some(self.flat_index(Location::Member(si, mi)));
+                }
+            }
+        }
+        // Internal-name fallback: find the container that owns it.
+        for (i, c) in self.ungrouped.iter().enumerate() {
+            if c.contains_internal(ident) {
+                return Some(self.flat_index(Location::Ungrouped(i)));
+            }
+        }
+        for (si, s) in self.sections.iter().enumerate() {
+            for (mi, c) in s.members.iter().enumerate() {
+                if c.contains_internal(ident) {
                     return Some(self.flat_index(Location::Member(si, mi)));
                 }
             }
@@ -255,41 +372,60 @@ impl SidebarModel {
     }
 
     /// Reconcile against the current live set of tmux session names.
-    /// - Dedupes sessions that appear in multiple buckets (keeps the
-    ///   first occurrence in visible order — ungrouped > section 0 > ...).
-    /// - Appends any live session not already present to `ungrouped`.
+    /// - Dedupes tabs that somehow appear in multiple containers
+    ///   (keeps the first occurrence in visible order).
+    /// - Appends any live session not already present in any
+    ///   container to `ungrouped` as a fresh single-tab container.
     ///
     /// Sections are preserved even if they end up empty.
     ///
-    /// **Dead sessions are NOT auto-removed.** Entries are dropped only
-    /// when the user explicitly deletes them via `remove_session` —
-    /// otherwise a tmux server restart (or reboot) would wipe the
-    /// entire sidebar, losing the user's grouping and ordering work.
-    /// Dead entries render as "missing" rows; the user can recreate
-    /// them from the recents store or `d` to remove.
+    /// **Dead sessions are NOT auto-removed.** Containers and their
+    /// tabs are dropped only when the user explicitly deletes them
+    /// via `remove_session` — otherwise a tmux server restart (or
+    /// reboot) would wipe the entire sidebar, losing the user's
+    /// grouping and ordering work. Dead containers render as
+    /// "missing" rows; the user can recreate them from the recents
+    /// store or `d` to remove.
     pub fn reconcile(&mut self, live: &[String]) {
-        // 1. Dedupe — if a name appears in multiple places, keep the
-        //    earliest in visible order.
         let mut seen = std::collections::HashSet::new();
-        self.ungrouped.retain(|n| seen.insert(n.clone()));
-        for s in &mut self.sections {
-            s.members.retain(|n| seen.insert(n.clone()));
+        for c in &mut self.ungrouped {
+            c.members.retain(|m| seen.insert(m.clone()));
+            if !c.members.iter().any(|m| m == &c.active) {
+                if let Some(first) = c.members.first() {
+                    c.active = first.clone();
+                }
+            }
         }
-        // 2. Append new live sessions to ungrouped.
+        // Drop ungrouped containers whose last tab was deduped
+        // away — a container with zero tabs has no sidebar
+        // identity left to render.
+        self.ungrouped.retain(|c| !c.members.is_empty());
+        for s in &mut self.sections {
+            for c in &mut s.members {
+                c.members.retain(|m| seen.insert(m.clone()));
+                if !c.members.iter().any(|m| m == &c.active) {
+                    if let Some(first) = c.members.first() {
+                        c.active = first.clone();
+                    }
+                }
+            }
+            s.members.retain(|c| !c.members.is_empty());
+        }
         for n in live {
             if !seen.contains(n) {
-                self.ungrouped.push(n.clone());
+                self.ungrouped.push(Container::single(n.clone(), n.clone()));
                 seen.insert(n.clone());
             }
         }
     }
 
-    /// Replace one internal name with another, in place. Used by the
-    /// restart flow so a kill+recreate doesn't leave a dead row above
-    /// the freshly-created session — the row's slot (and section) is
-    /// inherited by the new internal name. No-op if `old` isn't present
-    /// or `new` is already present (the swap would create a duplicate).
-    /// Returns true if the swap happened.
+    /// Replace one internal name with another, in place. Used by
+    /// the restart flow so a kill+recreate doesn't leave a dead
+    /// row above the freshly-created session — the row's slot
+    /// (and section) is inherited by the new internal name.
+    /// No-op if `old` isn't present or `new` is already present
+    /// (the swap would create a duplicate). Returns true if the
+    /// swap happened.
     pub fn replace_session(&mut self, old: &str, new: &str) -> bool {
         if old == new {
             return false;
@@ -297,35 +433,58 @@ impl SidebarModel {
         if self.contains(new) {
             return false;
         }
-        if let Some(slot) = self.ungrouped.iter_mut().find(|n| *n == old) {
-            *slot = new.to_string();
-            return true;
+        for c in &mut self.ungrouped {
+            if let Some(slot) = c.members.iter_mut().find(|m| *m == old) {
+                *slot = new.to_string();
+                if c.active == old {
+                    c.active = new.to_string();
+                }
+                return true;
+            }
         }
         for s in &mut self.sections {
-            if let Some(slot) = s.members.iter_mut().find(|n| *n == old) {
-                *slot = new.to_string();
-                return true;
+            for c in &mut s.members {
+                if let Some(slot) = c.members.iter_mut().find(|m| *m == old) {
+                    *slot = new.to_string();
+                    if c.active == old {
+                        c.active = new.to_string();
+                    }
+                    return true;
+                }
             }
         }
         false
     }
 
     fn contains(&self, internal: &str) -> bool {
-        self.ungrouped.iter().any(|n| n == internal)
+        self.ungrouped.iter().any(|c| c.contains_internal(internal))
             || self
                 .sections
                 .iter()
-                .any(|s| s.members.iter().any(|n| n == internal))
+                .any(|s| s.members.iter().any(|c| c.contains_internal(internal)))
     }
 
-    /// Explicit removal of a session entry from every bucket. Called
-    /// only when the user kills a session via `d` — never from
-    /// reconciliation, so dead-but-grouped sessions survive across a
-    /// tmux restart / reboot.
+    /// Explicit removal of a tmux session from every container.
+    /// Containers that lose their last tab are dropped from the
+    /// sidebar entirely. Called only when the user kills a session
+    /// via `d`, never from reconciliation — dead-but-grouped
+    /// sessions survive a tmux restart / reboot.
     pub fn remove_session(&mut self, internal: &str) {
-        self.ungrouped.retain(|n| n != internal);
+        for c in &mut self.ungrouped {
+            c.members.retain(|m| m != internal);
+            if c.active == internal {
+                c.active = c.members.first().cloned().unwrap_or_default();
+            }
+        }
+        self.ungrouped.retain(|c| !c.members.is_empty());
         for s in &mut self.sections {
-            s.members.retain(|n| n != internal);
+            for c in &mut s.members {
+                c.members.retain(|m| m != internal);
+                if c.active == internal {
+                    c.active = c.members.first().cloned().unwrap_or_default();
+                }
+            }
+            s.members.retain(|c| !c.members.is_empty());
         }
     }
 
@@ -364,11 +523,15 @@ impl SidebarModel {
 mod tests {
     use super::*;
 
+    fn con(internal: &str) -> Container {
+        Container::single(internal.to_string(), internal.to_string())
+    }
+
     fn sec(id: &str, name: &str, members: &[&str]) -> Section {
         Section {
             id: id.into(),
             name: name.into(),
-            members: members.iter().map(|s| s.to_string()).collect(),
+            members: members.iter().map(|s| con(s)).collect(),
             collapsed: false,
             banner_font: None,
         }
@@ -376,9 +539,17 @@ mod tests {
 
     fn model(ungrouped: &[&str], sections: Vec<Section>) -> SidebarModel {
         SidebarModel {
-            ungrouped: ungrouped.iter().map(|s| s.to_string()).collect(),
+            ungrouped: ungrouped.iter().map(|s| con(s)).collect(),
             sections,
         }
+    }
+
+    fn ungrouped_names(m: &SidebarModel) -> Vec<String> {
+        m.ungrouped.iter().map(|c| c.active.clone()).collect()
+    }
+
+    fn section_names(s: &Section) -> Vec<String> {
+        s.members.iter().map(|c| c.active.clone()).collect()
     }
 
     #[test]
@@ -389,7 +560,6 @@ mod tests {
         );
         let visible = m.visible();
         assert_eq!(visible.len(), m.len());
-        // Locate every index and round-trip through flat_index.
         for i in 0..m.len() {
             let loc = m.locate(i).expect("locate");
             assert_eq!(m.flat_index(loc), i, "round-trip failed at {}", i);
@@ -410,41 +580,47 @@ mod tests {
     fn reconcile_keeps_dead_sessions_appends_new() {
         let mut m = model(&["a"], vec![sec("g1", "W", &["b", "gone"])]);
         m.reconcile(&["a".into(), "b".into(), "newbie".into()]);
-        // "gone" stays in the section even though it's not live —
-        // explicit-only removal protects across a tmux restart.
-        // "newbie" lands in ungrouped.
-        assert_eq!(m.ungrouped, vec!["a".to_string(), "newbie".to_string()]);
+        // "gone" stays in the section even though it's not live;
+        // "newbie" lands in ungrouped as a fresh single-tab container.
         assert_eq!(
-            m.sections[0].members,
+            ungrouped_names(&m),
+            vec!["a".to_string(), "newbie".to_string()]
+        );
+        assert_eq!(
+            section_names(&m.sections[0]),
             vec!["b".to_string(), "gone".to_string()]
         );
     }
 
     #[test]
     fn reconcile_empty_live_preserves_everything() {
-        // The reboot scenario: tmux server died, no live sessions yet.
-        // Sidebar must NOT be wiped — that'd lose all the user's
-        // section structure and ordering work.
         let mut m = model(
             &["alpha", "beta"],
             vec![sec("g1", "Work", &["gamma", "delta"])],
         );
         m.reconcile(&[]);
-        assert_eq!(m.ungrouped, vec!["alpha".to_string(), "beta".to_string()]);
         assert_eq!(
-            m.sections[0].members,
+            ungrouped_names(&m),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            section_names(&m.sections[0]),
             vec!["gamma".to_string(), "delta".to_string()]
         );
     }
 
     #[test]
     fn reconcile_dedupes_across_buckets() {
+        // Two separate single-tab containers both holding "b" —
+        // would happen only via hand-edited config, but reconcile
+        // must collapse cleanly.
         let mut m = model(&["a", "b"], vec![sec("g1", "W", &["b", "c"])]);
-        // b appears in both ungrouped and g1; reconcile should leave
-        // it only in ungrouped (earliest in visible order wins).
         m.reconcile(&["a".into(), "b".into(), "c".into()]);
-        assert_eq!(m.ungrouped, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(m.sections[0].members, vec!["c".to_string()]);
+        assert_eq!(ungrouped_names(&m), vec!["a".to_string(), "b".to_string()]);
+        // "b" stayed in ungrouped (visible-order earliest); the
+        // section's "b" container loses its only tab and is
+        // dropped, leaving just "c".
+        assert_eq!(section_names(&m.sections[0]), vec!["c".to_string()]);
     }
 
     #[test]
@@ -455,8 +631,8 @@ mod tests {
         );
         m.remove_session("alpha");
         m.remove_session("gamma");
-        assert_eq!(m.ungrouped, vec!["beta".to_string()]);
-        assert_eq!(m.sections[0].members, vec!["delta".to_string()]);
+        assert_eq!(ungrouped_names(&m), vec!["beta".to_string()]);
+        assert_eq!(section_names(&m.sections[0]), vec!["delta".to_string()]);
     }
 
     #[test]
@@ -464,23 +640,36 @@ mod tests {
         let mut m = model(&["a"], vec![sec("g1", "W", &["b", "c"])]);
         m.delete_section_at(0);
         assert_eq!(
-            m.ungrouped,
+            ungrouped_names(&m),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert!(m.sections.is_empty());
     }
 
     #[test]
-    fn find_identity_returns_flat_index() {
+    fn find_identity_matches_section_container_and_internal() {
         let m = model(&["a"], vec![sec("g1", "W", &["b"])]);
-        assert_eq!(m.find_identity("a"), Some(0));
+        // Section id.
         assert_eq!(m.find_identity("g1"), Some(1));
+        // Container id of the ungrouped row.
+        let con_a = &m.ungrouped[0];
+        assert_eq!(m.find_identity(&con_a.id), Some(0));
+        // Internal tmux name fallback.
+        assert_eq!(m.find_identity("a"), Some(0));
         assert_eq!(m.find_identity("b"), Some(2));
         assert!(m.find_identity("nope").is_none());
     }
 
     #[test]
-    fn roundtrip_toml() {
+    fn replace_session_updates_active_too() {
+        let mut m = model(&["old"], vec![]);
+        assert!(m.replace_session("old", "new"));
+        assert_eq!(m.ungrouped[0].members, vec!["new".to_string()]);
+        assert_eq!(m.ungrouped[0].active, "new");
+    }
+
+    #[test]
+    fn roundtrip_toml_new_shape() {
         let m = model(
             &["bosun-alpha"],
             vec![
@@ -491,5 +680,38 @@ mod tests {
         let toml = toml::to_string(&m).expect("serialize");
         let parsed: SidebarModel = toml::from_str(&toml).expect("parse");
         assert_eq!(parsed, m);
+    }
+
+    #[test]
+    fn legacy_string_shape_deserializes_into_containers() {
+        // The exact on-disk shape an 0.x bosun would have written:
+        // ungrouped is a flat string array, section.members likewise.
+        let legacy = r#"
+ungrouped = ["bosun-alpha", "bosun-beta"]
+
+[[sections]]
+id = "g1"
+name = "Work"
+members = ["bosun-gamma"]
+"#;
+        let parsed: SidebarModel = toml::from_str(legacy).expect("legacy parse");
+        assert_eq!(parsed.ungrouped.len(), 2);
+        assert_eq!(parsed.ungrouped[0].members, vec!["bosun-alpha".to_string()]);
+        assert_eq!(parsed.ungrouped[0].active, "bosun-alpha");
+        assert!(parsed.ungrouped[0].id.starts_with("con-"));
+        assert_eq!(parsed.sections[0].members.len(), 1);
+        assert_eq!(
+            parsed.sections[0].members[0].members,
+            vec!["bosun-gamma".to_string()]
+        );
+
+        // Re-serializing must emit the new table form so the next
+        // load doesn't depend on the legacy compat path.
+        let re_emitted = toml::to_string(&parsed).expect("serialize");
+        assert!(
+            re_emitted.contains("[[ungrouped]]"),
+            "expected table form, got:\n{}",
+            re_emitted
+        );
     }
 }

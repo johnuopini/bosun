@@ -50,13 +50,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
         let selected = i == state.selected;
         let start = out.len();
         match entry {
-            VisibleEntry::UngroupedSession(n) => match state.session_by_name(n) {
+            VisibleEntry::Ungrouped(c) => match state.session_by_name(&c.active) {
                 Some(v) => {
                     out.push(render_primary_line(v, selected, false, area.width, theme));
                     out.push(render_meta_line(v, selected, false, area.width, theme));
                 }
                 None => {
-                    let label = state.dead_display_for(n);
+                    let label = state.dead_display_for(&c.active);
                     out.push(render_missing_line(
                         &label, selected, false, area.width, theme,
                     ));
@@ -73,18 +73,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 ));
                 section_idx += 1;
             }
-            VisibleEntry::SectionMember { internal, .. } => match state.session_by_name(internal) {
-                Some(v) => {
-                    out.push(render_primary_line(v, selected, true, area.width, theme));
-                    out.push(render_meta_line(v, selected, true, area.width, theme));
+            VisibleEntry::Member { container, .. } => {
+                match state.session_by_name(&container.active) {
+                    Some(v) => {
+                        out.push(render_primary_line(v, selected, true, area.width, theme));
+                        out.push(render_meta_line(v, selected, true, area.width, theme));
+                    }
+                    None => {
+                        let label = state.dead_display_for(&container.active);
+                        out.push(render_missing_line(
+                            &label, selected, true, area.width, theme,
+                        ));
+                    }
                 }
-                None => {
-                    let label = state.dead_display_for(internal);
-                    out.push(render_missing_line(
-                        &label, selected, true, area.width, theme,
-                    ));
-                }
-            },
+            }
         }
         entry_first_line.push(start);
         entry_last_line.push(out.len().saturating_sub(1));
@@ -127,16 +129,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
 /// helper so [`entry_at_row`] stays in lockstep with [`render`].
 fn entry_line_count(state: &AppState, entry: &VisibleEntry<'_>) -> u16 {
     match entry {
-        VisibleEntry::UngroupedSession(n) => {
-            if state.session_by_name(n).is_some() {
+        VisibleEntry::Ungrouped(c) => {
+            if state.session_by_name(&c.active).is_some() {
                 2
             } else {
                 1
             }
         }
         VisibleEntry::SectionHeader(_) => 1,
-        VisibleEntry::SectionMember { internal, .. } => {
-            if state.session_by_name(internal).is_some() {
+        VisibleEntry::Member { container, .. } => {
+            if state.session_by_name(&container.active).is_some() {
                 2
             } else {
                 1

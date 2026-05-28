@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::sidebar::{Section, SidebarModel};
+use crate::sidebar::{Container, Section, SidebarModel};
 
 /// Legacy Vec<SidebarEntry> shape from v0.2.8. Read-only, used for
 /// one-time migration to the new explicit-membership `SidebarModel`.
@@ -48,7 +48,9 @@ fn migrate_legacy_sidebar(old: Vec<LegacySidebarEntry>) -> SidebarModel {
                 });
             }
             LegacySidebarEntry::Session { internal } => {
-                model.ungrouped.push(internal);
+                model
+                    .ungrouped
+                    .push(Container::single(internal.clone(), internal));
             }
         }
     }
@@ -271,7 +273,12 @@ impl Config {
         let sidebar = match file.sidebar {
             Some(s) => s,
             None => {
-                let ungrouped = file.session_order.unwrap_or_default();
+                let ungrouped = file
+                    .session_order
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| Container::single(n.clone(), n))
+                    .collect();
                 SidebarModel {
                     ungrouped,
                     sections: Vec::new(),

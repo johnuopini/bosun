@@ -281,15 +281,15 @@ impl AppState {
     /// to cycle to a name `switch-client` can't resolve.
     pub fn cycle_order(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for n in &self.sidebar.ungrouped {
-            if self.session_by_name(n).is_some() {
-                out.push(n.clone());
+        for c in &self.sidebar.ungrouped {
+            if self.session_by_name(&c.active).is_some() {
+                out.push(c.active.clone());
             }
         }
         for s in &self.sidebar.sections {
-            for m in &s.members {
-                if self.session_by_name(m).is_some() {
-                    out.push(m.clone());
+            for c in &s.members {
+                if self.session_by_name(&c.active).is_some() {
+                    out.push(c.active.clone());
                 }
             }
         }
@@ -350,7 +350,7 @@ impl AppState {
         };
         // In a section?
         for sec in &self.sidebar.sections {
-            if sec.members.iter().any(|n| n == internal) {
+            if sec.members.iter().any(|c| c.contains_internal(internal)) {
                 let prev = self.session_history.insert(display, sec.name.clone());
                 return prev.as_deref() != Some(sec.name.as_str());
             }
@@ -366,8 +366,8 @@ impl AppState {
         let mut changed = false;
         // Iterate over a snapshot of ungrouped so we can mutate during the loop.
         let ungrouped = self.sidebar.ungrouped.clone();
-        for internal in ungrouped {
-            let display = match self.sessions.iter().find(|v| v.name() == internal) {
+        for container in ungrouped {
+            let display = match self.sessions.iter().find(|v| v.name() == container.active) {
                 Some(v) => v.display().to_string(),
                 None => continue,
             };
@@ -384,9 +384,14 @@ impl AppState {
                 Some(i) => i,
                 None => continue,
             };
-            if let Some(pos) = self.sidebar.ungrouped.iter().position(|n| n == &internal) {
-                let n = self.sidebar.ungrouped.remove(pos);
-                self.sidebar.sections[si].members.push(n);
+            if let Some(pos) = self
+                .sidebar
+                .ungrouped
+                .iter()
+                .position(|c| c.id == container.id)
+            {
+                let c = self.sidebar.ungrouped.remove(pos);
+                self.sidebar.sections[si].members.push(c);
                 changed = true;
             }
         }
@@ -1122,7 +1127,7 @@ impl AppState {
             }
         }
         self.save_sidebar(out);
-        if self.update_history_for(&moved) {
+        if self.update_history_for(&moved.active) {
             self.save_session_history(out);
         }
     }
@@ -1161,7 +1166,7 @@ impl AppState {
         };
         if let Some(name) = moved {
             self.save_sidebar(out);
-            if self.update_history_for(&name) {
+            if self.update_history_for(&name.active) {
                 self.save_session_history(out);
             }
         }
@@ -1198,7 +1203,7 @@ impl AppState {
         };
         if let Some(name) = moved {
             self.save_sidebar(out);
-            if self.update_history_for(&name) {
+            if self.update_history_for(&name.active) {
                 self.save_session_history(out);
             }
         }
@@ -2414,7 +2419,10 @@ mod tests {
     }
 
     fn state_with(sessions: Vec<SessionView>, selected: usize) -> AppState {
-        let ungrouped = sessions.iter().map(|s| s.name().to_string()).collect();
+        let ungrouped = sessions
+            .iter()
+            .map(|s| Container::single(s.name().to_string(), s.name().to_string()))
+            .collect();
         AppState {
             sessions,
             selected,
@@ -2662,13 +2670,17 @@ mod tests {
         assert!(!s.dragging_divider);
     }
 
-    use crate::sidebar::Section;
+    use crate::sidebar::{Container, Section};
+
+    fn con(internal: &str) -> Container {
+        Container::single(internal.to_string(), internal.to_string())
+    }
 
     fn section(id: &str, name: &str, members: &[&str]) -> Section {
         Section {
             id: id.into(),
             name: name.into(),
-            members: members.iter().map(|s| s.to_string()).collect(),
+            members: members.iter().map(|s| con(s)).collect(),
             collapsed: false,
             banner_font: None,
         }
@@ -2676,9 +2688,47 @@ mod tests {
 
     fn model(ungrouped: &[&str], sections: Vec<Section>) -> SidebarModel {
         SidebarModel {
-            ungrouped: ungrouped.iter().map(|s| s.to_string()).collect(),
+            ungrouped: ungrouped.iter().map(|s| con(s)).collect(),
             sections,
         }
+    }
+
+    /// Active tab names of the ungrouped containers — what most
+    /// assertions actually want to compare.
+    fn ungrouped_names(s: &SidebarModel) -> Vec<String> {
+        s.ungrouped.iter().map(|c| c.active.clone()).collect()
+    }
+
+    /// Active tab names of a section's containers.
+    fn section_member_names(s: &SidebarModel, si: usize) -> Vec<String> {
+        s.sections[si]
+            .members
+            .iter()
+            .map(|c| c.active.clone())
+            .collect()
+    }
+
+    /// ID-free shape of the sidebar — what most reorder /
+    /// dissolve tests actually want to assert about. Compares
+    /// ungrouped active-tab names plus, per section, its `(id,
+    /// name, member-active-names)` triple. Container IDs change
+    /// every time `Container::single` is called so a whole-model
+    /// `assert_eq!` would always trip on the random ids.
+    #[allow(clippy::type_complexity)]
+    fn shape(m: &SidebarModel) -> (Vec<String>, Vec<(String, String, Vec<String>)>) {
+        let ungrouped = m.ungrouped.iter().map(|c| c.active.clone()).collect();
+        let sections = m
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.name.clone(),
+                    s.members.iter().map(|c| c.active.clone()).collect(),
+                )
+            })
+            .collect();
+        (ungrouped, sections)
     }
 
     /// Shift-J on a section header moves only that section among the
@@ -2702,14 +2752,14 @@ mod tests {
         s.apply(AppMsg::Key(shift_j));
 
         assert_eq!(
-            s.sidebar,
-            model(
+            shape(&s.sidebar),
+            shape(&model(
                 &[],
                 vec![
                     section("g2", "Second", &["c", "d"]),
                     section("g1", "First", &["a", "b"]),
                 ],
-            )
+            ))
         );
         // g1 is now the second section; its header flat index = 3
         // (0..=2 are g2 header + its two members).
@@ -2730,8 +2780,8 @@ mod tests {
 
         // b didn't move — it's at the end of ungrouped.
         assert_eq!(
-            s.sidebar,
-            model(&["a", "b"], vec![section("g1", "First", &["c"])])
+            shape(&s.sidebar),
+            shape(&model(&["a", "b"], vec![section("g1", "First", &["c"])]))
         );
     }
 
@@ -2748,8 +2798,8 @@ mod tests {
         s.apply(AppMsg::Key(shift_right));
 
         assert_eq!(
-            s.sidebar,
-            model(&["b"], vec![section("g1", "First", &["a", "c"])])
+            shape(&s.sidebar),
+            shape(&model(&["b"], vec![section("g1", "First", &["a", "c"])]))
         );
         // cursor follows to new member index: ungrouped has 1 entry,
         // then header, then a at member index 0 → flat index 2.
@@ -2770,8 +2820,8 @@ mod tests {
         s.apply(AppMsg::Key(shift_left));
 
         assert_eq!(
-            s.sidebar,
-            model(&["a", "b"], vec![section("g1", "First", &[])])
+            shape(&s.sidebar),
+            shape(&model(&["a", "b"], vec![section("g1", "First", &[])]))
         );
         // b is now ungrouped at index 1.
         assert_eq!(s.selected, 1);
@@ -2788,7 +2838,10 @@ mod tests {
         let mut out = Vec::new();
         s.insert_section("Work".to_string(), &mut out);
 
-        assert_eq!(s.sidebar.ungrouped, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            ungrouped_names(&s.sidebar),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(s.sidebar.sections.len(), 1);
         assert_eq!(s.sidebar.sections[0].name, "Work");
         assert!(s.sidebar.sections[0].members.is_empty());
@@ -2804,7 +2857,7 @@ mod tests {
 
         s.apply(AppMsg::Key(key(KeyCode::Char('d'))));
 
-        assert_eq!(s.sidebar, model(&["a", "b"], vec![]));
+        assert_eq!(shape(&s.sidebar), shape(&model(&["a", "b"], vec![])));
         assert_eq!(s.selected, 1); // stays at the old header position (now b)
         assert!(s.modals.is_empty());
     }
@@ -2879,7 +2932,10 @@ mod tests {
 
         assert!(s.sidebar.ungrouped.is_empty());
         assert!(s.sidebar.sections[0].members.is_empty());
-        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 1),
+            vec!["bosun".to_string()]
+        );
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
             Some("bosun".to_string())
@@ -2897,7 +2953,7 @@ mod tests {
 
         s.apply(AppMsg::Key(key(KeyCode::Char('0'))));
 
-        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+        assert_eq!(ungrouped_names(&s.sidebar), vec!["bosun".to_string()]);
         assert!(s.sidebar.sections[0].members.is_empty());
     }
 
@@ -2911,7 +2967,7 @@ mod tests {
 
         // Only one section → `2` is out of range.
         s.apply(AppMsg::Key(key(KeyCode::Char('2'))));
-        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+        assert_eq!(ungrouped_names(&s.sidebar), vec!["bosun".to_string()]);
     }
 
     /// Shift-Right cycles through sections: pressing it again after
@@ -2930,7 +2986,10 @@ mod tests {
 
         s.apply(AppMsg::Key(sr));
         assert!(s.sidebar.ungrouped.is_empty());
-        assert_eq!(s.sidebar.sections[0].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 0),
+            vec!["bosun".to_string()]
+        );
         assert!(s.sidebar.sections[1].members.is_empty());
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
@@ -2940,7 +2999,10 @@ mod tests {
 
         s.apply(AppMsg::Key(sr));
         assert!(s.sidebar.sections[0].members.is_empty());
-        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 1),
+            vec!["bosun".to_string()]
+        );
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
             Some("bosun".to_string()),
@@ -2986,7 +3048,10 @@ mod tests {
         });
 
         assert!(s.sidebar.ungrouped.is_empty());
-        assert_eq!(s.sidebar.sections[0].members, vec!["bosun-abc".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 0),
+            vec!["bosun-abc".to_string()]
+        );
     }
 
     /// Restart-swap: a pending swap captured at modal-confirm time
@@ -3008,12 +3073,12 @@ mod tests {
         });
 
         assert_eq!(
-            s.sidebar.sections[0].members,
+            section_member_names(&s.sidebar, 0),
             vec!["bosun-def".to_string()],
             "new internal inherits the dead row's slot"
         );
         assert_eq!(
-            s.sidebar.ungrouped,
+            ungrouped_names(&s.sidebar),
             vec!["bosun-other".to_string()],
             "no append of bosun-def to ungrouped"
         );
@@ -3051,7 +3116,7 @@ mod tests {
         });
         assert!(s.pending_restart_swap.is_none(), "swap consumed");
         assert_eq!(
-            s.sidebar.ungrouped,
+            ungrouped_names(&s.sidebar),
             vec!["bosun-def".to_string()],
             "new internal landed in the old slot"
         );
@@ -3101,7 +3166,7 @@ mod tests {
         });
 
         assert_eq!(
-            s.sidebar.ungrouped,
+            ungrouped_names(&s.sidebar),
             vec!["bosun-keep".to_string()],
             "killed session must not reappear in ungrouped"
         );

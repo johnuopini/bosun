@@ -60,7 +60,7 @@ pub fn render(
                 let members: Vec<&crate::tmux::session::SessionView> = sec
                     .members
                     .iter()
-                    .filter_map(|n| state.session_by_name(n))
+                    .filter_map(|c| state.session_by_name(&c.active))
                     .collect();
                 section_preview::render_section(
                     frame.buffer_mut(),

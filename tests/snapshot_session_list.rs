@@ -6,7 +6,7 @@
 use std::time::SystemTime;
 
 use bosun::app::AppState;
-use bosun::sidebar::{Section, SidebarModel};
+use bosun::sidebar::{Container, Section, SidebarModel};
 use bosun::tmux::detector::Status;
 use bosun::tmux::session::SessionView;
 use bosun::tmux::TmuxSession;
@@ -18,7 +18,10 @@ use ratatui::Terminal;
 /// bucket (no sections). For snapshot tests that only care about
 /// flat-list rendering.
 fn state_with(sessions: Vec<SessionView>) -> AppState {
-    let ungrouped = sessions.iter().map(|s| s.name().to_string()).collect();
+    let ungrouped = sessions
+        .iter()
+        .map(|s| Container::single(s.name().to_string(), s.name().to_string()))
+        .collect();
     AppState {
         sessions,
         sidebar: SidebarModel {
@@ -133,11 +136,14 @@ fn sections_group_sessions() {
         ..Default::default()
     };
     state.sidebar = SidebarModel {
-        ungrouped: vec!["alpha".to_string()],
+        ungrouped: vec![Container::single("alpha".into(), "alpha".into())],
         sections: vec![Section {
             id: "g1".into(),
             name: "Premium Products".into(),
-            members: vec!["beta".to_string(), "gamma".to_string()],
+            members: vec![
+                Container::single("beta".into(), "beta".into()),
+                Container::single("gamma".into(), "gamma".into()),
+            ],
             collapsed: false,
             banner_font: None,
         }],
