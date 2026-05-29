@@ -69,6 +69,31 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Pick a legible foreground for text drawn on top of `bg`.
+    /// Chooses near-black or near-white by the background's perceived
+    /// luminance (ITU-R BT.601 weights), so accent-filled surfaces —
+    /// the "bosun" status chip, the active tab — stay readable on
+    /// both light and dark accents across every theme, built-in or
+    /// user-supplied. Non-RGB backgrounds (which we can't measure)
+    /// fall back to the theme's primary text color.
+    ///
+    /// The threshold leans slightly toward dark ink: a mid-tone
+    /// accent reads better with dark text than white, and that's the
+    /// case the default themes hit.
+    pub fn on(&self, bg: Color) -> Color {
+        match bg {
+            Color::Rgb(r, g, b) => {
+                let luminance = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                if luminance > 140.0 {
+                    Color::Rgb(0x10, 0x12, 0x18) // near-black ink
+                } else {
+                    Color::Rgb(0xf2, 0xf3, 0xf5) // near-white ink
+                }
+            }
+            _ => self.text,
+        }
+    }
+
     /// Resolve a theme by name. Checks the user theme directory
     /// first, then the built-in set, then falls back to opencode.
     pub fn load(name: &str, user_dir: Option<&Path>) -> Self {
@@ -201,6 +226,30 @@ mod hex_color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_picks_dark_ink_for_light_accent() {
+        let t = Theme::builtin("tokyonight").expect("tokyonight must parse");
+        // tokyonight's accent is a light blue → dark ink for contrast.
+        assert_eq!(t.on(t.accent), Color::Rgb(0x10, 0x12, 0x18));
+        // An explicitly light background → dark ink.
+        assert_eq!(
+            t.on(Color::Rgb(0xff, 0xff, 0xff)),
+            Color::Rgb(0x10, 0x12, 0x18)
+        );
+    }
+
+    #[test]
+    fn on_picks_light_ink_for_dark_accent() {
+        let t = Theme::builtin("opencode").expect("opencode must parse");
+        // opencode's accent is a mid-dark purple → light ink stays readable.
+        assert_eq!(t.on(t.accent), Color::Rgb(0xf2, 0xf3, 0xf5));
+        // An explicitly dark background → light ink.
+        assert_eq!(
+            t.on(Color::Rgb(0x00, 0x00, 0x00)),
+            Color::Rgb(0xf2, 0xf3, 0xf5)
+        );
+    }
 
     #[test]
     fn builtin_opencode_parses() {

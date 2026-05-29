@@ -36,6 +36,26 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   automatically. The help cheat-sheet documents both, plus the
   Option word-motion / word-delete keys.
 
+### Fixed
+- **syspolicyd CPU storm from the fast preview tick.** The fast
+  status tick was running `tmux capture-pane` for *every* managed
+  session every ~200ms (`1 + N` short-lived `tmux` execs per tick).
+  At a dozen sessions that's ~60 process spawns a second per bosun
+  instance, and because macOS Gatekeeper re-scans every exec of an
+  ad-hoc-signed binary (Homebrew's `tmux` included) without caching
+  the verdict, `syspolicyd` could peg every core. The fast tick now
+  captures only the *focused* session — the one whose preview you're
+  watching — and skips entirely when nothing is focused; background
+  sessions keep their 1Hz status refresh. Per-instance fast-tick
+  exec rate drops ~6×.
+- **Unreadable text on accent-colored chips.** The "bosun" status
+  chip and the active tab (top strip and sidebar pill) drew light
+  text on the theme accent, which was low-contrast on light accents
+  (tokyonight) and illegible in some terminals. A new luminance-aware
+  `Theme::on` picks near-black or near-white ink per the accent's
+  brightness, so the label stays readable across every built-in and
+  user theme.
+
 ## [2.0.2] — 2026-05-28
 
 ### Changed

@@ -454,7 +454,7 @@ fn render_tabs_line(
 ) -> Line<'static> {
     let bg = row_bg(selected, theme);
     let muted = Style::default().fg(theme.text_muted).bg(bg);
-    let active_style = Style::default().fg(theme.text).bg(theme.accent);
+    let active_style = Style::default().fg(theme.on(theme.accent)).bg(theme.accent);
 
     let base_indent: &str = "       ";
     let extra = if indented { "  " } else { "" };

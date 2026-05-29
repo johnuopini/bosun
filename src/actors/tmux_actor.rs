@@ -648,29 +648,46 @@ pub fn spawn(
                         None => { std::future::pending::<()>().await; }
                     }
                 } => {
-                    // Fast tick: live status for every managed session,
-                    // plus a preview refresh for the focused one.
+                    // Fast tick: live status + preview for the
+                    // *focused* session only.
                     //
-                    // Status detection used to ride only the 1Hz
-                    // `preview_tick` (do_refresh), so an agent flipping
-                    // between Running and Waiting could take a full
-                    // second to reflect in the sidebar — long enough
-                    // for users to question whether the glyph was
-                    // accurate. Moving it here drops latency to
-                    // `preview_tick_ms` (default 200ms) across the
-                    // whole sidebar, not just the focused row.
+                    // We used to `capture-pane` every managed session
+                    // on this tick to keep the whole sidebar's
+                    // Running/Waiting glyphs at `preview_tick_ms`
+                    // latency. That meant `1 + N` tmux execs every tick
+                    // (one `list-sessions` + one `capture-pane` per
+                    // session) — with a dozen sessions and a 200ms
+                    // tick that's ~60 short-lived `tmux` processes a
+                    // second, *per bosun instance*. macOS Gatekeeper
+                    // re-scans each exec of an ad-hoc-signed binary
+                    // (Homebrew's tmux included) and never caches the
+                    // verdict, so a high exec rate pins `syspolicyd` at
+                    // hundreds of percent CPU. See the project notes.
                     //
-                    // We re-list sessions every tick (one cheap tmux
-                    // query) rather than caching to avoid stale
-                    // membership: a session killed between ticks
-                    // would otherwise hang around as a phantom row.
-                    // capture-pane failures are silently dropped —
-                    // the next 1Hz `do_refresh` reconciles
-                    // membership properly.
+                    // Background sessions don't need sub-second glyphs:
+                    // the 1Hz `preview_tick` already captures and
+                    // detects every managed session via `refresh_all`,
+                    // so they stay live at 1s. Only the session the
+                    // user is actually watching needs the tight
+                    // cadence, so the fast tick now captures just that
+                    // one — dropping the per-tick cost from `1 + N` to
+                    // `1 + 1`. capture-pane failures are silently
+                    // dropped; the 1Hz tick reconciles membership.
+                    //
+                    // Nothing focused → nothing needs the tight
+                    // cadence, so skip the tick outright and don't
+                    // even pay the `list-sessions` exec.
+                    if focused.is_none() {
+                        continue;
+                    }
                     match client.list_sessions().await {
                         Ok(raw) => {
                             let now = SystemTime::now();
-                            for s in raw.into_iter().filter(|s| config.manages(&s.name)) {
+                            for s in raw
+                                .into_iter()
+                                .filter(|s| config.manages(&s.name))
+                                .filter(|s| Some(s.name.as_str()) == focused.as_deref())
+                            {
                                 let bytes = match client.capture_pane(&s.name).await {
                                     Ok(b) => b,
                                     Err(e) => {

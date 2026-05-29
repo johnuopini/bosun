@@ -12,7 +12,10 @@ use crate::ui::Theme;
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let bg = theme.panel_alt;
     let mut left_spans = vec![
-        Span::styled(" bosun ", Style::default().fg(theme.text).bg(theme.accent)),
+        Span::styled(
+            " bosun ",
+            Style::default().fg(theme.on(theme.accent)).bg(theme.accent),
+        ),
         Span::styled(
             format!(" v{} ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(theme.text_muted).bg(bg),
