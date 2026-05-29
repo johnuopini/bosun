@@ -1638,6 +1638,15 @@ pub struct App {
     /// follows the active-tab change once `SessionsRefreshed`
     /// reconciles).
     restore_focus_after_modal: bool,
+    /// Whether bosun successfully pushed the kitty keyboard
+    /// progressive-enhancement flags onto the outer terminal at
+    /// startup (gated on `supports_keyboard_enhancement`). When
+    /// true, the terminal reports modifiers unambiguously — so
+    /// Option+Delete arrives as `Alt+Backspace` and `Shift+Up/Down`
+    /// as modified arrows rather than bare keys. Used to know
+    /// whether to pop/re-push the flags around a full-screen
+    /// `tmux attach` (which owns the tty for its duration).
+    pub kbd_enhanced: bool,
     /// Tmux client. The tmux actor owns the primary copy and runs
     /// all timed / notification-driven tmux work; we keep this
     /// secondary handle so the app task itself can do synchronous
@@ -1712,6 +1721,7 @@ impl App {
             embed_enabled: config.embed_enabled,
             embed_focused: false,
             restore_focus_after_modal: false,
+            kbd_enhanced: false,
             client,
         }
     }
@@ -1791,6 +1801,27 @@ impl App {
             if self.embed_focused {
                 if let AppMsg::Key(k) = &msg {
                     use crossterm::event::{KeyCode, KeyModifiers};
+                    // Optional key-event tracing for diagnosing how the
+                    // outer terminal encodes chords (modifiers stripped,
+                    // chords swallowed, etc). Off unless `BOSUN_KEYLOG`
+                    // is set; appends to /tmp/bosun-keys.log. Cheap at
+                    // human typing rates and invaluable when a terminal
+                    // mangles a binding (see iTerm2's Natural Text
+                    // Editing preset eating Shift+Up/Down).
+                    if std::env::var_os("BOSUN_KEYLOG").is_some() {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/bosun-keys.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "code={:?} mods={:?} kind={:?}",
+                                k.code, k.modifiers, k.kind
+                            );
+                        }
+                    }
                     let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
                         && k.modifiers.contains(KeyModifiers::CONTROL);
                     // In-focus navigation chords:
@@ -1803,6 +1834,17 @@ impl App {
                     //     here so left/right is free for tabs).
                     // bosun intercepts the chord before the embed
                     // write so the inner app never sees it.
+                    //
+                    // Matching is `.contains(SHIFT)`, not an exact
+                    // modifier compare, on purpose: it also accepts
+                    // Ctrl+Shift+arrow as an equivalent. That matters
+                    // because iTerm2 strips the Shift bit from the
+                    // *vertical* arrows (Shift+Up/Down arrive bare)
+                    // but preserves it on Ctrl+Shift+Up/Down — so
+                    // iTerm2 users cycle sessions with Ctrl+Shift+
+                    // Up/Down while terminals that deliver a clean
+                    // Shift+Up/Down (Ghostty, kitty, WezTerm) keep the
+                    // simpler chord. Both map to the same action.
                     let is_shift_left = matches!(k.code, KeyCode::Left)
                         && k.modifiers.contains(KeyModifiers::SHIFT);
                     let is_shift_right = matches!(k.code, KeyCode::Right)
@@ -2448,6 +2490,17 @@ impl App {
         name: &str,
     ) -> Result<()> {
         // 1. Tear down ratatui's grip on the terminal so tmux can own it.
+        //    Pop the kitty keyboard flags first (if we pushed them) so
+        //    tmux negotiates the protocol from a clean slate — leaving
+        //    them on the stack would let our enhancement leak into the
+        //    attached session's key reporting.
+        if self.kbd_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+            )
+            .map_err(BosunError::Io)?;
+        }
         crossterm::terminal::disable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
@@ -2461,7 +2514,9 @@ impl App {
         let result = attach_with_ctrl_q_detach(self.socket.as_deref(), name);
 
         // 3. Re-enter raw mode / alt screen / mouse capture /
-        //    bracketed paste regardless of attach result.
+        //    bracketed paste regardless of attach result, then
+        //    re-push the keyboard flags so modifier reporting is
+        //    restored for the returning TUI.
         crossterm::terminal::enable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
@@ -2470,6 +2525,15 @@ impl App {
             crossterm::event::EnableBracketedPaste,
         )
         .map_err(BosunError::Io)?;
+        if self.kbd_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+            )
+            .map_err(BosunError::Io)?;
+        }
         terminal.clear().map_err(term_err)?;
 
         if let Err(e) = result {

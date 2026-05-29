@@ -4,6 +4,30 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] — 2026-05-28
+
+### Added
+- **Word-wise editing in the focused embed.** `Option+Delete`
+  deletes the previous word and `Option+Left`/`Option+Right` move
+  the cursor by word inside the embedded session. bosun now emits
+  the readline word-motion bytes (`ESC \x7f` for delete-word,
+  `ESC b`/`ESC f` for word-left/right) that zsh, bash, and Claude
+  Code honor, instead of the xterm `\e[1;3D` Alt-arrow form those
+  apps ignore.
+- **Kitty keyboard protocol at startup.** bosun requests the
+  `DISAMBIGUATE_ESCAPE_CODES` enhancement (gated on
+  `supports_keyboard_enhancement`, so it's a no-op on terminals
+  that don't speak it). This is what makes `Option`+key chords
+  arrive with their modifier bits intact; without it the outer
+  terminal falls back to legacy encoding and hands bosun bare
+  keys, so word-motion and word-delete couldn't be distinguished
+  from a plain arrow or backspace. Popped and re-pushed around the
+  full-screen `tmux attach` path and on panic.
+- **`BOSUN_KEYLOG` debug facility.** Setting the env var appends
+  every focused-mode key event (code, modifiers, kind) to
+  `/tmp/bosun-keys.log` — useful for diagnosing how a given
+  terminal encodes a chord without a rebuild.
+
 ## [2.0.2] — 2026-05-28
 
 ### Changed

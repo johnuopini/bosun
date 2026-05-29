@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -98,8 +100,12 @@ async fn main() -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // Pop unconditionally — harmless if we never pushed (the
+        // terminal ignores a pop on an empty stack), and it keeps the
+        // kitty keyboard protocol from leaking past a panic.
         let _ = execute!(
             io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -109,14 +115,18 @@ async fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, kbd_enhanced) = setup_terminal()?;
     let mut app = App::new(client, socket, config, store);
+    app.kbd_enhanced = kbd_enhanced;
     let run_result = app.run(&mut terminal).await;
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, kbd_enhanced)?;
     run_result
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+/// Set up the terminal and return it alongside whether the kitty
+/// keyboard progressive-enhancement flags were successfully pushed.
+/// The bool is threaded back so teardown pops exactly what we pushed.
+fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     enable_raw_mode().map_err(BosunError::Io)?;
     let mut stdout = io::stdout();
     // Mouse capture is needed so the draggable divider between the
@@ -136,11 +146,39 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
         EnableBracketedPaste
     )
     .map_err(BosunError::Io)?;
+
+    // Request the kitty keyboard protocol's "disambiguate escape
+    // codes" enhancement. This is what makes the outer terminal
+    // report modifiers unambiguously — without it, terminals fall
+    // back to legacy encoding and hand us *bare* keys for chords
+    // like Option+Delete (should be Alt+Backspace) and Shift+Up/Down
+    // (should be modified arrows), which breaks word-delete in the
+    // embed and the in-focus session-cycle chords. Gated on
+    // `supports_keyboard_enhancement` so it's a no-op on terminals
+    // that don't speak the protocol (Apple Terminal.app), where we
+    // keep the prior behavior. DISAMBIGUATE alone (no
+    // REPORT_EVENT_TYPES) means no key-release events, so the focus
+    // nav chords don't double-fire.
+    let kbd_enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
+        && execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        )
+        .is_ok();
+
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(BosunError::Io)
+    Terminal::new(backend)
+        .map(|t| (t, kbd_enhanced))
+        .map_err(BosunError::Io)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    kbd_enhanced: bool,
+) -> Result<()> {
+    if kbd_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode().map_err(BosunError::Io)?;
     execute!(
         terminal.backend_mut(),

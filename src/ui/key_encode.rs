@@ -79,8 +79,27 @@ pub fn encode(key: KeyEvent, ctx: EncodeContext) -> Option<Vec<u8>> {
         KeyCode::Enter => Some(modified_or(13, shift, ctrl, alt, b"\r")),
         KeyCode::Tab => Some(modified_or(9, shift, ctrl, alt, b"\t")),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        // Alt+Backspace (macOS Option+Delete) is the universal
+        // "delete previous word" chord. Real terminals send it as
+        // Meta+DEL = ESC + 0x7f, which readline / zsh / bash / Claude
+        // Code all map to backward-kill-word. The modifyOtherKeys
+        // form used for the Ctrl/Shift combos below is *not*
+        // recognized as a word-delete by those apps — they fall back
+        // to deleting a single char — so Alt-only gets the
+        // ESC-prefixed bare byte instead.
+        KeyCode::Backspace if alt && !ctrl && !shift => Some(b"\x1b\x7f".to_vec()),
         KeyCode::Backspace => Some(modified_or(127, shift, ctrl, alt, b"\x7f")),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
+        // Alt+Left / Alt+Right (macOS Option+Arrow) = move by word.
+        // Emit the readline Meta-b / Meta-f sequences (ESC b / ESC f),
+        // the universal backward-word / forward-word bindings that
+        // zsh / bash / readline / Claude Code all honor. The xterm
+        // Alt+arrow CSI form (`\e[1;3D`) the modified `arrow_seq`
+        // would otherwise produce is not recognized as word-motion by
+        // those apps, so the cursor wouldn't move at all. Mirrors the
+        // Alt+Backspace → `\x1b\x7f` (backward-kill-word) choice above.
+        KeyCode::Left if alt && !ctrl && !shift => Some(b"\x1bb".to_vec()),
+        KeyCode::Right if alt && !ctrl && !shift => Some(b"\x1bf".to_vec()),
         KeyCode::Left => Some(arrow_seq(b'D', shift, ctrl, alt, ctx.application_cursor)),
         KeyCode::Right => Some(arrow_seq(b'C', shift, ctrl, alt, ctx.application_cursor)),
         KeyCode::Up => Some(arrow_seq(b'A', shift, ctrl, alt, ctx.application_cursor)),
@@ -357,10 +376,46 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_deletes_word() {
+        // macOS Option+Delete. Meta+DEL = ESC + 0x7f, the readline
+        // backward-kill-word chord — not the modifyOtherKeys form,
+        // which apps don't treat as a word-delete.
+        assert_eq!(
+            encode(k(KeyCode::Backspace, KeyModifiers::ALT)),
+            Some(b"\x1b\x7f".to_vec())
+        );
+    }
+
+    #[test]
     fn ctrl_backspace_uses_modify_other_keys() {
         assert_eq!(
             encode(k(KeyCode::Backspace, KeyModifiers::CONTROL)),
             Some(b"\x1b[27;5;127~".to_vec())
+        );
+    }
+
+    #[test]
+    fn alt_left_right_move_by_word() {
+        // macOS Option+Arrow. ESC b / ESC f are the readline
+        // backward-word / forward-word bindings claude & shells honor;
+        // the xterm `\e[1;3D` Alt-arrow form is ignored by them.
+        assert_eq!(
+            encode(k(KeyCode::Left, KeyModifiers::ALT)),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            encode(k(KeyCode::Right, KeyModifiers::ALT)),
+            Some(b"\x1bf".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_left_falls_through_to_csi() {
+        // Only plain Alt+arrow is word-motion; combos keep the
+        // modified CSI form (Ctrl+Alt code 7).
+        assert_eq!(
+            encode(k(KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL)),
+            Some(b"\x1b[1;7D".to_vec())
         );
     }
 
