@@ -136,13 +136,10 @@ pub struct AppState {
     /// downward steps, negative = pending upward steps; resets on
     /// direction change so a flick the other way feels immediate.
     pub scroll_accum: i32,
-    /// Single-window mode (2.0+). When true, the App's `pending_attach`
-    /// handler routes through `enter_focus` (preview pane becomes
-    /// the interactive surface) instead of `perform_attach` (full-
-    /// screen `tmux attach` with ratatui torn down). The sidebar
-    /// stays visible the whole time. Toggled live with `s`;
-    /// persisted via `Command::SaveSingleWindow` so the preference
-    /// survives across bosun restarts.
+    /// Always `true` as of v2.0.2 — focused single-window mode is
+    /// the only attach behavior. The field is retained so callers
+    /// that branch on it keep compiling; remove once those callers
+    /// have been simplified.
     pub single_window_mode: bool,
     /// Internal names of sessions the user just killed via `d`.
     /// Suppresses the "re-add via reconcile" race where a 1Hz
@@ -865,8 +862,22 @@ impl AppState {
         if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return;
         }
+        // Shift-with-arrow normalisation: some terminals send Shift+arrow
+        // with extra modifier bits (e.g. SHIFT|KEYPAD, or mobile SSH
+        // clients that mix in ALT). Strip everything except SHIFT and
+        // CONTROL before matching so the exact-modifier arms below catch
+        // it. Focused mode already uses `.contains(SHIFT)`; this brings
+        // sidebar in line.
+        let normalized_mods = if matches!(
+            k.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        ) {
+            k.modifiers & (KeyModifiers::SHIFT | KeyModifiers::CONTROL)
+        } else {
+            k.modifiers
+        };
 
-        match (k.code, k.modifiers) {
+        match (k.code, normalized_mods) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -933,11 +944,22 @@ impl AppState {
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            // Enter OR plain Right = attach the selected session.
-            (KeyCode::Enter, _) | (KeyCode::Right, KeyModifiers::NONE) => {
+            // Enter = attach the selected session.
+            (KeyCode::Enter, _) => {
                 if let Some(s) = self.selected_session() {
                     self.pending_attach = Some(s.name().to_string());
                 }
+            }
+            // Plain Right / Left = cycle the active tab within the
+            // current container (no-op when the container has a
+            // single tab). Previously Right also attached, but that
+            // collided with "I'm pressing arrow keys to navigate"
+            // muscle memory — Enter stays as the explicit attach.
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                self.cycle_active_tab(-1, out);
             }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 out.push(Command::ListNow);
@@ -1119,38 +1141,9 @@ impl AppState {
             (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
                 self.pending_modal = Some(ModalRequest::Theme);
             }
-            // `s`: toggle single-window mode (2.0+). When on,
-            // `Enter` / `Right` on a session opens it inside the
-            // preview pane (focused embed) instead of doing a
-            // full-screen `tmux attach`. Persisted to `config.toml`
-            // so the preference sticks across restarts. The actual
-            // mode switch in the live embed is handled by the app
-            // loop on the next iteration via `sync_embed`-style
-            // reconciliation.
-            (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                // Refuse to turn single-window ON when the terminal is too
-                // narrow to render the preview pane — there's no embed to
-                // open `Enter` into, so the toggle would look broken.
-                // Turning OFF is always allowed so a user who already had
-                // it on (from a wider terminal) can clear the state.
-                if !self.single_window_mode
-                    && self.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH
-                {
-                    self.warning = Some(format!(
-                        "single-window mode needs ≥{} cols (current: {})",
-                        crate::ui::layout::PREVIEW_MIN_WIDTH,
-                        self.term_size.0,
-                    ));
-                } else {
-                    self.single_window_mode = !self.single_window_mode;
-                    out.push(Command::SaveSingleWindow(self.single_window_mode));
-                    self.warning = Some(if self.single_window_mode {
-                        "single-window mode ON — Enter opens in preview pane".to_string()
-                    } else {
-                        "single-window mode OFF — Enter attaches full-screen".to_string()
-                    });
-                }
-            }
+            // (The `s` toggle was removed in v2.0.2 — single-window
+            // focused mode is now the only behavior. `Enter` always
+            // opens the session in the embed.)
             // `/` opens the type-ahead session picker. Mirrors fzf/
             // vim's convention for "start a filter". The app loop
             // populates it with the current managed sessions.
@@ -2142,12 +2135,6 @@ impl App {
                             self.state.warning = Some(format!("divider: failed to save: {e}"));
                         }
                     }
-                    Command::SaveSingleWindow(on) => {
-                        if let Err(e) = crate::config::write_single_window(on) {
-                            self.state.warning =
-                                Some(format!("single-window: failed to save: {e}"));
-                        }
-                    }
                     Command::SaveSidebar(entries) => {
                         if let Err(e) = crate::config::write_sidebar(&entries) {
                             self.state.warning = Some(format!("sidebar: failed to save: {e}"));
@@ -2283,20 +2270,6 @@ impl App {
                 }
             }
 
-            // Terminal too narrow to render the preview pane (phone /
-            // small mosh): drop out of focused embed so the user's
-            // keys stop being routed into an invisible PTY. The
-            // `single_window_mode` preference is left alone — when
-            // the terminal grows back, the next `Enter` re-enters
-            // focus normally.
-            if self.embed_focused && self.state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH {
-                self.exit_focus().await;
-                self.state.warning = Some(format!(
-                    "terminal narrowed below {} cols — exited focus",
-                    crate::ui::layout::PREVIEW_MIN_WIDTH,
-                ));
-            }
-
             // Add-tab modal closed (Esc or submit): if it was opened
             // from focused mode, re-enter focus on the currently-
             // active tab. On submit the active tab is still the old
@@ -2333,7 +2306,6 @@ impl App {
             if let Some(name) = self.state.pending_attach.take() {
                 let want_single_window = self.state.single_window_mode
                     && self.embed_enabled
-                    && self.state.term_size.0 >= crate::ui::layout::PREVIEW_MIN_WIDTH
                     && self
                         .embed
                         .as_ref()
@@ -2635,9 +2607,7 @@ impl App {
             // state with no working PTY behind it.
             self.embed_focused = false;
             self.state.warning = Some(format!("focus: {e}"));
-            return;
         }
-        self.state.warning = Some("focus mode — Ctrl-Q to exit".to_string());
     }
 
     /// Switch the embed back to `AttachMode::Preview`. Mirrors
@@ -2757,9 +2727,9 @@ impl App {
 
     /// Full preview rectangle (in terminal coords) for the current
     /// layout. `None` on narrow terminals where the preview is
-    /// hidden. Used by hit-tests that should treat the focus-border
-    /// reservation as still part of the preview region (e.g. "click
-    /// anywhere in the preview to enter focus").
+    /// hidden — except when single-window mode is focused, in which
+    /// case the embed takes the entire body and we return that. Used
+    /// by hit-tests + PTY sizing.
     fn preview_rect(&self) -> Option<ratatui::layout::Rect> {
         use ratatui::layout::Rect;
         let area = Rect {
@@ -2768,7 +2738,16 @@ impl App {
             width: self.state.term_size.0,
             height: self.state.term_size.1,
         };
-        crate::ui::layout::compute(area, self.state.divider_x).preview
+        let layout = crate::ui::layout::compute(area, self.state.divider_x);
+        if let Some(p) = layout.preview {
+            return Some(p);
+        }
+        // Narrow + focused + single-window: the embed gets the whole
+        // body. Matches the special-case render branch in `ui::draw`.
+        if self.state.single_window_mode && self.embed_focused {
+            return Some(layout.list);
+        }
+        None
     }
 
     /// Rectangle the embed actually renders into. Matches the
@@ -3326,13 +3305,25 @@ mod tests {
         }
     }
 
-    /// Right arrow (no shift) attaches the selected session.
+    /// Enter attaches the selected session. Plain Right used to do
+    /// this too but was reassigned to tab-cycle so arrow keys
+    /// navigate without accidentally attaching.
     #[test]
-    fn right_arrow_attaches_session() {
+    fn enter_attaches_session() {
+        let mut s = state_with(vec![ses("main")], 0);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        s.apply(AppMsg::Key(enter));
+        assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    /// Plain Right cycles the active tab; on a single-tab container
+    /// it's a no-op (and crucially does *not* attach).
+    #[test]
+    fn right_arrow_does_not_attach_on_single_tab_container() {
         let mut s = state_with(vec![ses("main")], 0);
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         s.apply(AppMsg::Key(right));
-        assert_eq!(s.pending_attach.as_deref(), Some("main"));
+        assert!(s.pending_attach.is_none());
     }
 
     /// Pressing `2` on an ungrouped session jumps it directly to

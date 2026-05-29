@@ -168,7 +168,11 @@ impl Default for Config {
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
-            single_window_mode: false,
+            // v2.0.2+: focused single-window mode is the only mode.
+            // The field is retained as `true` for callers that still
+            // gate on it, but it is no longer user-toggleable or
+            // persisted.
+            single_window_mode: true,
         }
     }
 }
@@ -320,16 +324,10 @@ impl Config {
             Err(_) => file.embed.unwrap_or(DEFAULT_EMBED_ENABLED),
         };
 
-        // Single-window mode: env override accepts truthy values.
-        // Anything else (or absent) → fall through to the file
-        // setting, then to default-false.
-        let single_window_mode = match env::var("BOSUN_SINGLE_WINDOW") {
-            Ok(s) => matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            ),
-            Err(_) => file.single_window.unwrap_or(false),
-        };
+        // v2.0.2+: focused single-window is the only mode. The
+        // setting is no longer user-toggleable; we keep the field
+        // wired as `true` for code paths that gate on it.
+        let single_window_mode = true;
 
         Self {
             session_prefix,

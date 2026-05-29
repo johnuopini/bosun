@@ -548,7 +548,6 @@ pub fn spawn(
                 | Command::SaveSidebar(_)
                 | Command::SaveSessionHistory(_)
                 | Command::SaveBannerFont(_)
-                | Command::SaveSingleWindow(_)
                 | Command::InsertSection { .. }
                 | Command::RenameSection { .. }
                 | Command::OpenEditor { .. } => {

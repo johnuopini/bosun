@@ -29,6 +29,21 @@ pub fn draw(
 ) {
     let area = frame.area();
     let l = layout::compute(area, state.divider_x);
+
+    // Narrow-terminal focused mode (mobile / mosh in single-window):
+    // there's no room for a split, so hand the entire body to the
+    // embed and skip the sidebar. The user can still detach with
+    // Ctrl-Q and the sidebar comes back. Without this, focused mode
+    // on a phone would leave the embed unrendered while the sidebar
+    // hogged the screen.
+    if state.single_window_mode && embed_focused && l.preview.is_none() {
+        let body = Rect::new(l.list.x, l.list.y, l.list.width, l.list.height);
+        preview::render(frame, body, state, theme, embed);
+        statusbar::render(frame, l.statusbar, state, theme);
+        state.modals.render(frame, area, theme);
+        return;
+    }
+
     // In single-window mode the sidebar can pick up the focus
     // border (when the embed isn't focused). Inset the content rect
     // by one cell on every side so the border's perimeter doesn't

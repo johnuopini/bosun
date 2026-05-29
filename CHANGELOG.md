@@ -4,19 +4,49 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.1] — 2026-05-28
+## [2.0.2] — 2026-05-28
+
+### Changed
+- **Single-window focused mode is now the only mode.** The `s`
+  toggle, the `Command::SaveSingleWindow` persistence, the
+  `BOSUN_SINGLE_WINDOW` env var, and the legacy full-screen
+  `tmux attach` path are all gone. `Enter` on a session always
+  opens it in the embedded focused PTY; `Ctrl+Q` always brings
+  you back to the sidebar. Result: consistent keybindings — tab
+  cycle, session cycle, modals — regardless of where you came
+  from, and no more "bosun is paused while you're attached" trap
+  where bosun couldn't intercept keys.
+- **Plain `→`/`←` cycle tabs** within the selected container in
+  sidebar mode (no-op on single-tab containers). `Enter` is now
+  the only attach key; the old "Right also attaches" muscle
+  memory collided with arrow-key navigation. `Shift+→/←` and
+  `] [` still cycle tabs too, for parity with focused mode.
+
+### Added
+- **Mobile / narrow-terminal focused mode.** Below
+  `PREVIEW_MIN_WIDTH` (80 cols), `Enter` on a session hands the
+  entire body to the embed — sidebar hidden, embed full width —
+  so bosun's key handlers stay alive on a phone via mosh.
+  `Ctrl+Q` detaches back to the sidebar. Previously narrow
+  mode silently disabled focused mode, dropping users into a
+  full-screen `tmux attach` where bosun couldn't intercept tab
+  chords.
+- **Tab list under multi-tab containers in narrow mode.**
+  Without the preview pane visible, the tab strip wasn't
+  reachable. The sidebar now renders a third line per container
+  listing each tab, with the active tab styled like the `bosun`
+  chip, so tab membership and the active tab are visible at a
+  glance on mobile.
 
 ### Fixed
-- **Narrow-terminal embed handling.** The embedded terminal and
-  preview pane are now gated on the same width threshold as the
-  preview split (`PREVIEW_MIN_WIDTH`, raised 72 → 80 cols). On a
-  terminal too narrow to render the preview, single-window mode
-  refuses to turn ON (with a warning showing the required width),
-  and an already-focused embed drops out of focus automatically so
-  keystrokes stop routing into an invisible PTY. The
-  `single_window_mode` preference is preserved across the resize, so
-  focus re-enters normally once the terminal grows back. Both checks
-  are resize-driven and react live without a restart.
+- **Sidebar `Shift+arrow` matching with extra modifier bits.**
+  Some mobile SSH clients ship Shift+arrow with extra flags
+  (`SHIFT|KEYPAD`, `SHIFT|ALT`, etc.). The sidebar handler used
+  exact `KeyModifiers::SHIFT` matching and silently dropped
+  those, even though the focused handler caught them via
+  `modifiers.contains(SHIFT)`. Sidebar now normalises arrow
+  events to just SHIFT/CONTROL before matching, bringing the
+  two paths in line.
 
 ## [2.0.0] — 2026-05-28
 

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::AppState;
-use crate::sidebar::{Section, VisibleEntry};
+use crate::sidebar::{Container, Section, VisibleEntry};
 use crate::tmux::detector::Status;
 use crate::tmux::session::SessionView;
 use crate::ui::Theme;
@@ -39,6 +39,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     // section headers can show their numeric jump key.
     let mut section_idx: usize = 0;
     let mut out: Vec<Line<'_>> = Vec::with_capacity(visible.len() * 2);
+    // In narrow mode the preview pane (and its tab strip) is hidden,
+    // so multi-tab container membership is otherwise invisible. Emit
+    // an extra "tabs:" line per container in that case.
+    let narrow = state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH;
     // For each entry, record the first/last line index it produced.
     // Used after the build to compute a scroll offset that keeps the
     // selected entry fully visible — without this, on small screens
@@ -59,6 +63,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                             v, selected, false, tabs, bg_busy, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, false, area.width, theme));
+                        if narrow && tabs > 1 {
+                            out.push(render_tabs_line(
+                                c, state, selected, false, area.width, theme,
+                            ));
+                        }
                     }
                     None => {
                         let label = state.dead_display_for(&c.active);
@@ -88,6 +97,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                             v, selected, true, tabs, bg_busy, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, true, area.width, theme));
+                        if narrow && tabs > 1 {
+                            out.push(render_tabs_line(
+                                container, state, selected, true, area.width, theme,
+                            ));
+                        }
                     }
                     None => {
                         let label = state.dead_display_for(&container.active);
@@ -423,6 +437,71 @@ fn render_meta_line(
         Span::styled(body, meta_style),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
     ])
+}
+
+/// Narrow-mode tab listing under a multi-tab container row. The
+/// preview pane (and its tab strip) is hidden when the terminal is
+/// below `PREVIEW_MIN_WIDTH`, so without this line a user on mobile
+/// can't tell what tabs a container actually holds. Active tab gets
+/// the accent background so it stands out at a glance.
+fn render_tabs_line(
+    container: &Container,
+    state: &AppState,
+    selected: bool,
+    indented: bool,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let bg = row_bg(selected, theme);
+    let muted = Style::default().fg(theme.text_muted).bg(bg);
+    let active_style = Style::default().fg(theme.text).bg(theme.accent);
+
+    let base_indent: &str = "       ";
+    let extra = if indented { "  " } else { "" };
+    let lead = base_indent.chars().count() + extra.chars().count();
+    let max_body = (width as usize).saturating_sub(lead).saturating_sub(1);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(container.members.len() * 2 + 2);
+    spans.push(Span::styled(base_indent, Style::default().bg(bg)));
+    spans.push(Span::styled(extra, Style::default().bg(bg)));
+
+    let mut used = 0usize;
+    let names: Vec<(String, bool)> = container
+        .members
+        .iter()
+        .map(|m| {
+            let name = state
+                .session_by_name(m)
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| m.clone());
+            (name, m == &container.active)
+        })
+        .collect();
+
+    for (i, (name, active)) in names.iter().enumerate() {
+        if i > 0 {
+            let sep = " · ";
+            if used + sep.chars().count() >= max_body {
+                break;
+            }
+            spans.push(Span::styled(sep.to_string(), muted));
+            used += sep.chars().count();
+        }
+        let remaining = max_body.saturating_sub(used);
+        let label = truncate_to(name, remaining);
+        let label_len = label.chars().count();
+        if *active {
+            spans.push(Span::styled(format!(" {label} "), active_style));
+            used += label_len + 2;
+        } else {
+            spans.push(Span::styled(label, muted));
+            used += label_len;
+        }
+    }
+
+    let pad = (width as usize).saturating_sub(lead + used);
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    Line::from(spans)
 }
 
 fn render_missing_line(
