@@ -148,6 +148,13 @@ pub struct AppState {
     /// that branch on it keep compiling; remove once those callers
     /// have been simplified.
     pub single_window_mode: bool,
+    /// Sticky "hide the sidebar while focused" preference, seeded from
+    /// `config.sidebar_hidden` and flipped live by `Ctrl+B`. Only
+    /// collapses the sidebar while the embed is focused (see
+    /// `App::sidebar_collapsed`); when not focused the sidebar always
+    /// renders so the session list stays reachable. Persisted on each
+    /// toggle so the choice survives restarts.
+    pub sidebar_hidden: bool,
     /// Internal names of sessions the user just killed via `d`.
     /// Suppresses the "re-add via reconcile" race where a 1Hz
     /// `do_refresh` already inflight at confirm time emits a
@@ -833,7 +840,8 @@ impl AppState {
             }
             AppMsg::Shutdown => self.quit = true,
             AppMsg::Resume => { /* redraw happens unconditionally below */ }
-            AppMsg::FocusGained => { /* handled at the App level — see App::run */ }
+            AppMsg::FocusGained | AppMsg::FocusLost => { /* handled at the App level — see App::run */
+            }
             AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
                 // Phase 1: attach is done inline; these arms are for future use.
             }
@@ -1518,7 +1526,12 @@ impl AppState {
             return;
         }
         let area = Rect::new(0, 0, self.term_size.0, self.term_size.1);
-        let layouts = layout::compute(area, self.divider_x);
+        // `handle_mouse` only runs for events that fall through the
+        // focused-embed forwarding in `App::run` — i.e. clicks on the
+        // sidebar/divider/statusbar while *not* driving the embed. The
+        // collapsed-sidebar layout only applies while focused, so a
+        // non-collapsed split is always the right basis here.
+        let layouts = layout::compute(area, self.divider_x, false);
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Left)
@@ -1663,6 +1676,24 @@ pub struct App {
     /// whether to pop/re-push the flags around a full-screen
     /// `tmux attach` (which owns the tty for its duration).
     pub kbd_enhanced: bool,
+    /// Default fg/bg/cursor colors probed from the outer terminal at
+    /// startup (issue #2). Passed to each embed so it can answer the
+    /// OSC 10/11/12 queries inner apps (Codex, Neovim) use to detect a
+    /// light vs dark background. Any slot the terminal didn't report
+    /// falls back to the active theme's colors at spawn time.
+    pub term_colors: crate::terminal_query::TermColors,
+    /// Whether the outer terminal currently has focus, tracked from
+    /// the `FocusGained`/`FocusLost` events. Initialized `true`
+    /// (bosun launches focused). This guards `recover_display`: a
+    /// full recovery only runs on a genuine lost→gained transition.
+    /// Without the guard, Ghostty (and other terminals that report
+    /// the current focus state when focus reporting is *enabled*)
+    /// loop forever — `recover_display` re-issues `EnableFocusChange`
+    /// (`ESC[?1004h`), the terminal answers with another
+    /// `FocusGained`, which re-enters recovery, and so on. The result
+    /// is fast full-screen flicker. iTerm2 doesn't echo focus on
+    /// enable, so it never tripped this.
+    has_focus: bool,
     /// Tmux client. The tmux actor owns the primary copy and runs
     /// all timed / notification-driven tmux work; we keep this
     /// secondary handle so the app task itself can do synchronous
@@ -1721,6 +1752,7 @@ impl App {
             editor: config.editor.clone(),
             recents,
             single_window_mode: config.single_window_mode,
+            sidebar_hidden: config.sidebar_hidden,
             ..Default::default()
         };
 
@@ -1738,6 +1770,8 @@ impl App {
             embed_focused: false,
             restore_focus_after_modal: false,
             kbd_enhanced: false,
+            term_colors: crate::terminal_query::TermColors::default(),
+            has_focus: true,
             client,
         }
     }
@@ -1779,12 +1813,33 @@ impl App {
                 None => break,
             };
 
+            // Terminal lost focus — just record it. The next genuine
+            // focus gain is what triggers recovery.
+            if matches!(msg, AppMsg::FocusLost) {
+                self.has_focus = false;
+                continue;
+            }
+
             // Terminal regained focus — most commonly after iTerm's
             // Cmd+R "reset" wiped the screen and dropped alt screen +
             // our terminal modes. Re-establish everything and force a
             // full repaint so the user isn't left staring at a blank
             // or half-painted pane.
+            //
+            // Guard on a real lost→gained transition. Terminals like
+            // Ghostty report the current focus state whenever focus
+            // reporting is *enabled*, and `recover_display` re-enables
+            // it (`ESC[?1004h`) — so an unguarded recovery loops
+            // forever (recover → terminal echoes FocusGained →
+            // recover → …), which shows up as fast full-screen
+            // flicker. If we already believe we're focused, this is
+            // that echo: swallow it. Set the flag *before* recovering
+            // so the echo it provokes is recognized as a no-op.
             if matches!(msg, AppMsg::FocusGained) {
+                if self.has_focus {
+                    continue;
+                }
+                self.has_focus = true;
                 self.recover_display(terminal);
                 terminal
                     .draw(|f| {
@@ -1861,6 +1916,13 @@ impl App {
                     }
                     let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
                         && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Ctrl+B toggles the sticky hide-sidebar preference.
+                    // Only reachable while focused, so it always means
+                    // "(un)hide the sidebar around the session I'm
+                    // driving". Intercepted before the embed write so
+                    // the inner app never sees it.
+                    let is_ctrl_b = matches!(k.code, KeyCode::Char('b'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
                     // Ctrl+L recovers bosun's display *and* still gets
                     // forwarded to the inner shell below (it falls
                     // through to the encode/write arm), so the shell's
@@ -1903,6 +1965,43 @@ impl App {
                         && k.modifiers.contains(KeyModifiers::SHIFT);
                     if is_ctrl_q {
                         self.exit_focus().await;
+                    } else if is_ctrl_b {
+                        // Flip + persist the preference, then respawn
+                        // the embed at its new dimensions (the body
+                        // width jumps by the whole sidebar column) and
+                        // force a clean repaint so no stale sidebar
+                        // cells linger where the embed now lives.
+                        self.state.sidebar_hidden = !self.state.sidebar_hidden;
+                        if let Err(e) =
+                            crate::config::write_sidebar_hidden(self.state.sidebar_hidden)
+                        {
+                            self.state.warning = Some(format!("sidebar: save failed: {e}"));
+                        }
+                        if let Some(name) = self.state.selected_session_name() {
+                            if let Err(e) = self
+                                .respawn_embed(
+                                    &name,
+                                    crate::ui::embed_terminal::AttachMode::Focused,
+                                )
+                                .await
+                            {
+                                tracing::warn!("sidebar toggle respawn: {}", e);
+                                self.state.warning = Some(format!("sidebar: {e}"));
+                            }
+                        }
+                        let _ = terminal.clear();
+                        terminal
+                            .draw(|f| {
+                                ui::draw(
+                                    f,
+                                    &self.state,
+                                    &self.theme,
+                                    self.embed.as_ref(),
+                                    self.embed_focused,
+                                )
+                            })
+                            .map_err(term_err)?;
+                        continue;
                     } else if is_shift_left || is_shift_right {
                         // Tab cycle within the current container.
                         let prev = self.state.selected_session_name();
@@ -2725,6 +2824,7 @@ impl App {
                     cols,
                     mode,
                     snapshot.as_deref(),
+                    self.embed_default_colors(),
                     self.evt_tx.clone(),
                 ) {
                     Ok(e) => self.embed = Some(e),
@@ -2814,6 +2914,33 @@ impl App {
         self.state.warning = None;
     }
 
+    /// Effective default fg/bg/cursor for the embed's OSC 10/11/12
+    /// responses: the colors probed from the outer terminal at startup
+    /// where available, else the active theme's (text for fg, bg for
+    /// bg, fg for cursor). 16-bit per channel. See issue #2.
+    fn embed_default_colors(&self) -> crate::terminal_query::DefaultColors {
+        use crate::terminal_query::Rgb16;
+        fn dup8(c: u8) -> u16 {
+            ((c as u16) << 8) | c as u16
+        }
+        fn theme_rgb(c: ratatui::style::Color) -> Rgb16 {
+            match c {
+                ratatui::style::Color::Rgb(r, g, b) => (dup8(r), dup8(g), dup8(b)),
+                _ => (0, 0, 0),
+            }
+        }
+        let fg = self
+            .term_colors
+            .fg
+            .unwrap_or_else(|| theme_rgb(self.theme.text));
+        let bg = self
+            .term_colors
+            .bg
+            .unwrap_or_else(|| theme_rgb(self.theme.bg));
+        let cursor = self.term_colors.cursor.unwrap_or(fg);
+        crate::terminal_query::DefaultColors { fg, bg, cursor }
+    }
+
     /// Internal: drop the current embed and spawn a fresh one for
     /// `session` in the given mode, priming with a synchronous
     /// capture-pane snapshot so the transition is a single repaint
@@ -2840,6 +2967,7 @@ impl App {
             cols,
             mode,
             snapshot.as_deref(),
+            self.embed_default_colors(),
             self.evt_tx.clone(),
         )?;
         self.embed = Some(embed);
@@ -2870,15 +2998,36 @@ impl App {
         self.state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH
     }
 
+    /// True when the sidebar is collapsed and the focused embed owns
+    /// the entire body: single-window + focused + the sticky
+    /// `sidebar_hidden` preference set. In this state the layout is
+    /// full-body (no sidebar, no divider) and no focus border is
+    /// drawn, so the border-reservation math in `preview_dims` /
+    /// `embed_rect` / `ui::preview::render` must all skip the inset.
+    /// Detaching clears `embed_focused`, which brings the sidebar
+    /// back regardless of the preference.
+    fn sidebar_collapsed(&self) -> bool {
+        self.state.single_window_mode && self.embed_focused && self.state.sidebar_hidden
+    }
+
+    /// Whether the embed reserves focus-border cells: wide single-
+    /// window layout that isn't collapsed to full body. The narrow
+    /// path draws no border (the embed fills edge-to-edge) and the
+    /// collapsed path hides the sidebar entirely, also borderless.
+    fn embed_has_border(&self) -> bool {
+        self.state.single_window_mode && !self.is_narrow() && !self.sidebar_collapsed()
+    }
+
     fn preview_dims(&self) -> (u16, u16) {
         match self.preview_rect() {
             Some(p) => {
                 let tabs = self.tab_strip_height();
-                // Reserve the focus-border cells only in the wide
-                // layout; narrow/mobile draws no border, so the PTY
-                // gets the full width (and full height minus the tab
-                // strip). Mirrors `preview::render` / `embed_rect`.
-                if self.state.single_window_mode && !self.is_narrow() {
+                // Reserve the focus-border cells only when the embed
+                // actually draws one; narrow/mobile and the collapsed
+                // full-body layout draw none, so the PTY gets the full
+                // width (and full height minus the tab strip). Mirrors
+                // `preview::render` / `embed_rect`.
+                if self.embed_has_border() {
                     (
                         p.height.saturating_sub(2).saturating_sub(tabs),
                         p.width.saturating_sub(2),
@@ -2925,7 +3074,8 @@ impl App {
             width: self.state.term_size.0,
             height: self.state.term_size.1,
         };
-        let layout = crate::ui::layout::compute(area, self.state.divider_x);
+        let layout =
+            crate::ui::layout::compute(area, self.state.divider_x, self.sidebar_collapsed());
         if let Some(p) = layout.preview {
             return Some(p);
         }
@@ -2949,10 +3099,11 @@ impl App {
         let p = self.preview_rect()?;
         let tabs = self.tab_strip_height();
         let after_tabs = Rect::new(p.x, p.y + tabs, p.width, p.height.saturating_sub(tabs));
-        // Inset for the focus border only in the wide layout; the
-        // narrow/mobile body draws no border, so the embed fills the
-        // full width. Mirrors `preview_dims` / `preview::render`.
-        if self.state.single_window_mode && !self.is_narrow() {
+        // Inset for the focus border only when one is drawn; the
+        // narrow/mobile body and the collapsed full-body layout draw
+        // none, so the embed fills the full width. Mirrors
+        // `preview_dims` / `preview::render`.
+        if self.embed_has_border() {
             if after_tabs.width < 2 || after_tabs.height < 2 {
                 return Some(Rect::new(after_tabs.x, after_tabs.y, 0, 0));
             }

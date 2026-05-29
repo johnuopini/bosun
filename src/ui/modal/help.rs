@@ -274,6 +274,10 @@ fn build_rows() -> Vec<Row> {
             "Ctrl+L",
             "Redraw screen — recover from a terminal reset (e.g. Cmd+R)",
         ),
+        Binding(
+            "Ctrl+B",
+            "Hide / show the sidebar (while focused on a session; remembered)",
+        ),
         Blank,
         Section("Tabs"),
         Binding("Ctrl+T", "Add a tab to the selected container"),
@@ -316,6 +320,10 @@ fn build_rows() -> Vec<Row> {
         ),
         Binding("Option+← / Option+→", "Move cursor by word"),
         Binding("Option+Delete", "Delete previous word"),
+        Binding(
+            "Ctrl+B",
+            "Hide / show the sidebar (remembered across sessions)",
+        ),
         Binding("Ctrl+L", "Redraw — recover from a terminal reset (Cmd+R)"),
         Blank,
         Section("New-session modal"),

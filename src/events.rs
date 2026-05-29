@@ -261,4 +261,9 @@ pub enum AppMsg {
     /// iTerm's Cmd+R "reset" that clears the screen and exits alt
     /// screen out from under us without notifying ratatui.
     FocusGained,
+    /// Terminal lost focus. We only track it so the *next*
+    /// `FocusGained` is recognized as a genuine refocus (and not the
+    /// echo a terminal emits when focus reporting is re-enabled), so
+    /// recovery runs once instead of looping. See `App::has_focus`.
+    FocusLost,
 }

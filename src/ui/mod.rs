@@ -27,18 +27,42 @@ pub fn draw(
     embed: Option<&EmbedTerminal>,
     embed_focused: bool,
 ) {
-    let area = frame.area();
-    let l = layout::compute(area, state.divider_x);
+    draw_inner(frame, state, theme, embed, embed_focused);
 
-    // Narrow-terminal focused mode (mobile / mosh in single-window):
-    // there's no room for a split, so hand the entire body to the
-    // embed and skip the sidebar. The user can still detach with
-    // Ctrl-Q and the sidebar comes back. Without this, focused mode
-    // on a phone would leave the embed unrendered while the sidebar
-    // hogged the screen.
+    // 256-color fallback. Everything above paints in 24-bit `Rgb`
+    // (theme chrome + whatever the embedded pane emitted). On a
+    // terminal without truecolor (Apple Terminal.app) those sequences
+    // render as garbage, so we rewrite the finished frame to the
+    // nearest xterm-256 palette in one pass. No-op — and never
+    // called — on truecolor terminals.
+    if !theme::terminal_truecolor() {
+        theme::degrade_buffer_to_256(frame.buffer_mut());
+    }
+}
+
+fn draw_inner(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    theme: &Theme,
+    embed: Option<&EmbedTerminal>,
+    embed_focused: bool,
+) {
+    let area = frame.area();
+    // Collapse the sidebar when the user has hidden it (Ctrl+B) while
+    // focused on the embed — the embed then owns the whole body, same
+    // layout as the narrow-terminal path.
+    let collapsed = state.single_window_mode && embed_focused && state.sidebar_hidden;
+    let l = layout::compute(area, state.divider_x, collapsed);
+
+    // Full-body focused mode: either a narrow terminal (mobile / mosh)
+    // with no room for a split, or the user collapsed the sidebar with
+    // Ctrl+B. Hand the entire body to the embed and skip the sidebar.
+    // The user detaches with Ctrl-Q (or shows the sidebar again with
+    // Ctrl+B), and the sidebar comes back. No focus border is drawn in
+    // this layout, so the embed gets full width.
     if state.single_window_mode && embed_focused && l.preview.is_none() {
         let body = Rect::new(l.list.x, l.list.y, l.list.width, l.list.height);
-        preview::render(frame, body, state, theme, embed);
+        preview::render(frame, body, state, theme, embed, false);
         statusbar::render(frame, l.statusbar, state, theme);
         state.modals.render(frame, area, theme);
         return;
@@ -57,7 +81,7 @@ pub fn draw(
     session_list::render(frame, list_content, state, theme);
     // Preview is hidden on narrow terminals (mobile / mosh).
     if let Some(preview_area) = l.preview {
-        preview::render(frame, preview_area, state, theme, embed);
+        preview::render(frame, preview_area, state, theme, embed, true);
     }
     // Divider glyph sits between list and preview in wide mode.
     // Accent color while the user is dragging, muted otherwise so

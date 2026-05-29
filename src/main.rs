@@ -118,8 +118,23 @@ async fn main() -> Result<()> {
     }));
 
     let (mut terminal, kbd_enhanced) = setup_terminal()?;
+
+    // Probe the outer terminal for its default fg/bg/cursor colors so
+    // the embedded session PTY can answer the OSC 10/11/12 queries that
+    // apps like Codex / Neovim use to pick a light vs dark palette
+    // (issue #2). Must run here — after raw mode is on but *before*
+    // `App::new` spawns the input actor that owns stdin. Only worth the
+    // ~120ms window when the embed is actually in play; if the terminal
+    // doesn't answer, the embed falls back to the active theme colors.
+    let term_colors = if config.embed_enabled {
+        bosun::terminal_query::probe(std::time::Duration::from_millis(120))
+    } else {
+        bosun::terminal_query::TermColors::default()
+    };
+
     let mut app = App::new(client, socket, config, store);
     app.kbd_enhanced = kbd_enhanced;
+    app.term_colors = term_colors;
     let run_result = app.run(&mut terminal).await;
     restore_terminal(&mut terminal, kbd_enhanced)?;
     run_result

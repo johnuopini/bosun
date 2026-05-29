@@ -47,8 +47,8 @@ pub struct Layout {
 
 impl Layout {
     /// Resolve a click on `(col, row)` to the slot under the
-    /// pointer, if any. Plus button takes precedence (it's
-    /// rightmost and the layout never makes a tab overlap it).
+    /// pointer, if any. Plus button takes precedence (the layout
+    /// never makes a tab overlap it).
     pub fn hit(&self, col: u16, row: u16) -> Option<&Slot> {
         if let Some(p) = &self.plus {
             if contains(p.rect, col, row) {
@@ -68,8 +68,9 @@ fn contains(r: Rect, col: u16, row: u16) -> bool {
 
 /// Compute the on-screen rectangles for each tab pill and the
 /// add-tab `+` button. Tabs are laid out left-to-right starting at
-/// `area.x`; the `+` button always reserves its 3 columns at the
-/// right edge so overflow can't push it off-screen.
+/// `area.x`; the `+` button sits immediately right of the last
+/// visible tab. Its 3 columns are still reserved out of the available
+/// width so overflow can't push it off-screen.
 ///
 /// When more tabs exist than fit, the window slides so the active
 /// tab (`active_idx`) stays visible — dropped tabs come from the
@@ -89,7 +90,10 @@ pub fn compute(area: Rect, tab_labels: &[&str], active_idx: Option<usize>) -> La
     if area.width <= plus_w {
         return out;
     }
-    let plus_rect = Rect::new(area.right().saturating_sub(plus_w), area.y, plus_w, 1);
+    // Reserve the `+` button's columns so overflow can't push it off
+    // the right edge, but lay tabs first and place the button
+    // immediately after the last visible one (below) rather than
+    // pinning it to the far right.
     let available = area.width.saturating_sub(plus_w);
 
     let widths: Vec<u16> = tab_labels
@@ -137,9 +141,12 @@ pub fn compute(area: Rect, tab_labels: &[&str], active_idx: Option<usize>) -> La
     }
     out.first_visible = first;
     out.last_visible = last_excl;
+    // `+` button sits right after the last visible tab. The reserved
+    // `plus_w` columns guarantee `x + plus_w <= area.right()`, so it
+    // always fits on-screen.
     out.plus = Some(Slot {
         key: "+".to_string(),
-        rect: plus_rect,
+        rect: Rect::new(x, area.y, plus_w, 1),
     });
     out
 }
@@ -149,9 +156,11 @@ fn plus_slot(area: Rect) -> Option<Slot> {
     if area.width < plus_w || area.height == 0 {
         return None;
     }
+    // No tabs yet → the button leads the strip at the left edge
+    // (there's no "last tab" to sit after).
     Some(Slot {
         key: "+".to_string(),
-        rect: Rect::new(area.right().saturating_sub(plus_w), area.y, plus_w, 1),
+        rect: Rect::new(area.x, area.y, plus_w, 1),
     })
 }
 
@@ -233,10 +242,11 @@ pub fn render(
         }
     }
 
-    // Draw the `+` button at the right edge in accent color so
-    // it reads as a control, not a label.
+    // Draw the `+` button right after the last tab, accent glyph on a
+    // slightly raised `panel_alt` fill so it reads as a little tab-
+    // shaped control instead of blending into the strip background.
     if let Some(plus) = &layout.plus {
-        let style = Style::default().bg(theme.panel).fg(theme.accent);
+        let style = Style::default().bg(theme.panel_alt).fg(theme.accent);
         let mut col = plus.rect.x;
         for ch in PLUS_LABEL.chars() {
             if col >= plus.rect.x.saturating_add(plus.rect.width) {
@@ -256,15 +266,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compute_lays_tabs_left_to_right_with_plus_at_right() {
+    fn compute_lays_tabs_left_to_right_with_plus_after_last_tab() {
         let area = Rect::new(0, 5, 40, 1);
         let layout = compute(area, &["one", "two"], Some(0));
         assert_eq!(layout.tabs.len(), 2);
         // " ● one " = 1+1+1+3+1 = 7 cols; same for "two".
         assert_eq!(layout.tabs[0].rect, Rect::new(0, 5, 7, 1));
         assert_eq!(layout.tabs[1].rect, Rect::new(7, 5, 7, 1));
-        // " + " always at the right edge (3 cols).
-        assert_eq!(layout.plus.as_ref().unwrap().rect, Rect::new(37, 5, 3, 1));
+        // " + " (3 cols) sits immediately right of the last tab.
+        assert_eq!(layout.plus.as_ref().unwrap().rect, Rect::new(14, 5, 3, 1));
         assert_eq!(layout.first_visible, 0);
         assert_eq!(layout.last_visible, 2);
     }
@@ -298,10 +308,10 @@ mod tests {
         // Click inside the first tab.
         let hit = layout.hit(3, 0).unwrap();
         assert_eq!(hit.rect, Rect::new(0, 0, 7, 1));
-        // Click on +.
-        let hit = layout.hit(38, 0).unwrap();
+        // Click on + (now right after the two tabs: cols 14..17).
+        let hit = layout.hit(15, 0).unwrap();
         assert_eq!(hit.key, "+");
-        // Click in dead space.
+        // Click in dead space to the right of the + button.
         assert!(layout.hit(20, 0).is_none());
     }
 }

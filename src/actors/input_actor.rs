@@ -128,7 +128,13 @@ pub fn spawn(tx: mpsc::UnboundedSender<AppMsg>) -> Handle {
                         }
                     }
                     Ok(Event::FocusLost) => {
-                        // Not interested — drop the event and keep polling.
+                        // Track focus loss so the next `FocusGained`
+                        // is treated as a genuine refocus (recovery
+                        // runs once) rather than the echo a terminal
+                        // emits when focus reporting is re-enabled.
+                        if tx.send(AppMsg::FocusLost).is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(AppMsg::Fatal(format!("input read: {e}")));

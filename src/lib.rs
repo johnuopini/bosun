@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod sidebar;
 pub mod store;
+pub mod terminal_query;
 pub mod tmux;
 pub mod ui;
 pub mod util;

@@ -125,6 +125,14 @@ pub struct EmbedTerminal {
     /// spawning a new one in the opposite mode (the PTY's attach
     /// args differ between modes and aren't runtime-switchable).
     mode: AttachMode,
+    /// Default fg/bg/cursor colors to answer inner OSC 10/11/12 color
+    /// queries with — the outer terminal's, so Codex/Neovim et al.
+    /// detect the real light/dark background through bosun's tmux
+    /// layer instead of timing out and assuming dark (issue #2).
+    default_colors: crate::terminal_query::DefaultColors,
+    /// Incremental scanner that spots those queries in the inner byte
+    /// stream, carrying an incomplete trailing sequence between reads.
+    color_query_scanner: crate::terminal_query::QueryScanner,
 }
 
 impl EmbedTerminal {
@@ -141,6 +149,9 @@ impl EmbedTerminal {
     /// grid being filled in by tmux's initial `attach -r` repaint.
     /// Passing `None` is harmless — the parser just starts blank
     /// and tmux's relay paints it over the next few hundred ms.
+    // Spawn genuinely needs all of these; grouping them into a config
+    // struct would just move the noise to the call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         socket: Option<&str>,
         session: &str,
@@ -148,6 +159,7 @@ impl EmbedTerminal {
         cols: u16,
         mode: AttachMode,
         initial_snapshot: Option<&[u8]>,
+        default_colors: crate::terminal_query::DefaultColors,
         evt_tx: mpsc::UnboundedSender<AppMsg>,
     ) -> std::io::Result<Self> {
         let rows = rows.max(MIN_ROWS);
@@ -270,20 +282,21 @@ impl EmbedTerminal {
             rows,
             cols,
             mode,
+            default_colors,
+            color_query_scanner: crate::terminal_query::QueryScanner::default(),
         })
     }
 
     /// Write key bytes into the PTY master. Only meaningful in
     /// `AttachMode::Focused` — `Preview` mode runs tmux's `-r`
-    /// (read-only) attach, which silently drops every byte we send.
+    /// (read-only) attach, which silently drops key input. (Terminal
+    /// *responses* like OSC color replies are read by tmux itself even
+    /// on a read-only client, which is why `feed` uses `write_raw`
+    /// directly rather than going through this.)
     /// Returns the underlying io error on write failure (rare; the
     /// most likely cause is the child having exited).
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(w) = self.writer.as_mut() {
-            w.write_all(bytes)?;
-            w.flush()?;
-        }
-        Ok(())
+        self.write_raw(bytes)
     }
 
     pub fn mode(&self) -> AttachMode {
@@ -320,8 +333,33 @@ impl EmbedTerminal {
 
     /// Feed a chunk of PTY bytes into the vt100 parser. Cheap —
     /// vt100 is a single-pass state machine.
+    ///
+    /// Also scans the chunk for inner-app OSC 10/11/12 color *queries*
+    /// (which tmux relays down to us as its client terminal) and
+    /// answers each with the outer terminal's real fg/bg/cursor. vt100
+    /// ignores the queries, so the inner app would otherwise time out
+    /// and assume a dark background (issue #2). The query bytes still
+    /// flow into the parser too — harmless, vt100 drops them.
     pub fn feed(&mut self, bytes: &[u8]) {
+        for (kind, term) in self.color_query_scanner.scan(bytes) {
+            let reply = self.default_colors.response(kind, term);
+            if let Err(e) = self.write_raw(&reply) {
+                tracing::warn!("embed color-query reply failed: {}", e);
+            }
+        }
         self.parser.process(bytes);
+    }
+
+    /// Write bytes straight to the PTY master regardless of attach
+    /// mode. `write` is gated on `Focused`, but OSC color replies must
+    /// go back even in `Preview` mode — tmux relays the query to us as
+    /// its client and expects the answer on the same channel.
+    fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.write_all(bytes)?;
+            w.flush()?;
+        }
+        Ok(())
     }
 
     /// Resize both the parser grid and the PTY's window size. Cheap

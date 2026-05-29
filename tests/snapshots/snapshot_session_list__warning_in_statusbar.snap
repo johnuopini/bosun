@@ -2,7 +2,7 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
- ▌ ○  alpha  1w               │ ○ alpha                                       + 
+ ▌ ○  alpha  1w               │ ○ alpha  +                                      
        claude · /tmp/work     │                                                 
                               │  preview: capturing…                            
                               │                                                 

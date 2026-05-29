@@ -4,6 +4,49 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.5] — 2026-05-29
+
+### Added
+- **Hide / show the sidebar with `Ctrl+B`.** While focused on a
+  session, `Ctrl+B` collapses the sidebar so the embedded pane takes
+  the full width, and brings it back. The preference is sticky
+  (persisted to `config.toml` as `sidebar_hidden`) and only applies
+  while focused — detaching with `Ctrl+Q` always restores the sidebar
+  so the session list stays reachable, and re-focusing re-applies your
+  choice. Documented in the help cheat-sheet.
+- **Terminal background detection for embedded agents.** Apps like
+  Codex and Neovim probe the terminal's default background (OSC 10/11)
+  at startup to pick a light vs dark palette. Inside bosun those
+  queries dead-ended at the embed's parser, so Codex assumed a dark
+  background and rendered diffs with dark colors on a light terminal.
+  bosun now probes the real outer terminal for its fg/bg/cursor at
+  startup and answers those queries on the embedded session's PTY
+  (falling back to the active theme's colors if the terminal doesn't
+  report). Fixes [#2](https://github.com/yetidevworks/bosun/issues/2).
+
+### Changed
+- **The add-tab `+` button now sits beside the last tab.** It used to
+  float at the far right edge of the tab strip; it now follows the
+  last tab directly and renders on a slightly raised background so it
+  reads as a small button instead of getting lost.
+
+### Fixed
+- **Fast flicker in Ghostty and other focus-reporting terminals.** The
+  2.0.3 `Cmd+R` recovery re-enabled focus reporting on every focus
+  gain; terminals that echo their focus state when reporting is
+  enabled (Ghostty) looped — recover → echoed FocusGained → recover —
+  as a continuous full-screen flicker. Recovery now runs only on a
+  genuine lost→gained transition, so the echo is swallowed. iTerm's
+  `Cmd+R` repaint still works.
+- **Unreadable colors in terminals without 24-bit color.** bosun's
+  themes are all true-color, which Apple Terminal can't render, so its
+  UI came out garbled and often illegible. On a terminal that doesn't
+  advertise `COLORTERM=truecolor`, bosun now down-samples every color
+  to the nearest xterm-256 palette entry in a final pass over the
+  frame. Modern terminals (iTerm2, Ghostty, Warp, WezTerm, …) are
+  unaffected and keep full 24-bit color. `BOSUN_TRUECOLOR=1`/`0`
+  overrides the detection.
+
 ## [2.0.4] — 2026-05-28
 
 ### Changed

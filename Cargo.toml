@@ -1,6 +1,6 @@
 [package]
 name = "bosun-tmux"
-version = "2.0.4"
+version = "2.0.5"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Andy Miller <hello@skulkworks.dev>"]
@@ -47,6 +47,12 @@ serde_json = "1"
 portable-pty = "0.9"
 vt100 = "0.16"
 tui-term = "0.3"
+
+# Unix `poll`/`read` for the timed outer-terminal color probe at
+# startup (OSC 10/11/12). Already in the tree transitively; pinned
+# direct so the probe code can call it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 insta = "1.47"

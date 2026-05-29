@@ -152,6 +152,12 @@ pub struct Config {
     /// `BOSUN_SINGLE_WINDOW=1|true|yes|on` enables, anything else
     /// disables.
     pub single_window_mode: bool,
+    /// Sticky "hide the sidebar while focused on a session" preference
+    /// (2.0.5+). Toggled live with `Ctrl+B` while the embed is
+    /// focused; persisted to `config.toml` as `sidebar_hidden = true`.
+    /// Only takes effect while focused — detaching always brings the
+    /// sidebar back so the session list is reachable. Default false.
+    pub sidebar_hidden: bool,
 }
 
 impl Default for Config {
@@ -173,6 +179,7 @@ impl Default for Config {
             // gate on it, but it is no longer user-toggleable or
             // persisted.
             single_window_mode: true,
+            sidebar_hidden: false,
         }
     }
 }
@@ -231,6 +238,10 @@ struct ConfigFile {
     /// Single-window mode persistence. See `Config::single_window_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     single_window: Option<bool>,
+    /// Sticky hide-sidebar-while-focused preference. See
+    /// `Config::sidebar_hidden`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidebar_hidden: Option<bool>,
 }
 
 impl Config {
@@ -329,6 +340,10 @@ impl Config {
         // wired as `true` for code paths that gate on it.
         let single_window_mode = true;
 
+        // Sticky preference only — no env override. It's flipped at
+        // runtime via Ctrl+B and read back on next launch.
+        let sidebar_hidden = file.sidebar_hidden.unwrap_or(false);
+
         Self {
             session_prefix,
             tmux_socket,
@@ -342,6 +357,7 @@ impl Config {
             preview_tick_ms,
             embed_enabled,
             single_window_mode,
+            sidebar_hidden,
         }
     }
 
@@ -450,6 +466,31 @@ pub fn write_theme(name: &str) -> std::io::Result<()> {
 
     // Atomic write: temp file + rename. Avoids a half-written
     // config.toml if bosun is killed mid-write.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Persist the sticky hide-sidebar-while-focused preference to
+/// `config.toml`. Same read-modify-write approach as `write_theme`.
+/// Called from the `Ctrl+B` toggle; failure is surfaced as a status
+/// bar warning but the live toggle still applies.
+pub fn write_sidebar_hidden(hidden: bool) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.sidebar_hidden = Some(hidden);
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
@@ -645,6 +686,7 @@ mod tests {
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
             single_window_mode: false,
+            sidebar_hidden: false,
         }
     }
 
@@ -686,6 +728,7 @@ mod tests {
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
             embed_enabled: DEFAULT_EMBED_ENABLED,
             single_window_mode: false,
+            sidebar_hidden: false,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

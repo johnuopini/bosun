@@ -31,6 +31,11 @@ pub fn render(
     state: &AppState,
     theme: &Theme,
     embed: Option<&EmbedTerminal>,
+    // Whether the embed reserves focus-border cells. False for the
+    // full-body layouts (narrow terminal, or sidebar collapsed via
+    // Ctrl+B) where no border is drawn and the embed fills edge to
+    // edge. Mirrors `App::embed_has_border`.
+    with_border: bool,
 ) {
     // Reset every cell in the preview area to Color::Reset before drawing
     // so any leftover styling from a previous frame (e.g. the placeholder
@@ -127,15 +132,15 @@ pub fn render(
     if let Some(embed) = embed {
         if let Some(name) = state.selected_session_name() {
             if embed.session() == name {
-                // Reserve the focus-border cells only in the wide
-                // (sidebar + preview) layout, where the border is
-                // actually drawn. On a narrow terminal the embed owns
-                // the whole body and no border is painted, so insetting
-                // would just leave dead padding on the sides — give it
-                // the full width instead. Keep in sync with
-                // `App::preview_dims` / `App::embed_rect`.
-                let narrow = state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH;
-                let render_area = if state.single_window_mode && !narrow {
+                // Reserve the focus-border cells only when the caller
+                // says a border is drawn (the wide sidebar + preview
+                // layout). On a narrow terminal or with the sidebar
+                // collapsed via Ctrl+B the embed owns the whole body
+                // and no border is painted, so insetting would just
+                // leave dead padding on the sides — give it the full
+                // width instead. Keep in sync with `App::preview_dims`
+                // / `App::embed_rect` / `App::embed_has_border`.
+                let render_area = if with_border && state.single_window_mode {
                     shrink_for_focus_border(area)
                 } else {
                     area
