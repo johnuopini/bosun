@@ -27,6 +27,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every focused-mode key event (code, modifiers, kind) to
   `/tmp/bosun-keys.log` — useful for diagnosing how a given
   terminal encodes a chord without a rebuild.
+- **`Ctrl+L` redraw and focus-gain recovery.** `Ctrl+L` forces a
+  full repaint — re-enters alt screen, re-arms mouse / paste /
+  focus reporting, re-pushes the keyboard flags, and clears
+  ratatui's cached frame — and still forwards `^L` to the inner
+  shell. bosun also listens for focus events now, so switching
+  back to the window after iTerm's `Cmd+R` "reset" repaints
+  automatically. The help cheat-sheet documents both, plus the
+  Option word-motion / word-delete keys.
 
 ## [2.0.2] — 2026-05-28
 

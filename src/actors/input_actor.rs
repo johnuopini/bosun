@@ -118,7 +118,16 @@ pub fn spawn(tx: mpsc::UnboundedSender<AppMsg>) -> Handle {
                             break;
                         }
                     }
-                    Ok(Event::FocusGained) | Ok(Event::FocusLost) => {
+                    Ok(Event::FocusGained) => {
+                        // iTerm's Cmd+R "reset" clears the screen and
+                        // exits alt screen without telling ratatui;
+                        // when the user re-focuses the pane we force a
+                        // full repaint to recover. See `App::run`.
+                        if tx.send(AppMsg::FocusGained).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::FocusLost) => {
                         // Not interested — drop the event and keep polling.
                     }
                     Err(e) => {

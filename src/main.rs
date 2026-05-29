@@ -2,8 +2,9 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -106,6 +107,7 @@ async fn main() -> Result<()> {
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -143,7 +145,12 @@ fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        // FocusGained/FocusLost events let us recover from things
+        // like iTerm's Cmd+R "reset" that clears the screen and
+        // exits alt screen out from under ratatui — the next focus
+        // gain triggers a full repaint. See `App::recover_display`.
+        EnableFocusChange,
     )
     .map_err(BosunError::Io)?;
 
@@ -182,6 +189,7 @@ fn restore_terminal(
     disable_raw_mode().map_err(BosunError::Io)?;
     execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,

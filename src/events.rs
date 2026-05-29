@@ -256,4 +256,9 @@ pub enum AppMsg {
     Shutdown,
     /// SIGCONT — we came back from Ctrl-Z suspend, re-enter raw mode.
     Resume,
+    /// Terminal regained focus (e.g. switching back to the iTerm
+    /// window). Triggers a full repaint to recover from things like
+    /// iTerm's Cmd+R "reset" that clears the screen and exits alt
+    /// screen out from under us without notifying ratatui.
+    FocusGained,
 }

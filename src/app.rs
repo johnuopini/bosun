@@ -68,6 +68,13 @@ pub struct AppState {
     /// and pushes the modal (with store-loaded recents etc) since
     /// `AppState` doesn't hold the store itself.
     pub pending_modal: Option<ModalRequest>,
+    /// Set when the user presses `Ctrl+L` (or another redraw
+    /// trigger). The app loop re-enters alt screen and calls
+    /// `terminal.clear()` before the next draw, invalidating
+    /// ratatui's cached previous frame and forcing a full repaint —
+    /// recovering from things like iTerm's `Cmd+R` that wipe the
+    /// screen out from under us. Reset to `false` after the redraw.
+    pub force_redraw: bool,
     /// Cached terminal size, updated on every `AppMsg::Resize` and
     /// on the initial sync in `App::run`. Used by mouse handling to
     /// map a column click back to the current divider position
@@ -826,6 +833,7 @@ impl AppState {
             }
             AppMsg::Shutdown => self.quit = true,
             AppMsg::Resume => { /* redraw happens unconditionally below */ }
+            AppMsg::FocusGained => { /* handled at the App level — see App::run */ }
             AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
                 // Phase 1: attach is done inline; these arms are for future use.
             }
@@ -881,6 +889,14 @@ impl AppState {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
+            }
+            // Ctrl+L = force a full repaint. Standard TUI convention
+            // (vim, less, htop). Recovers from things like iTerm's
+            // Cmd+R which clears the screen out from under ratatui's
+            // diff-based renderer. (Focused mode handles Ctrl+L in the
+            // App loop so the inner shell still gets its clear too.)
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                self.force_redraw = true;
             }
             // Ctrl+Shift+Down / Shift+J: reorder within bucket
             // (session) or move whole group (section header). Plain
@@ -1763,6 +1779,27 @@ impl App {
                 None => break,
             };
 
+            // Terminal regained focus — most commonly after iTerm's
+            // Cmd+R "reset" wiped the screen and dropped alt screen +
+            // our terminal modes. Re-establish everything and force a
+            // full repaint so the user isn't left staring at a blank
+            // or half-painted pane.
+            if matches!(msg, AppMsg::FocusGained) {
+                self.recover_display(terminal);
+                terminal
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
+                    .map_err(term_err)?;
+                continue;
+            }
+
             // Tab-strip click handling runs *before* the focus
             // branch so clicks on a tab or the `+` button are
             // recognized regardless of whether the embed is focused.
@@ -1824,6 +1861,17 @@ impl App {
                     }
                     let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
                         && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Ctrl+L recovers bosun's display *and* still gets
+                    // forwarded to the inner shell below (it falls
+                    // through to the encode/write arm), so the shell's
+                    // own clear-screen runs too. Without the intercept
+                    // Ctrl+L cleared only the shell while bosun's
+                    // chrome stayed in its post-Cmd+R broken state.
+                    if matches!(k.code, KeyCode::Char('l'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.state.force_redraw = true;
+                    }
                     // In-focus navigation chords:
                     //   * Shift+Left  / Shift+Right → cycle the
                     //     active *tab* within the current container,
@@ -1920,6 +1968,25 @@ impl App {
                                 }
                             }
                         }
+                    }
+                    // Ctrl+L (above) requested a recovery repaint —
+                    // do it now rather than waiting on the inner
+                    // shell's echo, so bosun's chrome snaps back
+                    // immediately even if the shell produces no output.
+                    if self.state.force_redraw {
+                        self.recover_display(terminal);
+                        self.state.force_redraw = false;
+                        terminal
+                            .draw(|f| {
+                                ui::draw(
+                                    f,
+                                    &self.state,
+                                    &self.theme,
+                                    self.embed.as_ref(),
+                                    self.embed_focused,
+                                )
+                            })
+                            .map_err(term_err)?;
                     }
                     // Don't draw here — the next EmbedBytes chunk
                     // from the agent's echo / response will trigger
@@ -2453,6 +2520,14 @@ impl App {
             // synchronous capture-pane snapshot.
             self.sync_embed().await;
 
+            // Force-redraw requested (Ctrl+L in sidebar mode). Recover
+            // every terminal mode and invalidate ratatui's cached
+            // frame before the draw below paints in full.
+            if self.state.force_redraw {
+                self.recover_display(terminal);
+                self.state.force_redraw = false;
+            }
+
             terminal
                 .draw(|f| {
                     ui::draw(
@@ -2482,6 +2557,41 @@ impl App {
         set_terminal_title("");
 
         Ok(())
+    }
+
+    /// Re-establish every terminal mode and force a full repaint.
+    /// Called on `Ctrl+L` and on `FocusGained`, both of which are our
+    /// recovery hooks for iTerm's `Cmd+R` "reset" — it exits alt
+    /// screen, drops mouse/paste/focus reporting, and wipes the
+    /// kitty keyboard flags out from under us without telling
+    /// ratatui. Re-running the enable sequences is harmless when the
+    /// modes are already on (they're idempotent); the keyboard flags
+    /// are pop-then-pushed so a normal focus-gain doesn't grow the
+    /// terminal's enhancement stack while a post-reset gain still
+    /// restores them. The final `clear()` invalidates ratatui's
+    /// cached frame so the next draw paints in full against the now
+    /// blank terminal.
+    fn recover_display<B: ratatui::backend::Backend + std::io::Write>(
+        &self,
+        terminal: &mut Terminal<B>,
+    ) {
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange,
+        );
+        if self.kbd_enhanced {
+            let _ = execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+            );
+        }
+        let _ = terminal.clear();
     }
 
     fn perform_attach<B: ratatui::backend::Backend + std::io::Write>(
