@@ -4,6 +4,25 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.4] — 2026-05-28
+
+### Changed
+- **Dropped the embedded pane's tmux `status-left`.** The `⚓ bosun`
+  chip and the session name are redundant once you're focused: the
+  session name already shows in bosun's tab strip and the brand in
+  its own TUI footer, so the pane's left status segment was just
+  noise fighting the agent UI. The right-side key hint
+  (detach / cycle / jump) stays.
+
+### Fixed
+- **Narrow / mobile embed now fills the full pane width.** Focused
+  mode reserved a one-cell focus-border inset on every side even on
+  narrow terminals — where no border is actually drawn — leaving
+  dead padding down the left and right (and top/bottom). The embed
+  now renders edge-to-edge in that layout, with the PTY size and
+  mouse hit-testing reclaiming the same cells so everything stays
+  aligned.
+
 ## [2.0.3] — 2026-05-28
 
 ### Added

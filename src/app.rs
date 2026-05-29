@@ -2861,11 +2861,24 @@ impl App {
     /// reflow by one column on attach/detach and paragraphs would
     /// visibly jump. The matching render-area shrink lives in
     /// `ui::preview::render`.
+    /// True when the terminal is too narrow for the sidebar + preview
+    /// split, so focused mode hands the entire body to the embed. In
+    /// that layout no focus border is drawn, so the embed fills the
+    /// width edge-to-edge instead of reserving border cells. Keep the
+    /// threshold in lockstep with `layout::compute` and `preview::render`.
+    fn is_narrow(&self) -> bool {
+        self.state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH
+    }
+
     fn preview_dims(&self) -> (u16, u16) {
         match self.preview_rect() {
             Some(p) => {
                 let tabs = self.tab_strip_height();
-                if self.state.single_window_mode {
+                // Reserve the focus-border cells only in the wide
+                // layout; narrow/mobile draws no border, so the PTY
+                // gets the full width (and full height minus the tab
+                // strip). Mirrors `preview::render` / `embed_rect`.
+                if self.state.single_window_mode && !self.is_narrow() {
                     (
                         p.height.saturating_sub(2).saturating_sub(tabs),
                         p.width.saturating_sub(2),
@@ -2936,7 +2949,10 @@ impl App {
         let p = self.preview_rect()?;
         let tabs = self.tab_strip_height();
         let after_tabs = Rect::new(p.x, p.y + tabs, p.width, p.height.saturating_sub(tabs));
-        if self.state.single_window_mode {
+        // Inset for the focus border only in the wide layout; the
+        // narrow/mobile body draws no border, so the embed fills the
+        // full width. Mirrors `preview_dims` / `preview::render`.
+        if self.state.single_window_mode && !self.is_narrow() {
             if after_tabs.width < 2 || after_tabs.height < 2 {
                 return Some(Rect::new(after_tabs.x, after_tabs.y, 0, 0));
             }
