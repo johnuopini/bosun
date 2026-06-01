@@ -3,12 +3,12 @@ source: tests/snapshot_session_list.rs
 expression: frame
 ---
                               │                                                 
-  no tmux sessions            │   ███▀▀█▄▄▄█▀▀█▄▄▄█▀▀▀  ██  ██▄▄█▄ ██           
-  (press n to create · g for a│   ███▀▀█▄███ ███ ▀▀▀▀█▄ ██  ██ ██▀▀██           
-                              │   ███▄▄█▀▀▀█▄▄█▀███▄▄█▀▀▀█▄▄█▀ ██  ██           
+  no tmux sessions            │   ██                                            
+  (press n to create · g for a│   ████████  ████████  ████████  ██    ██  ████  
+                              │   ██    ██  ██    ██  ██        ██    ██  ██    
+                              │   ████████  ████████  ████████  ████████  ████  
+                              │   ████████  ████████  ████████  ████████  ████  
+                              │   ████████  ████████  ████████  ████████  ████  
                               │                                                 
-                              │   v2.0.6 · TDF banner: eatmex                   
                               │                                                 
-                              │   press n to create a session                   
-                              │   press f to cycle banner fonts                 
- bosun  v2.0.6 0 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren
+ bosun  v2.0.7 0 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren
