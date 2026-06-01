@@ -67,6 +67,13 @@ pub struct SessionView {
     /// can render without cloning the whole buffer on every frame.
     /// `None` for sessions we skipped capturing on this tick.
     pub preview: Option<Arc<[u8]>>,
+    /// Hash of the visible pane's plain text on this poll. The app
+    /// compares it against the hash the user last *saw* (when the
+    /// session was selected) to decide whether the row has unviewed
+    /// changes — the "unread" notification dot. `0` means "no usable
+    /// capture this tick" (empty / failed) and never counts as a
+    /// change. Computed by the actor in `refresh_all`.
+    pub content_hash: u64,
 }
 
 impl SessionView {
@@ -75,6 +82,7 @@ impl SessionView {
             session,
             status,
             preview,
+            content_hash: 0,
         }
     }
 

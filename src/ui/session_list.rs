@@ -57,10 +57,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
             VisibleEntry::Ungrouped(c) => {
                 let tabs = c.members.len() as u16;
                 let bg_busy = background_activity(state, c);
+                let unread = container_unread(state, c);
                 match state.session_by_name(&c.active) {
                     Some(v) => {
                         out.push(render_primary_line(
-                            v, selected, false, tabs, bg_busy, area.width, theme,
+                            v, selected, false, tabs, bg_busy, unread, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, false, area.width, theme));
                         if narrow && tabs > 1 {
@@ -91,10 +92,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
             VisibleEntry::Member { container, .. } => {
                 let tabs = container.members.len() as u16;
                 let bg_busy = background_activity(state, container);
+                let unread = container_unread(state, container);
                 match state.session_by_name(&container.active) {
                     Some(v) => {
                         out.push(render_primary_line(
-                            v, selected, true, tabs, bg_busy, area.width, theme,
+                            v, selected, true, tabs, bg_busy, unread, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, true, area.width, theme));
                         if narrow && tabs > 1 {
@@ -305,24 +307,46 @@ fn background_activity(state: &AppState, container: &crate::sidebar::Container) 
         .any(|v| matches!(v.status, Status::Running | Status::Waiting))
 }
 
+/// True iff any tab in `container` has unviewed changes — its pane
+/// differs from what the user last saw. Aggregated across all tabs
+/// (not just the active one) so a multi-tab container lights up even
+/// when the changed tab isn't the one on top. The currently-viewed
+/// session is kept baselined by `AppState::sync_focus`, so this never
+/// lights the row under the cursor.
+fn container_unread(state: &AppState, container: &crate::sidebar::Container) -> bool {
+    container.members.iter().any(|m| state.session_unread(m))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_primary_line(
     view: &SessionView,
     selected: bool,
     indented: bool,
     tabs: u16,
     bg_busy: bool,
+    unread: bool,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
-    let marker = if selected { "▌" } else { " " };
     let bg = row_bg(selected, theme);
 
-    let marker_style = if selected {
-        Style::default().fg(theme.accent).bg(bg)
+    // Left gutter: the selection bar wins when this row is selected;
+    // otherwise an unread session shows a notification dot there.
+    // These never coincide — selecting a row clears its unread flag —
+    // so reusing the one column keeps every row's columns aligned.
+    // The dot uses the error/red slot, not the (yellow) waiting slot,
+    // so it never reads as the in-progress Waiting glyph.
+    let (marker, marker_style) = if selected {
+        ("▌", Style::default().fg(theme.accent).bg(bg))
+    } else if unread {
+        ("●", Style::default().fg(theme.status_error).bg(bg))
     } else {
-        Style::default().fg(bg).bg(bg)
+        (" ", Style::default().fg(bg).bg(bg))
     };
-    let name_style = if selected {
+    // Bold the name for the selected row and for unread rows — the
+    // dot alone is easy to miss, and bold reads as "new" even on
+    // terminals where the accent color is muted.
+    let name_style = if selected || unread {
         Style::default()
             .fg(theme.text)
             .bg(bg)

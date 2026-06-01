@@ -4,6 +4,29 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.6] — 2026-06-01
+
+### Added
+- **Unread indicator for sessions with unviewed activity.** Each
+  sidebar row now shows a red notification dot in the gutter and a
+  bold name when that session's pane has changed since you last looked
+  at it — a finished turn, a permission prompt, a question, any new
+  output. It works by fingerprinting each session's visible text on
+  the refresh bosun already runs (no extra tmux calls) and comparing
+  against the snapshot from the last time the row was selected.
+  Selecting a row marks it seen and clears the dot; it lights again if
+  the session keeps changing while you're looking elsewhere. New rows
+  and failed captures never start unread.
+
+### Fixed
+- **A fresh or idle Claude no longer shows as "waiting" (◐).** Recent
+  Claude versions use `❯` as the composer's input glyph, which the
+  detector read as a confirmation menu — so an untasked instance
+  sitting at its prompt looked like it needed an answer. `Waiting` is
+  now limited to genuine decision points (numbered `❯ 1.` menus,
+  `Do you want to…`, `(y/n)`); an empty or typed-but-unsubmitted
+  composer reads as `Idle`.
+
 ## [2.0.5] — 2026-05-29
 
 ### Added

@@ -166,6 +166,20 @@ pub struct AppState {
     /// from the live list, so the set never grows unbounded and
     /// can't shadow a future create with the same internal name.
     pub recently_killed: std::collections::HashSet<String>,
+    /// Per-session content hash the user has last *seen* — the
+    /// fingerprint of a session's visible pane the last time it was the
+    /// selected (viewed) row. A session reads as "unread" when its
+    /// current [`SessionView::content_hash`] differs from this baseline
+    /// (see [`AppState::session_unread`]): output changed while the
+    /// user wasn't looking. This is more robust than keying on status
+    /// transitions — it catches a finished turn, a permission prompt, a
+    /// prose question, any new output. Baselined on first sight (so a
+    /// new row doesn't start unread) and re-baselined whenever the
+    /// session becomes the selected row (see [`AppState::sync_focus`]),
+    /// which is what clears the dot. Pruned to live sessions on every
+    /// `SessionsRefreshed`. Rendered as the left-gutter notification
+    /// dot in `session_list`.
+    pub seen_content: std::collections::HashMap<String, u64>,
 }
 
 /// Number of wheel events that must accumulate in one direction before
@@ -554,6 +568,27 @@ impl AppState {
             .push(Box::new(ConfirmModal::new(title, msg, cmd).destructive()));
     }
 
+    /// Whether `name`'s row has unviewed changes — its current pane
+    /// content differs from what the user last saw (the baseline in
+    /// [`AppState::seen_content`]). Drives the sidebar's unread dot.
+    /// `false` when the session is unknown, when its capture this tick
+    /// was empty/failed (`content_hash == 0`), or when it hasn't been
+    /// baselined yet. The currently-viewed row is kept baselined by
+    /// `sync_focus`, so it never reads as unread.
+    pub fn session_unread(&self, name: &str) -> bool {
+        let cur = match self.session_by_name(name) {
+            Some(v) => v.content_hash,
+            None => return false,
+        };
+        if cur == 0 {
+            return false;
+        }
+        match self.seen_content.get(name) {
+            Some(seen) => *seen != cur,
+            None => false,
+        }
+    }
+
     /// Pure reducer. Returns a list of Commands the caller should dispatch.
     pub fn apply(&mut self, msg: AppMsg) -> Vec<Command> {
         let mut out = Vec::new();
@@ -599,6 +634,26 @@ impl AppState {
                 };
 
                 self.sessions = sessions;
+
+                // Unread tracking: baseline any session we're seeing for
+                // the first time (a fresh row must not start unread) and
+                // drop baselines for sessions that are gone. We do NOT
+                // touch the baseline of a session we've seen before, so a
+                // pane that changed since the user last looked stays
+                // unread until they select it — `sync_focus` re-baselines
+                // the selected row, which is what clears the dot. A 0
+                // hash (empty/failed capture) is no information, so it
+                // never establishes a baseline. This rides the existing
+                // 1Hz refresh; no extra captures.
+                for v in &self.sessions {
+                    if v.content_hash != 0 {
+                        self.seen_content
+                            .entry(v.name().to_string())
+                            .or_insert(v.content_hash);
+                    }
+                }
+                self.seen_content
+                    .retain(|n, _| self.sessions.iter().any(|v| v.name() == n));
 
                 // Restart-swap (dead-row restart-from-recents only —
                 // live restart is in-place and never changes the
@@ -703,6 +758,8 @@ impl AppState {
                 // matching SessionView's `status` field in place; no
                 // reconcile or statusbar work. A no-op if the named
                 // session was killed between detect and delivery.
+                // Unread is tracked from pane content on the 1Hz
+                // refresh, not from status, so nothing to do here.
                 if let Some(view) = self.sessions.iter_mut().find(|v| v.name() == name) {
                     view.status = status;
                 }
@@ -860,8 +917,19 @@ impl AppState {
         // Only request preview capture when a session is selected.
         // On a section header we keep the previous focus so switching
         // off/onto a header doesn't churn capture work.
-        let current = self.selected_session().map(|v| v.name().to_string());
-        if let Some(name) = &current {
+        let current = self
+            .selected_session()
+            .map(|v| (v.name().to_string(), v.content_hash));
+        if let Some((name, hash)) = &current {
+            // Landing the cursor on a session counts as viewing it —
+            // in single-window mode the embed shows it live the moment
+            // it's selected — so re-baseline its content to "now."
+            // That clears the unread dot and means only changes the
+            // user hasn't seen since this moment count going forward.
+            // A 0 hash (no capture yet) leaves the prior baseline be.
+            if *hash != 0 {
+                self.seen_content.insert(name.clone(), *hash);
+            }
             if self.focus_sent.as_deref() != Some(name.as_str()) {
                 out.push(Command::FocusPreview { name: name.clone() });
                 self.focus_sent = Some(name.clone());
@@ -3138,6 +3206,10 @@ mod tests {
     use std::time::SystemTime;
 
     fn ses(name: &str) -> SessionView {
+        ses_status(name, Status::Idle)
+    }
+
+    fn ses_status(name: &str, status: Status) -> SessionView {
         SessionView::new(
             TmuxSession {
                 name: name.into(),
@@ -3151,7 +3223,7 @@ mod tests {
                 spec_path: None,
                 container_id: None,
             },
-            Status::Idle,
+            status,
             None,
         )
     }
@@ -3249,6 +3321,92 @@ mod tests {
         let mut s = state_with(vec![ses("main")], 0);
         s.apply(AppMsg::Key(key(KeyCode::Enter)));
         assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    /// A session with a specific content-hash fingerprint, for the
+    /// unread (content-change) tests.
+    fn ses_h(name: &str, hash: u64) -> SessionView {
+        let mut v = ses(name);
+        v.content_hash = hash;
+        v
+    }
+
+    #[test]
+    fn first_sight_is_not_unread() {
+        // Both rows appear for the first time → baselined, none unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        assert!(!s.session_unread("a"));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn background_change_marks_unread() {
+        // Cursor on "a" (viewed). "b" is a background row whose pane
+        // changes between refreshes → "b" reads unread, "a" doesn't.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 2)]));
+        assert!(s.session_unread("b"));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn change_on_viewed_session_is_not_unread() {
+        // The selected row changing while the user watches it (the
+        // embed shows it live) must not light its own row.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 2)]));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn selecting_session_clears_unread() {
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 2)]));
+        assert!(s.session_unread("b"));
+        // Move the cursor onto "b" → viewing re-baselines it to its
+        // current content, clearing the dot.
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert_eq!(s.selected, 1);
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn unread_reappears_after_leaving_unresolved_change() {
+        // The Grav 2.0 case: a row changes (e.g. asks a question), the
+        // user views it (clears), then navigates away while it changes
+        // again → it goes unread again. Level-based, not one-shot.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        // Cursor onto "b" — viewed, baselined.
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert!(!s.session_unread("b"));
+        // Back to "a"; meanwhile "b" keeps producing output.
+        s.apply(AppMsg::Key(key(KeyCode::Up)));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 9)]));
+        assert!(s.session_unread("b"));
+    }
+
+    #[test]
+    fn zero_hash_never_marks_unread() {
+        // A failed/empty capture (hash 0) is "no information" and must
+        // not flip the row to unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 0)]));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn dead_session_pruned_from_seen_content() {
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        // "b" is gone from the live list — its baseline is dropped.
+        s.apply(refreshed(vec![ses_h("a", 1)]));
+        assert!(!s.seen_content.contains_key("b"));
     }
 
     fn mouse(kind: MouseEventKind, col: u16) -> MouseEvent {

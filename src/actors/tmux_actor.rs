@@ -1078,7 +1078,12 @@ async fn refresh_all(
         } else {
             None
         };
-        out.push(SessionView::new(
+        // Fingerprint the visible text so the app can tell when a row
+        // has changed since the user last looked at it (the unread
+        // dot). Cheap, and rides the capture we already did — no extra
+        // tmux exec.
+        let content_hash = content_hash(&plain);
+        let mut view = SessionView::new(
             s,
             if smoothed == Status::Unknown {
                 // Never surface Unknown to the UI — fall back to Idle so the
@@ -1088,10 +1093,28 @@ async fn refresh_all(
                 smoothed
             },
             preview,
-        ));
+        );
+        view.content_hash = content_hash;
+        out.push(view);
     }
 
     Ok(out)
+}
+
+/// Stable hash of a pane's visible plain text, used for unread
+/// detection. Trailing blank lines are trimmed so an idle pane whose
+/// only "change" is cursor parking doesn't churn the hash. Returns `0`
+/// for empty/whitespace-only text (a failed or blank capture) so the
+/// app can treat it as "no information" rather than a change.
+fn content_hash(plain: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let trimmed = plain.trim_end();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    trimmed.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]
