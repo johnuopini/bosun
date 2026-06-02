@@ -10,24 +10,24 @@ Glyphs are authored on a 7-row canvas:
   row 0      ascender line
   rows 1..5  x-height body (baseline = bottom of row 5)
   row 6      descender line
-Square corners only. Each design column renders as TWO terminal cells so
-the pixels read square (a terminal cell is ~1:2, so 2 wide ≈ 1 tall).
+Square corners only. Rendered with half-block characters (▀ ▄ █) so two
+pixel-rows share one terminal row — the glyphs land at the same compact
+scale as bosun's other banner fonts, with roughly square pixels.
 """
 
 import struct
 
-# Render scale: terminal cells per design column (2 => square pixels).
-CELLS_PER_COL = 2
-# Subtle background band behind the BOTTOM 3 ROWS of the x-height body
-# (rows 3..5 on the 7-row canvas), spanning each glyph's content width
-# incl. counters. The top 2 body rows and the dangling leg rows (0, 6)
-# get no fill. Painted as a dim foreground block (bosun's bg attribute
-# maxes at ~67% accent, too strong; a dim fg block at index 8 is the
-# subtlest solid available ≈ 33% accent).
-BG_BAND = True
+# Optional dim background band behind the bottom body rows. Disabled:
+# at the compact half-block scale a half-block cell carries only one
+# foreground colour, so the band and the bright strokes can't coexist
+# in a shared cell and it renders patchily. Kept as a flag for the
+# full-block variant (CELLS_PER_COL path) where every pixel is its own
+# cell and the band is clean.
+BG_BAND = False
 BAND_TOP = 3
 BAND_BOT = 5
-DIM_FG = 8  # DOS index -> ~33% accent tint in bosun
+BRIGHT = 0x0F  # fg=15 -> full accent (strokes)
+DIM = 0x08     # fg=8  -> ~33% accent (band)
 
 # --- glyph bitmaps (7 rows each) ----------------------------------------
 G = {
@@ -62,48 +62,76 @@ G = {
 
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
-# --- CP437 / attrs -------------------------------------------------------
-FULL = 0xDB  # █
+# --- CP437 half-block glyphs ---------------------------------------------
+FULL = 0xDB   # █  both halves on
+UPPER = 0xDF  # ▀  top half on
+LOWER = 0xDC  # ▄  bottom half on
 SPACE = 0x20
-FG_ON = 0x0F  # fg=15 -> full accent
-ATTR_OFF = 0x00
 
 
 def normalize(rows):
-    """Pad rows to content width, add a 1-col inter-letter gap.
+    """Pad rows to the glyph's max width, add a 1-col inter-letter gap.
     Returns (rows_with_gap, content_width)."""
     w = max(len(r) for r in rows)
     out = [r.ljust(w, ".") + "." for r in rows]
     return out, w
 
 
-def row_cells(row, ry, content_w):
-    """One design row -> list of (cp437, attr) cells (CELLS_PER_COL each).
-    The subtle band fills non-stroke content cells (not the trailing gap
-    column, not the leg rows) on rows BAND_TOP..BAND_BOT."""
-    cells = []
-    for x, px in enumerate(row):
-        if px == "#":
-            cell = (FULL, FG_ON)
-        elif BG_BAND and BAND_TOP <= ry <= BAND_BOT and x < content_w:
-            cell = (FULL, DIM_FG)
-        else:
-            cell = (SPACE, ATTR_OFF)
-        cells.extend([cell] * CELLS_PER_COL)
-    return cells
+def color_of(px, ry, x, content_w):
+    """Pixel -> 0 (off), DIM (band fill), or BRIGHT (stroke)."""
+    if px == "#":
+        return BRIGHT
+    if BG_BAND and BAND_TOP <= ry <= BAND_BOT and x < content_w:
+        return DIM
+    return 0
+
+
+def cell_for(top, bot):
+    """Two stacked pixel colours -> (cp437 glyph, attr=fg). A half-block
+    cell carries one fg colour, so a mixed bright/dim cell resolves in
+    favour of the bright (stroke) half."""
+    if top == 0 and bot == 0:
+        return (SPACE, 0x00)
+    if top == bot:
+        return (FULL, top)
+    if bot == 0:
+        return (UPPER, top)
+    if top == 0:
+        return (LOWER, bot)
+    return (UPPER, BRIGHT) if top == BRIGHT else (LOWER, BRIGHT)
+
+
+def half_rows(rows, content_w):
+    """7 design rows -> 4 terminal rows of (cp437, attr) cells, packing
+    two pixel-rows per row with half-blocks. A blank row is prepended so
+    the ascender leg pairs cleanly above the body."""
+    width = len(rows[0])  # includes the trailing gap column
+    cgrid = [
+        [color_of(rows[ry][x], ry, x, content_w) for x in range(width)]
+        for ry in range(len(rows))
+    ]
+    padded = [[0] * width] + cgrid  # 8 rows -> 4 terminal rows
+    return [
+        [cell_for(padded[2 * t][x], padded[2 * t + 1][x]) for x in range(width)]
+        for t in range(4)
+    ]
 
 
 def preview():
-    block = {FULL: "█", SPACE: " "}
-    dim = "▒"
+    bright = {FULL: "█", UPPER: "▀", LOWER: "▄", SPACE: " "}
+
+    def ch(b, a):
+        if b == SPACE:
+            return " "
+        return "▒" if a == DIM else bright[b]
 
     def render_word(word):
-        glyphs = [normalize(G[c]) for c in word]
-        for ry in range(7):
-            line = ""
-            for rows, cw in glyphs:
-                for b, a in row_cells(rows[ry], ry, cw):
-                    line += dim if (b == FULL and a == DIM_FG) else block.get(b, " ")
+        glyphs = []
+        for c in word:
+            norm, cw = normalize(G[c])
+            glyphs.append(half_rows(norm, cw))
+        for t in range(4):
+            line = "".join(ch(b, a) for g in glyphs for (b, a) in g[t])
             print(line.rstrip() if line.strip() else "")
         print()
 
@@ -122,15 +150,15 @@ TABLE = LAST - FIRST + 1
 
 def build_glyph(rows):
     norm, content_w = normalize(rows)
-    total_w = content_w + 1  # includes the trailing gap column
+    cells = half_rows(norm, content_w)
     out = bytearray()
-    out.append(total_w * CELLS_PER_COL)
-    out.append(len(norm))  # height in rows (7)
-    for i, row in enumerate(norm):
-        for b, a in row_cells(row, i, content_w):
+    out.append(len(norm[0]))  # width in cells (1 per column, incl. gap)
+    out.append(len(cells))    # height: 4 terminal rows
+    for i, row in enumerate(cells):
+        for b, a in row:
             out.append(b)
             out.append(a)
-        if i != len(norm) - 1:
+        if i != len(cells) - 1:
             out.append(0x0D)
     out.append(0x00)
     return bytes(out)
