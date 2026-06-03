@@ -3,8 +3,8 @@
 //! Job: prove or disprove that `portable-pty + vt100 + tui-term` keeps up with
 //! realistic burst loads coming out of a real tmux session, and produce hard
 //! frame-time / throughput numbers before we commit to wiring this into the
-//! main bin. Standalone on purpose — nothing under `src/` is touched until
-//! Step 2 says go. See `PLAN_2_0.md` and `EMBEDDED_TERMINAL_FEASIBILITY.md`.
+//! main bin. Standalone on purpose — nothing under `src/` is touched; this
+//! spike informed the embedded-terminal stack that later shipped in 2.0.
 //!
 //! ## How to run
 //!

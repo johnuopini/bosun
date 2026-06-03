@@ -9,7 +9,7 @@
 //! That round-trip symmetry is what makes the encoded bytes look
 //! like a "real" terminal to the child.
 //!
-//! ## Not covered (yet — see PLAN_2_0.md Step 4 follow-ups)
+//! ## Not covered (yet)
 //!
 //! - **Cursor key application mode** (DECCKM): the child can switch
 //!   between `CSI A` / `SS3 A` for the same arrow. We always emit
