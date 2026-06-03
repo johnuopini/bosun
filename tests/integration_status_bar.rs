@@ -67,12 +67,21 @@ fn configure_session_writes_per_session_options_only() {
     }];
     configure_session(Some(&sock), "bosun-main", &sessions).expect("configure ok");
 
-    // bosun-main should now show the brand in its per-session option.
+    // bosun-main should now carry bosun's per-session status bar. The
+    // left segment was dropped in 2.0 (the session name lives in the
+    // tab strip and the brand in bosun's own TUI footer), so the
+    // distinctive per-session signal is the status-right hint.
     let bosun_left = show_session(&sock, "bosun-main", "status-left");
-    assert!(
-        bosun_left.contains("bosun"),
-        "bosun-main status-left should contain 'bosun', got: {}",
+    assert_eq!(
+        bosun_left, "",
+        "bosun-main status-left is empty by design in 2.0, got: {}",
         bosun_left
+    );
+    let bosun_right = show_session(&sock, "bosun-main", "status-right");
+    assert!(
+        bosun_right.contains("detach") && bosun_right.contains("jump"),
+        "bosun-main status-right should carry the per-session hint, got: {}",
+        bosun_right
     );
 
     // Global status-left should be UNCHANGED. This is the core of the
