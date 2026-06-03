@@ -49,6 +49,9 @@ pub struct SessionMetadata {
     pub claude_session_mode: String,
     pub claude_skip_permissions: bool,
     pub codex_yolo: bool,
+    /// Sidebar container this session belongs to (tabs feature).
+    /// `None` when this session is its own row.
+    pub container_id: Option<String>,
 }
 
 /// Abstraction over the tmux CLI. Real impl shells out; mocks record calls.
@@ -83,6 +86,14 @@ pub trait TmuxClient: Send + Sync {
     /// feature or wasn't created by bosun). Used by restart to
     /// rebuild the original spec.
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>>;
+
+    /// Overwrite the `@bosun_*` metadata user options on a live
+    /// session. Used by the modify-session modal to update the
+    /// stored spec without recreating the session. The next
+    /// `RestartSession` will read these back via
+    /// `get_session_metadata` and spawn the agent with the new
+    /// flags.
+    async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()>;
 
     /// Restart the agent inside a live session without killing the
     /// session itself. Sends Ctrl-C twice (covers agents that swallow
@@ -401,7 +412,7 @@ impl TmuxClient for TokioTmuxClient {
         // `tmux::parse::LIST_SESSIONS_FORMAT`.
         const SEP: &str = "|||";
         let fmt = format!(
-            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}",
+            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}{SEP}#{{@bosun_container_id}}",
             SEP = SEP
         );
         let mut cmd = self.cmd();
@@ -423,7 +434,10 @@ impl TmuxClient for TokioTmuxClient {
         let raw = String::from_utf8_lossy(&output.stdout);
         let line = raw.trim_end_matches('\n');
         let parts: Vec<&str> = line.split(SEP).collect();
-        if parts.len() != 7 {
+        // Accept the legacy 7-field shape (pre-container_id sessions)
+        // as well as the new 8-field shape — keeps sessions created
+        // by an older bosun usable after upgrade.
+        if parts.len() != 7 && parts.len() != 8 {
             return Ok(None);
         }
         // Agent is the required anchor — if it's empty, this session
@@ -431,6 +445,10 @@ impl TmuxClient for TokioTmuxClient {
         if parts[2].is_empty() {
             return Ok(None);
         }
+        let container_id = parts
+            .get(7)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         Ok(Some(SessionMetadata {
             display_name: parts[0].to_string(),
             path: parts[1].to_string(),
@@ -443,7 +461,37 @@ impl TmuxClient for TokioTmuxClient {
             },
             claude_skip_permissions: parts[5] == "1",
             codex_yolo: parts[6] == "1",
+            container_id,
         }))
+    }
+
+    async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()> {
+        // Re-uses the same key/value mapping the create path writes
+        // on session birth, so a modify produces options
+        // byte-identical to what the create path would have
+        // produced for the same spec. Errors on the first failed
+        // option write so the caller can surface a single message
+        // — partial-update state is rare enough (it would mean
+        // tmux died mid-call) that we'd rather fail loudly.
+        for (key, value) in metadata_options(metadata) {
+            let mut cmd = self.cmd();
+            cmd.arg("set-option")
+                .arg("-t")
+                .arg(session)
+                .arg(key)
+                .arg(&value);
+            let output = cmd.output().await.map_err(BosunError::Io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(BosunError::Tmux(format!(
+                    "set {} on {}: {}",
+                    key,
+                    session,
+                    stderr.trim()
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
@@ -599,7 +647,7 @@ impl TmuxClient for TokioTmuxClient {
 /// Map a `SessionMetadata` into the `(key, value)` pairs that should
 /// be written via `set-option -t <session>`.
 fn metadata_options(m: &SessionMetadata) -> Vec<(&'static str, String)> {
-    vec![
+    let mut out = vec![
         ("@bosun_path", m.path.clone()),
         ("@bosun_agent", m.agent.clone()),
         ("@bosun_args", m.args.clone()),
@@ -612,7 +660,15 @@ fn metadata_options(m: &SessionMetadata) -> Vec<(&'static str, String)> {
             "@bosun_codex_yolo",
             if m.codex_yolo { "1" } else { "0" }.to_string(),
         ),
-    ]
+    ];
+    // Only emit `@bosun_container_id` when a container assignment
+    // is requested — leaves pre-feature sessions clean and avoids
+    // writing a `None` sentinel value that we'd then have to
+    // distinguish from "no option" on reads.
+    if let Some(id) = &m.container_id {
+        out.push(("@bosun_container_id", id.clone()));
+    }
+    out
 }
 
 /// Build a synchronous `std::process::Command` for tmux with the given args.

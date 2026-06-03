@@ -2,13 +2,13 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
-   ●  build  1w               │                                                 
-       claude · /tmp/work     │  preview: capturing…                            
- ▌ ◐  review  1w  •attached   │                                                 
+   ●  build  1w               │ ◐ review  +                                     
+       claude · /tmp/work     │                                                 
+ ▌ ◐  review  1w  •attached   │  preview: capturing…                            
        claude · /tmp/work     │                                                 
    ○  shell  1w               │                                                 
        claude · /tmp/work     │                                                 
    ✕  crashed  1w             │                                                 
        claude · /tmp/work     │                                                 
                               │                                                 
- bosun  v0.4.1 4 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren
+ bosun  v2.0.8 4 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren

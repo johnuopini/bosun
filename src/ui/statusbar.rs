@@ -11,21 +11,25 @@ use crate::ui::Theme;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
     let bg = theme.panel_alt;
-    let left = Line::from(vec![
-        Span::styled(" bosun ", Style::default().fg(theme.text).bg(theme.accent)),
+    let mut left_spans = vec![
+        Span::styled(
+            " bosun ",
+            Style::default().fg(theme.on(theme.accent)).bg(theme.accent),
+        ),
         Span::styled(
             format!(" v{} ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(theme.text_muted).bg(bg),
         ),
-        if let Some(w) = &state.warning {
-            Span::styled(w.clone(), Style::default().fg(theme.status_waiting).bg(bg))
-        } else {
-            Span::styled(
-                format!("{} sessions", state.sessions.len()),
-                Style::default().fg(theme.text_muted).bg(bg),
-            )
-        },
-    ]);
+    ];
+    left_spans.push(if let Some(w) = &state.warning {
+        Span::styled(w.clone(), Style::default().fg(theme.status_waiting).bg(bg))
+    } else {
+        Span::styled(
+            format!("{} sessions", state.sessions.len()),
+            Style::default().fg(theme.text_muted).bg(bg),
+        )
+    });
+    let left = Line::from(left_spans);
 
     let right =
         "↵ attach · n new · e edit · g group · 1-9 move · r ren · d kill · t theme · ? help · q quit ";

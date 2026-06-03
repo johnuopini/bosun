@@ -68,6 +68,13 @@ pub struct AppState {
     /// and pushes the modal (with store-loaded recents etc) since
     /// `AppState` doesn't hold the store itself.
     pub pending_modal: Option<ModalRequest>,
+    /// Set when the user presses `Ctrl+L` (or another redraw
+    /// trigger). The app loop re-enters alt screen and calls
+    /// `terminal.clear()` before the next draw, invalidating
+    /// ratatui's cached previous frame and forcing a full repaint —
+    /// recovering from things like iTerm's `Cmd+R` that wipe the
+    /// screen out from under us. Reset to `false` after the redraw.
+    pub force_redraw: bool,
     /// Cached terminal size, updated on every `AppMsg::Resize` and
     /// on the initial sync in `App::run`. Used by mouse handling to
     /// map a column click back to the current divider position
@@ -136,12 +143,75 @@ pub struct AppState {
     /// downward steps, negative = pending upward steps; resets on
     /// direction change so a flick the other way feels immediate.
     pub scroll_accum: i32,
+    /// Always `true` as of v2.0.2 — focused single-window mode is
+    /// the only attach behavior. The field is retained so callers
+    /// that branch on it keep compiling; remove once those callers
+    /// have been simplified.
+    pub single_window_mode: bool,
+    /// Sticky "hide the sidebar while focused" preference, seeded from
+    /// `config.sidebar_hidden` and flipped live by `Ctrl+B`. Only
+    /// collapses the sidebar while the embed is focused (see
+    /// `App::sidebar_collapsed`); when not focused the sidebar always
+    /// renders so the session list stays reachable. Persisted on each
+    /// toggle so the choice survives restarts.
+    pub sidebar_hidden: bool,
+    /// Internal names of sessions the user just killed via `d`.
+    /// Suppresses the "re-add via reconcile" race where a 1Hz
+    /// `do_refresh` already inflight at confirm time emits a
+    /// `SessionsRefreshed` containing the still-alive session
+    /// before the actor gets a chance to process `KillSession` —
+    /// without this set, the dead row would briefly reappear in
+    /// ungrouped as `? <name>` until the next refresh. Entries
+    /// clear the moment a refresh confirms the session is gone
+    /// from the live list, so the set never grows unbounded and
+    /// can't shadow a future create with the same internal name.
+    pub recently_killed: std::collections::HashSet<String>,
+    /// Per-session content hash the user has last *seen* — the
+    /// fingerprint of a session's visible pane the last time it was the
+    /// selected (viewed) row. A session reads as "unread" when its
+    /// current [`SessionView::content_hash`] differs from this baseline
+    /// (see [`AppState::session_unread`]): output changed while the
+    /// user wasn't looking. This is more robust than keying on status
+    /// transitions — it catches a finished turn, a permission prompt, a
+    /// prose question, any new output. Baselined on first sight (so a
+    /// new row doesn't start unread) and re-baselined whenever the
+    /// session becomes the selected row (see [`AppState::sync_focus`]),
+    /// which is what clears the dot. Pruned to live sessions on every
+    /// `SessionsRefreshed`. Rendered as the left-gutter notification
+    /// dot in `session_list`.
+    pub seen_content: std::collections::HashMap<String, SeenState>,
+}
+
+/// What the user has "seen" for one session — the baseline the unread
+/// dot is computed against (see [`AppState::seen_content`] and
+/// [`AppState::session_unread`]). Keyed on pane width as well as
+/// content so a reflow (resize / focus-embed / a second bosun instance
+/// attaching to the shared session) is treated as layout, not new
+/// output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeenState {
+    /// Fingerprint of the pane text the user last saw.
+    pub hash: u64,
+    /// Pane width that fingerprint was captured at. A different width
+    /// on a later poll means the pane reflowed, so we re-baseline
+    /// rather than mark unread.
+    pub width: u16,
+    /// Refreshes remaining during which a content change is treated as
+    /// the post-reflow redraw settling rather than new output. Set when
+    /// a width change is detected; counts down to 0.
+    pub settle: u8,
 }
 
 /// Number of wheel events that must accumulate in one direction before
 /// the selection steps. Tuned for macOS trackpads, which fire ~10
 /// events per modest two-finger swipe.
 const SCROLL_TICKS_PER_STEP: i32 = 2;
+
+/// Refreshes to suppress unread for a session after its pane width
+/// changes. The reflow itself is re-baselined immediately; this short
+/// window then absorbs the agent TUI's redraw, which lands a beat after
+/// the resize at the new width and would otherwise read as new output.
+const REFLOW_SETTLE_TICKS: u8 = 2;
 
 impl AppState {
     /// Resolve a dead session's internal name into the friendliest
@@ -196,6 +266,16 @@ pub enum ModalRequest {
     /// Open the key-bindings help / cheat-sheet modal. Pure UI; the
     /// app loop just constructs a `HelpModal` with no extra data.
     Help,
+    /// Open the new-session modal in add-tab mode: path is locked
+    /// to the container's, name is seeded with the container's
+    /// label, and submit stamps `container_id` onto the emitted
+    /// `SessionSpec` so the new session joins the container as
+    /// another tab.
+    AddTab {
+        container_id: String,
+        container_name: String,
+        container_path: String,
+    },
 }
 
 impl AppState {
@@ -251,6 +331,63 @@ impl AppState {
         self.sessions.iter().find(|v| v.name() == name)
     }
 
+    /// Ordered list of live internal session names for the
+    /// Shift+Left/Right cycle. Uses the sidebar's display order
+    /// (ungrouped first, then each section's members) rather than
+    /// MRU — sidebar order is stable until the user explicitly
+    /// reorders, which is what muscle memory needs. Collapsed
+    /// sections still contribute their members so cycling can reach
+    /// hidden sessions. Dead sidebar rows (entries whose tmux
+    /// session no longer exists) are filtered out — we never want
+    /// to cycle to a name `switch-client` can't resolve.
+    pub fn cycle_order(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &self.sidebar.ungrouped {
+            if self.session_by_name(&c.active).is_some() {
+                out.push(c.active.clone());
+            }
+        }
+        for s in &self.sidebar.sections {
+            for c in &s.members {
+                if self.session_by_name(&c.active).is_some() {
+                    out.push(c.active.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Internal name of the session that should be activated when
+    /// the user presses Shift+Right from `current` (or, when no
+    /// current is provided, from the start of the cycle). Returns
+    /// `None` only when there are zero live sessions to cycle
+    /// through. Wraps around at the end of the order so the
+    /// gesture stays continuous.
+    pub fn cycle_next(&self, current: Option<&str>) -> Option<String> {
+        let order = self.cycle_order();
+        if order.is_empty() {
+            return None;
+        }
+        let idx = current
+            .and_then(|c| order.iter().position(|n| n == c))
+            .map(|i| (i + 1) % order.len())
+            .unwrap_or(0);
+        order.into_iter().nth(idx)
+    }
+
+    /// Mirror of `cycle_next` for Shift+Left.
+    pub fn cycle_prev(&self, current: Option<&str>) -> Option<String> {
+        let order = self.cycle_order();
+        if order.is_empty() {
+            return None;
+        }
+        let idx = current
+            .and_then(|c| order.iter().position(|n| n == c))
+            .map(|i| if i == 0 { order.len() - 1 } else { i - 1 })
+            .unwrap_or_else(|| order.len() - 1);
+        order.into_iter().nth(idx)
+    }
+
     /// If the cursor is on a section header or one of its members,
     /// return that section's name. Otherwise (ungrouped or empty), None.
     /// Used to remember which group a new session should land in.
@@ -274,7 +411,7 @@ impl AppState {
         };
         // In a section?
         for sec in &self.sidebar.sections {
-            if sec.members.iter().any(|n| n == internal) {
+            if sec.members.iter().any(|c| c.contains_internal(internal)) {
                 let prev = self.session_history.insert(display, sec.name.clone());
                 return prev.as_deref() != Some(sec.name.as_str());
             }
@@ -290,8 +427,8 @@ impl AppState {
         let mut changed = false;
         // Iterate over a snapshot of ungrouped so we can mutate during the loop.
         let ungrouped = self.sidebar.ungrouped.clone();
-        for internal in ungrouped {
-            let display = match self.sessions.iter().find(|v| v.name() == internal) {
+        for container in ungrouped {
+            let display = match self.sessions.iter().find(|v| v.name() == container.active) {
                 Some(v) => v.display().to_string(),
                 None => continue,
             };
@@ -308,9 +445,14 @@ impl AppState {
                 Some(i) => i,
                 None => continue,
             };
-            if let Some(pos) = self.sidebar.ungrouped.iter().position(|n| n == &internal) {
-                let n = self.sidebar.ungrouped.remove(pos);
-                self.sidebar.sections[si].members.push(n);
+            if let Some(pos) = self
+                .sidebar
+                .ungrouped
+                .iter()
+                .position(|c| c.id == container.id)
+            {
+                let c = self.sidebar.ungrouped.remove(pos);
+                self.sidebar.sections[si].members.push(c);
                 changed = true;
             }
         }
@@ -320,6 +462,157 @@ impl AppState {
     /// Emit a `SaveSessionHistory` command with the current history.
     fn save_session_history(&self, out: &mut Vec<Command>) {
         out.push(Command::SaveSessionHistory(self.session_history.clone()));
+    }
+
+    /// Resolve a click landing in the tab strip rect to a tab pill
+    /// or the `+` button and react: tab → switch active tab +
+    /// persist; `+` → queue the add-tab modal. The `strip` rect
+    /// must be the same one the renderer used, so the hit-test
+    /// matches what the user actually saw on screen.
+    pub fn handle_tab_strip_click(
+        &mut self,
+        strip: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+        out: &mut Vec<Command>,
+    ) {
+        let Some(entry) = self.sidebar.visible().get(self.selected).copied() else {
+            return;
+        };
+        let Some(container) = entry.container() else {
+            return;
+        };
+        let labels: Vec<String> = container
+            .members
+            .iter()
+            .map(|m| {
+                self.session_by_name(m)
+                    .map(|v| v.display().to_string())
+                    .unwrap_or_else(|| m.clone())
+            })
+            .collect();
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let active_idx = container
+            .members
+            .iter()
+            .position(|m| m == &container.active);
+        let layout = crate::ui::tab_strip::compute(strip, &label_refs, active_idx);
+        let Some(slot) = layout.hit(col, row) else {
+            return;
+        };
+        if slot.key == "+" {
+            self.request_add_tab();
+            return;
+        }
+        // Resolve slot → container.members[i]. The renderer stamps
+        // slot.key with the internal name; the windowing scheme
+        // only ever shows visible tabs, so the keys match members
+        // 1:1 within the visible window.
+        let slot_idx = layout
+            .tabs
+            .iter()
+            .position(|s| s.rect.x == slot.rect.x && s.rect.width == slot.rect.width)
+            .unwrap_or(0);
+        let member_idx = layout.first_visible + slot_idx;
+        let Some(new_active) = container.members.get(member_idx).cloned() else {
+            return;
+        };
+        let container_id = container.id.clone();
+        if self.sidebar.set_active_tab(&container_id, &new_active) {
+            self.save_sidebar(out);
+        }
+    }
+
+    /// Resolve the container under the cursor (if any) and queue
+    /// an add-tab modal request. The modal opens with the
+    /// container's path locked and its display label seeded; submit
+    /// emits `Command::CreateSession` with `container_id` stamped
+    /// so the new tmux session joins the container as a tab.
+    fn request_add_tab(&mut self) {
+        let entry = self.sidebar.visible().get(self.selected).copied();
+        let Some(container) = entry.and_then(|e| e.container()) else {
+            return;
+        };
+        // Path: prefer the live session's `best_path` (handles
+        // both `@bosun_path` and the shell cwd fallback), then fall
+        // back to the container's name as a last resort.
+        let path = self
+            .session_by_name(&container.active)
+            .and_then(|v| v.session.best_path().map(|s| s.to_string()))
+            .unwrap_or_else(|| container.name.clone());
+        self.pending_modal = Some(ModalRequest::AddTab {
+            container_id: container.id.clone(),
+            container_name: container.name.clone(),
+            container_path: path,
+        });
+    }
+
+    /// Walk the active tab one position forward (`step = 1`) or
+    /// backward (`step = -1`), wrapping at the bounds. Persists
+    /// the new active-tab choice so it survives restart.
+    pub fn cycle_active_tab(&mut self, step: i32, out: &mut Vec<Command>) {
+        let Some(loc) = self.selected_location() else {
+            return;
+        };
+        let container = match loc {
+            Location::Ungrouped(i) => self.sidebar.ungrouped.get_mut(i),
+            Location::Member(si, mi) => self
+                .sidebar
+                .sections
+                .get_mut(si)
+                .and_then(|s| s.members.get_mut(mi)),
+            Location::Header(_) => None,
+        };
+        let Some(c) = container else {
+            return;
+        };
+        if c.members.len() <= 1 {
+            return;
+        }
+        let cur = c.members.iter().position(|m| m == &c.active).unwrap_or(0);
+        let len = c.members.len() as i32;
+        let next = ((cur as i32 + step).rem_euclid(len)) as usize;
+        c.active = c.members[next].clone();
+        self.save_sidebar(out);
+    }
+
+    /// Emit a confirm-modal that, on accept, kills every tmux
+    /// session inside the selected container. The sidebar row
+    /// disappears once `remove_session` walks all the way through
+    /// the container's tabs.
+    fn request_kill_container(&mut self, _out: &mut [Command]) {
+        let entry = self.sidebar.visible().get(self.selected).copied();
+        let Some(container) = entry.and_then(|e| e.container()) else {
+            return;
+        };
+        let display = container.name.clone();
+        let tabs = container.members.clone();
+        let title = "Kill all tabs in container?";
+        let msg = format!("This will kill all {} tab(s) in '{}'.", tabs.len(), display);
+        let cmd = Command::KillContainer { tabs };
+        self.modals
+            .push(Box::new(ConfirmModal::new(title, msg, cmd).destructive()));
+    }
+
+    /// Whether `name`'s row has unviewed changes — its current pane
+    /// content differs from what the user last saw (the baseline in
+    /// [`AppState::seen_content`]). Drives the sidebar's unread dot.
+    /// `false` when the session is unknown, when its capture this tick
+    /// was empty/failed (`content_hash == 0`), or when it hasn't been
+    /// baselined yet. The currently-viewed row is kept baselined by
+    /// `sync_focus`, so it never reads as unread.
+    pub fn session_unread(&self, name: &str) -> bool {
+        let cur = match self.session_by_name(name) {
+            Some(v) => v.content_hash,
+            None => return false,
+        };
+        if cur == 0 {
+            return false;
+        }
+        match self.seen_content.get(name) {
+            Some(seen) => seen.hash != cur,
+            None => false,
+        }
     }
 
     /// Pure reducer. Returns a list of Commands the caller should dispatch.
@@ -341,7 +634,85 @@ impl AppState {
                     .get(self.selected)
                     .map(|v| v.identity().to_string());
 
+                // Race guard: the actor's 1Hz `do_refresh` can have
+                // started capturing the session list *before* it
+                // reached our `KillSession` in `cmd_rx`, so the
+                // SessionsRefreshed we're holding can still contain
+                // the freshly-killed session. Filter both the
+                // session view list and the live-name list used for
+                // reconcile so the dead row doesn't briefly
+                // reappear in ungrouped as `? <name>`.
+                //
+                // Any name that's NOT in this incoming live list is
+                // confirmed gone — drop it from the suppression set
+                // so the entry can never shadow a future create
+                // that happens to land on the same internal name.
+                let sessions: Vec<SessionView> = if self.recently_killed.is_empty() {
+                    sessions
+                } else {
+                    let live_names: std::collections::HashSet<String> =
+                        sessions.iter().map(|v| v.name().to_string()).collect();
+                    self.recently_killed.retain(|n| live_names.contains(n));
+                    sessions
+                        .into_iter()
+                        .filter(|v| !self.recently_killed.contains(v.name()))
+                        .collect()
+                };
+
                 self.sessions = sessions;
+
+                // Unread tracking, keyed on (content, pane width).
+                //
+                // Baseline a row the first time we see it (a fresh row
+                // must not start unread). On later refreshes:
+                //
+                // * If the pane *width* changed, the text reflowed — a
+                //   terminal resize, the focus-embed sizing the pane to
+                //   the preview area, or a *second bosun instance*
+                //   attaching to the shared tmux session. That's layout,
+                //   not new agent output, so adopt the reflowed content
+                //   as "seen" and hold a short settle window for the
+                //   redraw that lands a beat later. This is what stops
+                //   one instance's resize from lighting up unread in
+                //   another, and a device switch from lighting up
+                //   everything.
+                // * Otherwise leave the baseline be, so a change since
+                //   the user last looked stays unread until they select
+                //   the row — `sync_focus` re-baselines the selected row,
+                //   which is what clears the dot.
+                //
+                // A 0 hash (empty/failed capture) is no information and
+                // never baselines or trips unread. Dead sessions are
+                // pruned. Rides the existing 1Hz refresh; no extra exec.
+                for v in &self.sessions {
+                    if v.content_hash == 0 {
+                        continue;
+                    }
+                    match self.seen_content.get_mut(v.name()) {
+                        None => {
+                            self.seen_content.insert(
+                                v.name().to_string(),
+                                SeenState {
+                                    hash: v.content_hash,
+                                    width: v.width(),
+                                    settle: 0,
+                                },
+                            );
+                        }
+                        Some(seen) if seen.width != v.width() => {
+                            seen.hash = v.content_hash;
+                            seen.width = v.width();
+                            seen.settle = REFLOW_SETTLE_TICKS;
+                        }
+                        Some(seen) if seen.settle > 0 => {
+                            seen.hash = v.content_hash;
+                            seen.settle -= 1;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                self.seen_content
+                    .retain(|n, _| self.sessions.iter().any(|v| v.name() == n));
 
                 // Restart-swap (dead-row restart-from-recents only —
                 // live restart is in-place and never changes the
@@ -364,10 +735,23 @@ impl AppState {
                     false
                 };
 
-                let live: Vec<String> =
-                    self.sessions.iter().map(|v| v.name().to_string()).collect();
-                self.sidebar.reconcile(&live);
-                if swap_applied {
+                let live: Vec<(String, Option<String>)> = self
+                    .sessions
+                    .iter()
+                    .map(|v| (v.name().to_string(), v.session.container_id.clone()))
+                    .collect();
+                let reconcile_changed = self.sidebar.reconcile(&live);
+                // Persist whenever reconcile mutated the model
+                // (added an auto-discovered session, deduped a
+                // duplicate, or dropped an empty container) so the
+                // new shape — including container ids assigned to
+                // brand-new sessions — survives a restart. Without
+                // this, a fresh container had its id only in memory
+                // and the next launch would regenerate a different
+                // id, leaving the container's sibling tabs
+                // (`@bosun_container_id` already pointing at the
+                // original) stranded as top-level rows.
+                if swap_applied || reconcile_changed {
                     self.save_sidebar(&mut out);
                 }
 
@@ -427,6 +811,37 @@ impl AppState {
                     view.preview = Some(bytes);
                 }
             }
+            AppMsg::StatusRefreshed { name, status } => {
+                // Sibling of `PreviewRefreshed` — push-style status
+                // update from the actor's fast tick. Updates the
+                // matching SessionView's `status` field in place; no
+                // reconcile or statusbar work. A no-op if the named
+                // session was killed between detect and delivery.
+                // Unread is tracked from pane content on the 1Hz
+                // refresh, not from status, so nothing to do here.
+                if let Some(view) = self.sessions.iter_mut().find(|v| v.name() == name) {
+                    view.status = status;
+                }
+            }
+            AppMsg::EmbedBytes { .. } => {
+                // The reducer is pure and AppState doesn't own the
+                // embed (the App struct does — embed has runtime
+                // resources that don't belong in pure state). The
+                // App::run loop intercepts EmbedBytes before calling
+                // apply() and feeds bytes into the embed directly,
+                // so reaching here is a code-path bug, not a runtime
+                // problem.
+                tracing::warn!("EmbedBytes reached reducer — App::run intercept is broken");
+            }
+            AppMsg::Paste(_) => {
+                // Paste handling lives on the App side too — the
+                // only currently-meaningful target is the embed
+                // PTY when focused. App::run intercepts before
+                // calling apply(). Reaching here means no embed
+                // (or not focused), in which case dropping is the
+                // right move; no modal currently expects pasted
+                // text directly.
+            }
             AppMsg::Key(k) => {
                 // Route through open modals first. Most modals consume
                 // everything they see so typing in a text field doesn't
@@ -456,8 +871,22 @@ impl AppState {
                                     // the user's groups), so the only
                                     // way an entry leaves the sidebar
                                     // is via this explicit-action path.
+                                    //
+                                    // Also record the internal name in
+                                    // `recently_killed` so a
+                                    // `SessionsRefreshed` already in
+                                    // flight (the 1Hz `do_refresh` can
+                                    // fire just before the actor
+                                    // processes our `KillSession`)
+                                    // doesn't reconcile-re-add the
+                                    // still-momentarily-alive session
+                                    // as a fresh ungrouped row. The
+                                    // refresh handler clears the entry
+                                    // the first time the live list
+                                    // confirms the session is gone.
                                     if let Command::KillSession(internal) = &c {
                                         self.sidebar.remove_session(internal);
+                                        self.recently_killed.insert(internal.clone());
                                         self.clamp_selection();
                                         self.save_sidebar(&mut out);
                                     }
@@ -517,6 +946,11 @@ impl AppState {
                 // `handle_mouse` needs the current area to compute
                 // the divider column, and it can't ask the terminal
                 // directly from inside a pure reducer.
+                //
+                // Unread tracking absorbs the reflow per-session: a
+                // resize changes each pane's width, which the
+                // SessionsRefreshed reducer treats as layout (re-baseline)
+                // rather than new output — so there's nothing to arm here.
                 self.term_size = (w, h);
                 // ratatui auto-redraws next frame, no command to emit.
             }
@@ -527,8 +961,17 @@ impl AppState {
             }
             AppMsg::Shutdown => self.quit = true,
             AppMsg::Resume => { /* redraw happens unconditionally below */ }
+            AppMsg::FocusGained | AppMsg::FocusLost => { /* handled at the App level — see App::run */
+            }
             AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
                 // Phase 1: attach is done inline; these arms are for future use.
+            }
+            AppMsg::ModifySpecReady { .. } => {
+                // Handled directly in `App::run` (it needs the recents
+                // store, which lives on the App, not AppState). If a
+                // message reaches here the intercept upstream is
+                // broken — log and drop.
+                tracing::warn!("ModifySpecReady reached reducer — App::run intercept is broken");
             }
         }
         out
@@ -538,8 +981,26 @@ impl AppState {
         // Only request preview capture when a session is selected.
         // On a section header we keep the previous focus so switching
         // off/onto a header doesn't churn capture work.
-        let current = self.selected_session().map(|v| v.name().to_string());
-        if let Some(name) = &current {
+        let current = self
+            .selected_session()
+            .map(|v| (v.name().to_string(), v.content_hash, v.width()));
+        if let Some((name, hash, width)) = &current {
+            // Landing the cursor on a session counts as viewing it —
+            // in single-window mode the embed shows it live the moment
+            // it's selected — so re-baseline its content to "now."
+            // That clears the unread dot and means only changes the
+            // user hasn't seen since this moment count going forward.
+            // A 0 hash (no capture yet) leaves the prior baseline be.
+            if *hash != 0 {
+                self.seen_content.insert(
+                    name.clone(),
+                    SeenState {
+                        hash: *hash,
+                        width: *width,
+                        settle: 0,
+                    },
+                );
+            }
             if self.focus_sent.as_deref() != Some(name.as_str()) {
                 out.push(Command::FocusPreview { name: name.clone() });
                 self.focus_sent = Some(name.clone());
@@ -556,27 +1017,86 @@ impl AppState {
         if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return;
         }
+        // Shift-with-arrow normalisation: some terminals send Shift+arrow
+        // with extra modifier bits (e.g. SHIFT|KEYPAD, or mobile SSH
+        // clients that mix in ALT). Strip everything except SHIFT and
+        // CONTROL before matching so the exact-modifier arms below catch
+        // it. Focused mode already uses `.contains(SHIFT)`; this brings
+        // sidebar in line.
+        let normalized_mods = if matches!(
+            k.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        ) {
+            k.modifiers & (KeyModifiers::SHIFT | KeyModifiers::CONTROL)
+        } else {
+            k.modifiers
+        };
 
-        match (k.code, k.modifiers) {
+        match (k.code, normalized_mods) {
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
-            // Shift+Down / Shift+J: reorder within bucket (session)
-            // or move whole group (section header).
-            (KeyCode::Down, KeyModifiers::SHIFT) | (KeyCode::Char('J'), _) => {
+            // Ctrl+L = force a full repaint. Standard TUI convention
+            // (vim, less, htop). Recovers from things like iTerm's
+            // Cmd+R which clears the screen out from under ratatui's
+            // diff-based renderer. (Focused mode handles Ctrl+L in the
+            // App loop so the inner shell still gets its clear too.)
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                self.force_redraw = true;
+            }
+            // Ctrl+Shift+Down / Shift+J: reorder within bucket
+            // (session) or move whole group (section header). Plain
+            // Shift+Down is now session-cycle to match the in-focus
+            // chord, so reorder moved to Ctrl+Shift.
+            (KeyCode::Down, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_down_within(out);
             }
-            (KeyCode::Up, KeyModifiers::SHIFT) | (KeyCode::Char('K'), _) => {
+            (KeyCode::Char('J'), _) => {
+                self.move_down_within(out);
+            }
+            (KeyCode::Up, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_up_within(out);
             }
-            // Shift+Right / Shift+Left: cross-bucket moves. Only
-            // meaningful on session rows.
-            (KeyCode::Right, KeyModifiers::SHIFT) => {
+            (KeyCode::Char('K'), _) => {
+                self.move_up_within(out);
+            }
+            // Ctrl+Shift+Right / Ctrl+Shift+Left: cross-bucket
+            // moves (session → next / prev section). Plain
+            // Shift+Right/Left is now tab-cycle.
+            (KeyCode::Right, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_to_next_bucket(out);
             }
-            (KeyCode::Left, KeyModifiers::SHIFT) => {
+            (KeyCode::Left, m) if m == KeyModifiers::SHIFT | KeyModifiers::CONTROL => {
                 self.move_to_prev_bucket(out);
+            }
+            // Shift+Right / Shift+Left: cycle the active tab within
+            // the current container. Same as `]` / `[`, exposed on
+            // arrow keys so the chord matches the in-focus binding.
+            (KeyCode::Right, KeyModifiers::SHIFT) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Left, KeyModifiers::SHIFT) => {
+                self.cycle_active_tab(-1, out);
+            }
+            // Shift+Down / Shift+Up: cycle to next / previous
+            // session in sidebar order (skips section headers and
+            // dead rows). Mirrors the in-focus chord.
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                let cur = self.selected_session_name();
+                if let Some(name) = self.cycle_next(cur.as_deref()) {
+                    if let Some(idx) = self.sidebar.find_identity(&name) {
+                        self.selected = idx;
+                    }
+                }
+            }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                let cur = self.selected_session_name();
+                if let Some(name) = self.cycle_prev(cur.as_deref()) {
+                    if let Some(idx) = self.sidebar.find_identity(&name) {
+                        self.selected = idx;
+                    }
+                }
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                 let len = self.sidebar.len();
@@ -587,11 +1107,22 @@ impl AppState {
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            // Enter OR plain Right = attach the selected session.
-            (KeyCode::Enter, _) | (KeyCode::Right, KeyModifiers::NONE) => {
+            // Enter = attach the selected session.
+            (KeyCode::Enter, _) => {
                 if let Some(s) = self.selected_session() {
                     self.pending_attach = Some(s.name().to_string());
                 }
+            }
+            // Plain Right / Left = cycle the active tab within the
+            // current container (no-op when the container has a
+            // single tab). Previously Right also attached, but that
+            // collided with "I'm pressing arrow keys to navigate"
+            // muscle memory — Enter stays as the explicit attach.
+            (KeyCode::Right, KeyModifiers::NONE) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Left, KeyModifiers::NONE) => {
+                self.cycle_active_tab(-1, out);
             }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 out.push(Command::ListNow);
@@ -715,10 +1246,57 @@ impl AppState {
                     }
                 }
             }
+            // `m`: modify the selected live session's stored spec.
+            // Opens the new-session modal in modify mode, pre-filled
+            // from the session's persisted `@bosun_*` metadata so the
+            // user can adjust flags (e.g. add `--resume`), rename,
+            // change path, or switch agent. Save only — the running
+            // pane keeps its current agent; the next `R` picks up
+            // the new spec.
+            //
+            // The pre-fill is async (tmux read), so we just emit the
+            // open command here; the actor responds with
+            // `AppMsg::ModifySpecReady` and the app loop opens the
+            // modal from that. No-op on a section header or a dead
+            // row (no live spec to read).
+            (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                if let Some(sel) = self.selected_session() {
+                    out.push(Command::OpenModifySession {
+                        internal: sel.name().to_string(),
+                    });
+                }
+            }
             (KeyCode::Char('n'), KeyModifiers::NONE)
                 if self.modals.top_id() != Some("new_session") =>
             {
                 self.pending_modal = Some(ModalRequest::NewSession);
+            }
+            // Ctrl+T: add a tab to the currently-selected container.
+            // Opens the new-session modal in add-tab mode (path
+            // locked to the container's). No-op on a section header
+            // or when no container is selected. Active path picks
+            // the container's existing path; the new tmux session
+            // joins the container via `@bosun_container_id`.
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                self.request_add_tab();
+            }
+            // `]` / `[`: cycle the active tab within the selected
+            // container, wrapping at the ends. No-op for single-tab
+            // containers or section headers — the existing cursor
+            // movement keys handle cross-container navigation.
+            (KeyCode::Char(']'), KeyModifiers::NONE) => {
+                self.cycle_active_tab(1, out);
+            }
+            (KeyCode::Char('['), KeyModifiers::NONE) => {
+                self.cycle_active_tab(-1, out);
+            }
+            // Shift+D: kill the whole container — every tab plus
+            // the container itself. Distinct from plain `d` which
+            // only kills the active tab (and removes the container
+            // only when the last tab is gone). Mirrors how
+            // delete-section already works on headers.
+            (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
+                self.request_kill_container(out);
             }
             (KeyCode::Char('g'), KeyModifiers::NONE) if self.modals.top_id() != Some("section") => {
                 self.pending_modal = Some(ModalRequest::Section { editing: None });
@@ -726,6 +1304,9 @@ impl AppState {
             (KeyCode::Char('t'), KeyModifiers::NONE) if self.modals.top_id() != Some("theme") => {
                 self.pending_modal = Some(ModalRequest::Theme);
             }
+            // (The `s` toggle was removed in v2.0.2 — single-window
+            // focused mode is now the only behavior. `Enter` always
+            // opens the session in the embed.)
             // `/` opens the type-ahead session picker. Mirrors fzf/
             // vim's convention for "start a filter". The app loop
             // populates it with the current managed sessions.
@@ -934,7 +1515,7 @@ impl AppState {
             }
         }
         self.save_sidebar(out);
-        if self.update_history_for(&moved) {
+        if self.update_history_for(&moved.active) {
             self.save_session_history(out);
         }
     }
@@ -973,7 +1554,7 @@ impl AppState {
         };
         if let Some(name) = moved {
             self.save_sidebar(out);
-            if self.update_history_for(&name) {
+            if self.update_history_for(&name.active) {
                 self.save_session_history(out);
             }
         }
@@ -1010,7 +1591,7 @@ impl AppState {
         };
         if let Some(name) = moved {
             self.save_sidebar(out);
-            if self.update_history_for(&name) {
+            if self.update_history_for(&name.active) {
                 self.save_session_history(out);
             }
         }
@@ -1084,13 +1665,42 @@ impl AppState {
             return;
         }
         let area = Rect::new(0, 0, self.term_size.0, self.term_size.1);
-        let layouts = layout::compute(area, self.divider_x);
+        // `handle_mouse` only runs for events that fall through the
+        // focused-embed forwarding in `App::run` — i.e. clicks on the
+        // sidebar/divider/statusbar while *not* driving the embed. The
+        // collapsed-sidebar layout only applies while focused, so a
+        // non-collapsed split is always the right basis here.
+        let layouts = layout::compute(area, self.divider_x, false);
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Left)
                 if layout::is_divider_col(&layouts, m.column) =>
             {
                 self.dragging_divider = true;
+            }
+            // Click on a session-list row: jump the selection straight
+            // there. Modal-open is filtered by `point_in_list` so a
+            // click in the dimmed list underneath a confirm dialog
+            // doesn't silently move the cursor.
+            MouseEventKind::Down(MouseButton::Left) if self.point_in_list(&layouts, m) => {
+                // Click rows are resolved against the same rect the
+                // renderer drew into — in single-window mode that's
+                // the inset content rect (1 cell padded for the
+                // focus border), not the full `layouts.list`.
+                let content_rect = if self.single_window_mode {
+                    let p = layouts.list;
+                    if p.width >= 2 && p.height >= 2 {
+                        ratatui::layout::Rect::new(p.x + 1, p.y + 1, p.width - 2, p.height - 2)
+                    } else {
+                        p
+                    }
+                } else {
+                    layouts.list
+                };
+                if let Some(idx) = crate::ui::session_list::entry_at_row(self, content_rect, m.row)
+                {
+                    self.selected = idx;
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
                 // Raw column — `layout::compute` clamps it to the
@@ -1171,13 +1781,65 @@ pub struct App {
     /// the user ends up needing to press Ctrl-Q twice because the
     /// first press is read by Bosun and silently dropped.
     input_handle: Option<input_actor::Handle>,
-    /// Tmux client. The tmux actor owns the primary copy (it's the
-    /// single owner of all timed/notification-driven tmux work) but
-    /// we keep one here for the rare cases when the app task itself
-    /// needs to make a synchronous tmux call — currently just the
-    /// post-detach `capture_pane` snap (v0.4.1+) that eliminates the
-    /// "preview catching up" blink between detach and the first
-    /// async `Command::ListNow` round-trip.
+    /// Embedded terminal for the focused session's preview (2.0+).
+    /// `None` when no session is focused, when the user has opted
+    /// out via `embed_enabled = false`, or when the embed spawn
+    /// failed (in which case the preview path falls back to the
+    /// v0.4 polled snapshot — bosun stays useful even if PTY/tmux
+    /// negotiation hits an edge case).
+    embed: Option<crate::ui::embed_terminal::EmbedTerminal>,
+    /// Sticky copy of `Config::embed_enabled`. `App::sync_embed`
+    /// reads this on every iteration to decide whether to spawn.
+    embed_enabled: bool,
+    /// Step 4 focus mode (2.0+). When true, the embed is running
+    /// in `AttachMode::Focused` (real attach, ignore-size) and the
+    /// app loop routes all `AppMsg::Key` events straight into the
+    /// embed's PTY writer instead of bosun's reducer. Ctrl-Q is
+    /// intercepted to exit focus.
+    embed_focused: bool,
+    /// Set when a modal was opened from focused mode (today: the
+    /// add-tab modal triggered by `Ctrl+T` or clicking `+` while
+    /// the embed has focus). Causes the run loop to auto-detach
+    /// the embed on modal open so the user can type into the
+    /// modal, and to re-attach on modal close (landing on the new
+    /// tab if a `CreateSession` went through — `sync_embed`
+    /// follows the active-tab change once `SessionsRefreshed`
+    /// reconciles).
+    restore_focus_after_modal: bool,
+    /// Whether bosun successfully pushed the kitty keyboard
+    /// progressive-enhancement flags onto the outer terminal at
+    /// startup (gated on `supports_keyboard_enhancement`). When
+    /// true, the terminal reports modifiers unambiguously — so
+    /// Option+Delete arrives as `Alt+Backspace` and `Shift+Up/Down`
+    /// as modified arrows rather than bare keys. Used to know
+    /// whether to pop/re-push the flags around a full-screen
+    /// `tmux attach` (which owns the tty for its duration).
+    pub kbd_enhanced: bool,
+    /// Default fg/bg/cursor colors probed from the outer terminal at
+    /// startup (issue #2). Passed to each embed so it can answer the
+    /// OSC 10/11/12 queries inner apps (Codex, Neovim) use to detect a
+    /// light vs dark background. Any slot the terminal didn't report
+    /// falls back to the active theme's colors at spawn time.
+    pub term_colors: crate::terminal_query::TermColors,
+    /// Whether the outer terminal currently has focus, tracked from
+    /// the `FocusGained`/`FocusLost` events. Initialized `true`
+    /// (bosun launches focused). This guards `recover_display`: a
+    /// full recovery only runs on a genuine lost→gained transition.
+    /// Without the guard, Ghostty (and other terminals that report
+    /// the current focus state when focus reporting is *enabled*)
+    /// loop forever — `recover_display` re-issues `EnableFocusChange`
+    /// (`ESC[?1004h`), the terminal answers with another
+    /// `FocusGained`, which re-enters recovery, and so on. The result
+    /// is fast full-screen flicker. iTerm2 doesn't echo focus on
+    /// enable, so it never tripped this.
+    has_focus: bool,
+    /// Tmux client. The tmux actor owns the primary copy and runs
+    /// all timed / notification-driven tmux work; we keep this
+    /// secondary handle so the app task itself can do synchronous
+    /// `capture_pane` calls — currently used at embed spawn to
+    /// prime the parser with the session's current screen, and at
+    /// detach exit (v0.4.1) to snap the polled preview to current
+    /// state before the next draw.
     client: Arc<dyn TmuxClient>,
 }
 
@@ -1228,6 +1890,8 @@ impl App {
             session_prefix: config.session_prefix.clone(),
             editor: config.editor.clone(),
             recents,
+            single_window_mode: config.single_window_mode,
+            sidebar_hidden: config.sidebar_hidden,
             ..Default::default()
         };
 
@@ -1240,6 +1904,13 @@ impl App {
             store,
             theme,
             input_handle: Some(input_handle),
+            embed: None,
+            embed_enabled: config.embed_enabled,
+            embed_focused: false,
+            restore_focus_after_modal: false,
+            kbd_enhanced: false,
+            term_colors: crate::terminal_query::TermColors::default(),
+            has_focus: true,
             client,
         }
     }
@@ -1264,7 +1935,15 @@ impl App {
         }
 
         terminal
-            .draw(|f| ui::draw(f, &self.state, &self.theme))
+            .draw(|f| {
+                ui::draw(
+                    f,
+                    &self.state,
+                    &self.theme,
+                    self.embed.as_ref(),
+                    self.embed_focused,
+                )
+            })
             .map_err(term_err)?;
 
         while !self.state.quit {
@@ -1272,6 +1951,502 @@ impl App {
                 Some(m) => m,
                 None => break,
             };
+
+            // Terminal lost focus — just record it. The next genuine
+            // focus gain is what triggers recovery.
+            if matches!(msg, AppMsg::FocusLost) {
+                self.has_focus = false;
+                continue;
+            }
+
+            // Terminal regained focus — most commonly after iTerm's
+            // Cmd+R "reset" wiped the screen and dropped alt screen +
+            // our terminal modes. Re-establish everything and force a
+            // full repaint so the user isn't left staring at a blank
+            // or half-painted pane.
+            //
+            // Guard on a real lost→gained transition. Terminals like
+            // Ghostty report the current focus state whenever focus
+            // reporting is *enabled*, and `recover_display` re-enables
+            // it (`ESC[?1004h`) — so an unguarded recovery loops
+            // forever (recover → terminal echoes FocusGained →
+            // recover → …), which shows up as fast full-screen
+            // flicker. If we already believe we're focused, this is
+            // that echo: swallow it. Set the flag *before* recovering
+            // so the echo it provokes is recognized as a no-op.
+            if matches!(msg, AppMsg::FocusGained) {
+                if self.has_focus {
+                    continue;
+                }
+                self.has_focus = true;
+                self.recover_display(terminal);
+                terminal
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
+                    .map_err(term_err)?;
+                continue;
+            }
+
+            // Tab-strip click handling runs *before* the focus
+            // branch so clicks on a tab or the `+` button are
+            // recognized regardless of whether the embed is focused.
+            // The strip lives in the row above the embed, outside
+            // `embed_rect`, so it never collides with mouse
+            // forwarding into the inner app. Click on a tab →
+            // switch active tab + persist; click on `+` → queue
+            // the add-tab modal. Both swallow the event.
+            if let AppMsg::Mouse(m) = &msg {
+                use crossterm::event::{MouseButton, MouseEventKind};
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.state.dragging_divider
+                    && self.state.modals.is_empty()
+                {
+                    if let Some(strip) = self.tab_strip_rect() {
+                        if point_in_rect(strip, m.column, m.row) {
+                            let mut out = Vec::new();
+                            self.state
+                                .handle_tab_strip_click(strip, m.column, m.row, &mut out);
+                            for cmd in out {
+                                let _ = self.cmd_tx.send(cmd);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Step 4 focus mode: while the embed is focused, all
+            // `AppMsg::Key` events go directly into the embed's PTY
+            // writer instead of bosun's reducer. Ctrl-Q is the
+            // exit-focus chord (mirrors the existing tmux-attach
+            // detach key). Non-key AppMsgs (Resize, refresh,
+            // EmbedBytes, etc.) still flow through the normal paths
+            // so layout / state stay current.
+            if self.embed_focused {
+                if let AppMsg::Key(k) = &msg {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    // Optional key-event tracing for diagnosing how the
+                    // outer terminal encodes chords (modifiers stripped,
+                    // chords swallowed, etc). Off unless `BOSUN_KEYLOG`
+                    // is set; appends to /tmp/bosun-keys.log. Cheap at
+                    // human typing rates and invaluable when a terminal
+                    // mangles a binding (see iTerm2's Natural Text
+                    // Editing preset eating Shift+Up/Down).
+                    if std::env::var_os("BOSUN_KEYLOG").is_some() {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/bosun-keys.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "code={:?} mods={:?} kind={:?}",
+                                k.code, k.modifiers, k.kind
+                            );
+                        }
+                    }
+                    let is_ctrl_q = matches!(k.code, KeyCode::Char('q'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Ctrl+B toggles the sticky hide-sidebar preference.
+                    // Only reachable while focused, so it always means
+                    // "(un)hide the sidebar around the session I'm
+                    // driving". Intercepted before the embed write so
+                    // the inner app never sees it.
+                    let is_ctrl_b = matches!(k.code, KeyCode::Char('b'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Ctrl+L recovers bosun's display *and* still gets
+                    // forwarded to the inner shell below (it falls
+                    // through to the encode/write arm), so the shell's
+                    // own clear-screen runs too. Without the intercept
+                    // Ctrl+L cleared only the shell while bosun's
+                    // chrome stayed in its post-Cmd+R broken state.
+                    if matches!(k.code, KeyCode::Char('l'))
+                        && k.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.state.force_redraw = true;
+                    }
+                    // In-focus navigation chords:
+                    //   * Shift+Left  / Shift+Right → cycle the
+                    //     active *tab* within the current container,
+                    //     respawning the embed on the new active tab.
+                    //   * Shift+Up    / Shift+Down  → cycle the
+                    //     focused *session* in sidebar order (the
+                    //     pre-tabs cross-container navigation; moved
+                    //     here so left/right is free for tabs).
+                    // bosun intercepts the chord before the embed
+                    // write so the inner app never sees it.
+                    //
+                    // Matching is `.contains(SHIFT)`, not an exact
+                    // modifier compare, on purpose: it also accepts
+                    // Ctrl+Shift+arrow as an equivalent. That matters
+                    // because iTerm2 strips the Shift bit from the
+                    // *vertical* arrows (Shift+Up/Down arrive bare)
+                    // but preserves it on Ctrl+Shift+Up/Down — so
+                    // iTerm2 users cycle sessions with Ctrl+Shift+
+                    // Up/Down while terminals that deliver a clean
+                    // Shift+Up/Down (Ghostty, kitty, WezTerm) keep the
+                    // simpler chord. Both map to the same action.
+                    let is_shift_left = matches!(k.code, KeyCode::Left)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_right = matches!(k.code, KeyCode::Right)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_up =
+                        matches!(k.code, KeyCode::Up) && k.modifiers.contains(KeyModifiers::SHIFT);
+                    let is_shift_down = matches!(k.code, KeyCode::Down)
+                        && k.modifiers.contains(KeyModifiers::SHIFT);
+                    if is_ctrl_q {
+                        self.exit_focus().await;
+                    } else if is_ctrl_b {
+                        // Flip + persist the preference, then respawn
+                        // the embed at its new dimensions (the body
+                        // width jumps by the whole sidebar column) and
+                        // force a clean repaint so no stale sidebar
+                        // cells linger where the embed now lives.
+                        self.state.sidebar_hidden = !self.state.sidebar_hidden;
+                        if let Err(e) =
+                            crate::config::write_sidebar_hidden(self.state.sidebar_hidden)
+                        {
+                            self.state.warning = Some(format!("sidebar: save failed: {e}"));
+                        }
+                        if let Some(name) = self.state.selected_session_name() {
+                            if let Err(e) = self
+                                .respawn_embed(
+                                    &name,
+                                    crate::ui::embed_terminal::AttachMode::Focused,
+                                )
+                                .await
+                            {
+                                tracing::warn!("sidebar toggle respawn: {}", e);
+                                self.state.warning = Some(format!("sidebar: {e}"));
+                            }
+                        }
+                        let _ = terminal.clear();
+                        terminal
+                            .draw(|f| {
+                                ui::draw(
+                                    f,
+                                    &self.state,
+                                    &self.theme,
+                                    self.embed.as_ref(),
+                                    self.embed_focused,
+                                )
+                            })
+                            .map_err(term_err)?;
+                        continue;
+                    } else if is_shift_left || is_shift_right {
+                        // Tab cycle within the current container.
+                        let prev = self.state.selected_session_name();
+                        let mut out_cmds: Vec<Command> = Vec::new();
+                        self.state
+                            .cycle_active_tab(if is_shift_right { 1 } else { -1 }, &mut out_cmds);
+                        for cmd in out_cmds {
+                            let _ = self.cmd_tx.send(cmd);
+                        }
+                        let next = self.state.selected_session_name();
+                        if next != prev {
+                            if let Some(name) = next {
+                                if let Err(e) = self
+                                    .respawn_embed(
+                                        &name,
+                                        crate::ui::embed_terminal::AttachMode::Focused,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("tab respawn: {}", e);
+                                    self.state.warning = Some(format!("tab: {e}"));
+                                }
+                            }
+                        }
+                    } else if is_shift_up || is_shift_down {
+                        // Session cycle in sidebar order (moved off
+                        // Shift+Left/Right so tabs own that chord).
+                        let cur = self.state.selected_session_name();
+                        let target = if is_shift_down {
+                            self.state.cycle_next(cur.as_deref())
+                        } else {
+                            self.state.cycle_prev(cur.as_deref())
+                        };
+                        if let Some(name) = target {
+                            if Some(name.as_str()) != cur.as_deref() {
+                                if let Some(idx) = self.state.sidebar.find_identity(&name) {
+                                    self.state.selected = idx;
+                                }
+                                if let Err(e) = self
+                                    .respawn_embed(
+                                        &name,
+                                        crate::ui::embed_terminal::AttachMode::Focused,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("cycle respawn: {}", e);
+                                    self.state.warning = Some(format!("cycle: {e}"));
+                                }
+                            }
+                        }
+                    } else {
+                        let ctx = crate::ui::key_encode::EncodeContext {
+                            application_cursor: self
+                                .embed
+                                .as_ref()
+                                .is_some_and(|e| e.application_cursor()),
+                        };
+                        if let Some(bytes) = crate::ui::key_encode::encode(*k, ctx) {
+                            if let Some(embed) = self.embed.as_mut() {
+                                if let Err(e) = embed.write(&bytes) {
+                                    tracing::warn!("embed write: {}", e);
+                                    self.state.warning = Some(format!("focus: write failed: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    // Ctrl+L (above) requested a recovery repaint —
+                    // do it now rather than waiting on the inner
+                    // shell's echo, so bosun's chrome snaps back
+                    // immediately even if the shell produces no output.
+                    if self.state.force_redraw {
+                        self.recover_display(terminal);
+                        self.state.force_redraw = false;
+                        terminal
+                            .draw(|f| {
+                                ui::draw(
+                                    f,
+                                    &self.state,
+                                    &self.theme,
+                                    self.embed.as_ref(),
+                                    self.embed_focused,
+                                )
+                            })
+                            .map_err(term_err)?;
+                    }
+                    // Don't draw here — the next EmbedBytes chunk
+                    // from the agent's echo / response will trigger
+                    // the redraw. If the keystroke produces no echo
+                    // (unusual), the screen is unchanged anyway.
+                    continue;
+                }
+                if let AppMsg::Paste(text) = &msg {
+                    // Wrap in bracketed-paste markers so apps that
+                    // opted in (most modern shells, vim, Claude
+                    // Code, etc.) treat the whole block as a paste
+                    // rather than executing line-by-line. Outer
+                    // terminals deliver drag-dropped file paths
+                    // and image markers via this same path, so
+                    // this is also "I dropped an image onto bosun"
+                    // working correctly.
+                    if let Some(embed) = self.embed.as_mut() {
+                        let mut buf = Vec::with_capacity(text.len() + b"\x1b[200~\x1b[201~".len());
+                        buf.extend_from_slice(b"\x1b[200~");
+                        buf.extend_from_slice(text.as_bytes());
+                        buf.extend_from_slice(b"\x1b[201~");
+                        if let Err(e) = embed.write(&buf) {
+                            tracing::warn!("embed paste write: {}", e);
+                        }
+                    }
+                    continue;
+                }
+                if let AppMsg::Mouse(m) = &msg {
+                    // Click outside the embed area while focused =
+                    // "click out": auto-exit focus so the sidebar
+                    // takes the focus border and keystrokes return
+                    // to bosun's reducer. Mirrors the desktop habit
+                    // of clicking out of a text field to defocus.
+                    // Falls through to the normal mouse pipeline
+                    // (handle_mouse) so the same click can still
+                    // update the list selection or start a divider
+                    // drag — the user gets both effects from one
+                    // gesture, no second click required.
+                    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                        && !self.state.dragging_divider
+                        && self.state.modals.is_empty()
+                    {
+                        let in_preview = self
+                            .preview_rect()
+                            .map(|a| point_in_rect(a, m.column, m.row))
+                            .unwrap_or(false);
+                        if !in_preview {
+                            self.exit_focus().await;
+                        }
+                    }
+                    // Forward mouse events to the PTY only when:
+                    //   (a) the inner app has enabled mouse tracking
+                    //       (otherwise we'd dump SGR-1006 escape
+                    //       bytes into a shell that interprets them
+                    //       as literal text),
+                    //   (b) the event lands inside the preview /
+                    //       embed rectangle (mouse over the sidebar
+                    //       or status bar still goes to bosun for
+                    //       divider drag etc), and
+                    //   (c) the user isn't currently mid-drag on the
+                    //       divider — once a divider drag is in
+                    //       progress, every Drag/Up event must reach
+                    //       `handle_mouse` so divider_x tracks the
+                    //       cursor and Up ends the drag, even when
+                    //       the cursor crosses into the preview
+                    //       pane. Without this, dragging the divider
+                    //       rightward (toward the preview) silently
+                    //       feeds drag events to the inner app
+                    //       (which has mouse tracking on) and the
+                    //       divider stops moving the moment the
+                    //       cursor leaves the list side.
+                    // Coordinates are translated to embed-local
+                    // 0-based; the encoder converts to the 1-based
+                    // form SGR 1006 expects.
+                    let wants = self.embed.as_ref().is_some_and(|e| e.wants_mouse());
+                    if wants && !self.state.dragging_divider {
+                        // `embed_rect` (not `preview_rect`) — the PTY
+                        // is sized for the inner area in single-
+                        // window mode and the inner app's terminal
+                        // grid starts at (1,1) within the preview
+                        // rect. Using the outer rect here put every
+                        // click/drag one row + one column past where
+                        // the user actually clicked.
+                        if let Some(area) = self.embed_rect() {
+                            if point_in_rect(area, m.column, m.row) {
+                                let local_col = m.column - area.x;
+                                let local_row = m.row - area.y;
+                                if let Some(bytes) =
+                                    crate::ui::mouse_encode::encode(*m, local_col, local_row)
+                                {
+                                    if let Some(embed) = self.embed.as_mut() {
+                                        if let Err(e) = embed.write(&bytes) {
+                                            tracing::warn!("embed mouse write: {}", e);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Mouse outside the embed area (or app doesn't
+                    // want mouse, or divider drag in progress): fall
+                    // through to bosun's normal handler so divider
+                    // drag etc. still works even while focused.
+                }
+            } else if let AppMsg::Mouse(m) = &msg {
+                // Click inside the preview while unfocused = "click
+                // in": enter focus on the currently selected session
+                // — the mirror of the click-out handler above. Lets
+                // the user move between sidebar and embed entirely
+                // with the mouse (sidebar click → defocus + select,
+                // preview click → enter focus). The triggering click
+                // itself isn't forwarded into the embed; subsequent
+                // clicks under the new Focused mode are.
+                //
+                // Gated on `!modals.is_empty()` so a stray click that
+                // lands in the preview pane while the add-tab /
+                // new-session modal is open doesn't activate the
+                // background pane (which left the modal looking dim
+                // and unrecoverable from the keyboard).
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.state.dragging_divider
+                    && self.state.modals.is_empty()
+                {
+                    let in_preview = self
+                        .preview_rect()
+                        .map(|a| point_in_rect(a, m.column, m.row))
+                        .unwrap_or(false);
+                    if in_preview {
+                        self.enter_focus().await;
+                    }
+                }
+            }
+
+            // Fast path for embed PTY bytes. The reducer is pure and
+            // AppState doesn't own the embed (it's runtime state on
+            // the App struct), so we feed bytes here instead of
+            // routing through `apply()`. Stale chunks from a previous
+            // embed (session was switched between read and delivery)
+            // are silently dropped. Render still happens at the
+            // bottom of the branch so the new vt100 grid state shows
+            // up on screen.
+            //
+            // Burst coalescing: when this chunk is the first of many
+            // (tmux attach -r's initial pane repaint, a `cargo build`
+            // flood, a Claude response that arrives in 20 chunks),
+            // draining the rest of the queue into the parser before
+            // drawing collapses the burst into one repaint instead
+            // of N. Without coalescing the user sees the burst
+            // animate over a couple of seconds; with it the final
+            // screen state appears in a single frame. Non-embed
+            // messages encountered during the drain are preserved
+            // and re-sent so the normal flow handles them on the
+            // next iteration.
+            // Modify-session: the actor has finished the JIT
+            // metadata read; open the new-session modal in modify
+            // mode pre-filled from `spec`. Lives here (not in
+            // `apply`) because the modal needs the recents store
+            // (owned by `App`) for its Ctrl+R picker, and an
+            // explicit redraw afterward so the modal renders this
+            // frame instead of waiting for the next event.
+            if let AppMsg::ModifySpecReady { internal, spec } = msg {
+                let recents = self.store.list_recents(50).unwrap_or_default();
+                self.state.modals.push(Box::new(
+                    crate::ui::modal::new_session::NewSessionModal::for_modify(
+                        internal, spec, recents,
+                    ),
+                ));
+                terminal
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
+                    .map_err(term_err)?;
+                continue;
+            }
+
+            if let AppMsg::EmbedBytes { session, bytes } = msg {
+                if let Some(embed) = self.embed.as_mut() {
+                    if embed.session() == session {
+                        embed.feed(&bytes);
+                    }
+                }
+                let mut preserved: Vec<AppMsg> = Vec::new();
+                use tokio::sync::mpsc::error::TryRecvError;
+                loop {
+                    match self.evt_rx.try_recv() {
+                        Ok(AppMsg::EmbedBytes {
+                            session: s2,
+                            bytes: b2,
+                        }) => {
+                            if let Some(embed) = self.embed.as_mut() {
+                                if embed.session() == s2 {
+                                    embed.feed(&b2);
+                                }
+                            }
+                        }
+                        Ok(other) => preserved.push(other),
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for m in preserved {
+                    let _ = self.evt_tx.send(m);
+                }
+                terminal
+                    .draw(|f| {
+                        ui::draw(
+                            f,
+                            &self.state,
+                            &self.theme,
+                            self.embed.as_ref(),
+                            self.embed_focused,
+                        )
+                    })
+                    .map_err(term_err)?;
+                continue;
+            }
 
             // Intercept UI-only commands here before anything reaches
             // the tmux actor. Some commands (InsertSection, RenameSection)
@@ -1411,12 +2586,96 @@ impl App {
                     ModalRequest::Help => {
                         self.state.modals.push(Box::new(HelpModal::new()));
                     }
+                    ModalRequest::AddTab {
+                        container_id,
+                        container_name: _,
+                        container_path,
+                    } => {
+                        // If the modal opens from focused mode
+                        // (user pressed `Ctrl+T` or clicked `+` while
+                        // attached), auto-detach so keyboard input
+                        // reaches the modal — otherwise the user
+                        // ends up typing into the inner tmux pane
+                        // and the modal looks ignored. Remember the
+                        // focus state so we can restore it once the
+                        // modal closes; `sync_embed` then follows the
+                        // active-tab change after `SessionsRefreshed`
+                        // hands us the new tab.
+                        if self.embed_focused {
+                            self.exit_focus().await;
+                            self.restore_focus_after_modal = true;
+                        }
+                        let recents = self.store.list_recents(50).unwrap_or_default();
+                        self.state
+                            .modals
+                            .push(Box::new(NewSessionModal::for_add_tab(
+                                container_id,
+                                container_path,
+                                recents,
+                            )));
+                    }
                 }
             }
 
-            // If the reducer queued an attach, perform it now: tear down the
-            // terminal, hand the tty to tmux, install/remove the Ctrl-Q binding.
+            // Add-tab modal closed (Esc or submit): if it was opened
+            // from focused mode, re-enter focus on the currently-
+            // active tab. On submit the active tab is still the old
+            // one at this point — `SessionsRefreshed` from the
+            // freshly-created tmux session arrives later and
+            // `sync_embed` follows the active-tab change, respawning
+            // the embed in `Focused` mode (since `embed_focused` is
+            // back on by then).
+            if self.restore_focus_after_modal && self.state.modals.is_empty() {
+                self.restore_focus_after_modal = false;
+                if self.state.selected_session_name().is_some() {
+                    self.enter_focus().await;
+                }
+            }
+
+            // If the reducer queued an attach, perform it now.
+            //
+            // Two paths depending on `single_window_mode`:
+            //
+            // - OFF (default): tear down the terminal, hand the tty
+            //   to tmux, run a full-screen `tmux attach`. Sidebar
+            //   disappears until the user detaches with Ctrl-Q.
+            //   Matches v0.4 behavior.
+            // - ON: route through `enter_focus`, which respawns the
+            //   preview-pane embed in writable mode. Sidebar stays
+            //   visible the whole time. The user's keys flow into
+            //   the session through bosun's PTY writer. Ctrl-Q
+            //   exits focus, same chord.
+            //
+            // The embed must be live (embed_enabled + spawn
+            // succeeded) for the single-window path to make sense.
+            // If it isn't, fall back to the full-screen path so
+            // `Enter` still has a useful behavior.
             if let Some(name) = self.state.pending_attach.take() {
+                let want_single_window = self.state.single_window_mode
+                    && self.embed_enabled
+                    && self
+                        .embed
+                        .as_ref()
+                        .map(|e| e.session() == name)
+                        .unwrap_or(false);
+                if want_single_window {
+                    self.enter_focus().await;
+                    terminal
+                        .draw(|f| {
+                            ui::draw(
+                                f,
+                                &self.state,
+                                &self.theme,
+                                self.embed.as_ref(),
+                                self.embed_focused,
+                            )
+                        })
+                        .map_err(term_err)?;
+                    continue;
+                }
+
+                // Full-screen path — same as v0.4.
+                //
                 // Stop the input actor so tmux has stdin to itself. Without
                 // this, Bosun's crossterm reader and tmux race for each key
                 // byte and the user has to press Ctrl-Q twice to detach.
@@ -1428,6 +2687,18 @@ impl App {
                 if let Some(h) = self.input_handle.take() {
                     h.shutdown().await;
                 }
+
+                // Drop the embed before handing the terminal to tmux.
+                // Two reasons: (1) the embed's reader thread would
+                // otherwise keep queueing EmbedBytes into evt_rx for
+                // the entire attach session — an attach to a busy
+                // pane could accumulate hundreds of MB in the channel
+                // before the user detaches. (2) On detach we want a
+                // clean reattach with the parser cleared, so the
+                // returning preview shows current state, not an
+                // out-of-date scrollback. `sync_embed` re-spawns
+                // automatically after the attach returns.
+                self.embed = None;
 
                 // Update the terminal title to reflect the attached session.
                 let display = self
@@ -1460,6 +2731,12 @@ impl App {
                 loop {
                     match self.evt_rx.try_recv() {
                         Ok(AppMsg::SessionsRefreshed { .. }) => {}
+                        // Bytes from the embed we just dropped (or
+                        // from the brief window before the reader
+                        // saw EOF) — silently discarded. The new
+                        // embed `sync_embed` spawns will have its
+                        // own clean parser.
+                        Ok(AppMsg::EmbedBytes { .. }) => {}
                         Ok(other) => preserved.push(other),
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
@@ -1469,46 +2746,36 @@ impl App {
                 }
 
                 attach_result?;
-
-                // Snap the focused session's preview to its current
-                // state *before* yielding back to the event loop, so
-                // the very first post-detach frame shows what the
-                // session looks like *now* — not a stale 200ms-old
-                // buffer that the fast tick happens to refresh a
-                // moment later. The user just left a full-screen
-                // tmux view of this same pane; the eye expects the
-                // preview to be a screenshot of the place it was
-                // *just* attached to, not a half-second-old recap.
-                //
-                // capture_pane is ~1-3ms on a normal pane, so the
-                // synchronous await is cheap; the trade is one tiny
-                // blocking hop for the disappearance of a visibly
-                // jarring "catching up" frame.
-                if let Some(focused) = self.state.selected_session_name() {
-                    match self.client.capture_pane(&focused).await {
-                        Ok(bytes) => {
-                            if let Some(view) =
-                                self.state.sessions.iter_mut().find(|v| v.name() == focused)
-                            {
-                                view.preview = Some(std::sync::Arc::from(bytes.into_boxed_slice()));
-                            }
-                        }
-                        Err(e) => {
-                            // Non-fatal — the async ListNow below
-                            // will pick up the right state within
-                            // a tick or two. Worst case the user
-                            // sees the same blink they used to see.
-                            tracing::debug!("post-detach capture_pane({focused}): {e}");
-                        }
-                    }
-                }
-
                 // After return, kick a refresh — the session may have been killed.
                 let _ = self.cmd_tx.send(Command::ListNow);
             }
 
+            // Reconcile the embed against the current selection
+            // (spawn / drop / resize on focus change or terminal
+            // resize). Runs once per AppMsg, which covers every
+            // selection-changing key + every Resize event. Awaits
+            // because spawn now primes the parser with a
+            // synchronous capture-pane snapshot.
+            self.sync_embed().await;
+
+            // Force-redraw requested (Ctrl+L in sidebar mode). Recover
+            // every terminal mode and invalidate ratatui's cached
+            // frame before the draw below paints in full.
+            if self.state.force_redraw {
+                self.recover_display(terminal);
+                self.state.force_redraw = false;
+            }
+
             terminal
-                .draw(|f| ui::draw(f, &self.state, &self.theme))
+                .draw(|f| {
+                    ui::draw(
+                        f,
+                        &self.state,
+                        &self.theme,
+                        self.embed.as_ref(),
+                        self.embed_focused,
+                    )
+                })
                 .map_err(term_err)?;
         }
 
@@ -1530,32 +2797,91 @@ impl App {
         Ok(())
     }
 
+    /// Re-establish every terminal mode and force a full repaint.
+    /// Called on `Ctrl+L` and on `FocusGained`, both of which are our
+    /// recovery hooks for iTerm's `Cmd+R` "reset" — it exits alt
+    /// screen, drops mouse/paste/focus reporting, and wipes the
+    /// kitty keyboard flags out from under us without telling
+    /// ratatui. Re-running the enable sequences is harmless when the
+    /// modes are already on (they're idempotent); the keyboard flags
+    /// are pop-then-pushed so a normal focus-gain doesn't grow the
+    /// terminal's enhancement stack while a post-reset gain still
+    /// restores them. The final `clear()` invalidates ratatui's
+    /// cached frame so the next draw paints in full against the now
+    /// blank terminal.
+    fn recover_display<B: ratatui::backend::Backend + std::io::Write>(
+        &self,
+        terminal: &mut Terminal<B>,
+    ) {
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange,
+        );
+        if self.kbd_enhanced {
+            let _ = execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+            );
+        }
+        let _ = terminal.clear();
+    }
+
     fn perform_attach<B: ratatui::backend::Backend + std::io::Write>(
         &mut self,
         terminal: &mut Terminal<B>,
         name: &str,
     ) -> Result<()> {
         // 1. Tear down ratatui's grip on the terminal so tmux can own it.
+        //    Pop the kitty keyboard flags first (if we pushed them) so
+        //    tmux negotiates the protocol from a clean slate — leaving
+        //    them on the stack would let our enhancement leak into the
+        //    attached session's key reporting.
+        if self.kbd_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+            )
+            .map_err(BosunError::Io)?;
+        }
         crossterm::terminal::disable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
         )
         .map_err(BosunError::Io)?;
 
         // 2. Install binding + run attach (blocking).
         let result = attach_with_ctrl_q_detach(self.socket.as_deref(), name);
 
-        // 3. Re-enter raw mode / alt screen / mouse capture
-        //    regardless of attach result.
+        // 3. Re-enter raw mode / alt screen / mouse capture /
+        //    bracketed paste regardless of attach result, then
+        //    re-push the keyboard flags so modifier reporting is
+        //    restored for the returning TUI.
         crossterm::terminal::enable_raw_mode().map_err(BosunError::Io)?;
         execute!(
             terminal.backend_mut(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste,
         )
         .map_err(BosunError::Io)?;
+        if self.kbd_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+            )
+            .map_err(BosunError::Io)?;
+        }
         terminal.clear().map_err(term_err)?;
 
         if let Err(e) = result {
@@ -1563,6 +2889,383 @@ impl App {
         }
         Ok(())
     }
+
+    /// Reconcile the embed against the current selection. Called
+    /// once per main-loop iteration after `apply()` returns, plus
+    /// just after `perform_attach` returns. Decisions:
+    /// - `embed_enabled == false` → no embed, drop any current one.
+    /// - cursor not on a live session → no embed.
+    /// - cursor on the same session as the current embed → resize
+    ///   to the current preview area dims (idempotent if unchanged).
+    /// - cursor on a different live session → drop old, spawn new.
+    ///
+    /// Spawn failure is logged and surfaced as a status-bar warning
+    /// but is non-fatal — the preview falls back to the v0.4 polled
+    /// snapshot path automatically (it's still drawn from
+    /// `SessionView.preview`, which the fast-tick keeps populated).
+    async fn sync_embed(&mut self) {
+        if !self.embed_enabled {
+            if self.embed.is_some() {
+                self.embed = None;
+            }
+            return;
+        }
+
+        // `selected_session()` returns Some only when the cursor is
+        // on a row that maps to a live SessionView — dead rows,
+        // section headers, and the empty state all yield None,
+        // which is the right "no embed" answer.
+        let target = self.state.selected_session().map(|v| v.name().to_string());
+        let current = self.embed.as_ref().map(|e| e.session().to_string());
+
+        if target != current {
+            self.embed = None;
+            if let Some(t) = target {
+                let (rows, cols) = self.preview_dims();
+                // Synchronously snapshot the session's current pane
+                // before spawning the embed, then prime the parser
+                // with those bytes. Without this, the parser would
+                // start blank and tmux's `attach -r` would stream
+                // its initial repaint of the existing pane content
+                // — the user sees that repaint render top-to-bottom
+                // over a couple of seconds (visible "scrollback
+                // replay" animation). Priming makes the very first
+                // post-switch frame show the current state. Any
+                // intermediate redraws caused by tmux's repaint
+                // bytes resolve to the same final screen, so the
+                // animation is invisible.
+                let snapshot = match self.client.capture_pane(&t).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::debug!("embed prime capture-pane({t}): {e}");
+                        None
+                    }
+                };
+                // sync_embed always spawns in Preview mode. Focus
+                // entry/exit (Step 4) is handled separately by
+                // `App::set_embed_focus`, which respawns with
+                // `AttachMode::Focused` while preserving the
+                // currently-focused session.
+                // Spawn in the mode that matches the user's intent:
+                // Focused when the embed currently has keyboard
+                // focus (e.g. the user was attached and the active
+                // tab just changed under them via add-tab landing
+                // or `]` / `[` from sidebar mode); Preview otherwise.
+                let mode = if self.embed_focused {
+                    crate::ui::embed_terminal::AttachMode::Focused
+                } else {
+                    crate::ui::embed_terminal::AttachMode::Preview
+                };
+                match crate::ui::embed_terminal::EmbedTerminal::spawn(
+                    self.socket.as_deref(),
+                    &t,
+                    rows,
+                    cols,
+                    mode,
+                    snapshot.as_deref(),
+                    self.embed_default_colors(),
+                    self.evt_tx.clone(),
+                ) {
+                    Ok(e) => self.embed = Some(e),
+                    Err(err) => {
+                        tracing::warn!("embed spawn failed for {}: {}", t, err);
+                        self.state.warning = Some(format!("embed: {err}"));
+                    }
+                }
+            }
+            return;
+        }
+
+        // Same embed; ensure it's sized to the current preview area.
+        // resize() short-circuits if dims are unchanged so this is
+        // free on the steady-state path. Compute dims first so we
+        // don't borrow self both mutably and immutably.
+        let (rows, cols) = self.preview_dims();
+        if let Some(embed) = self.embed.as_mut() {
+            embed.resize(rows, cols);
+        }
+    }
+
+    /// Switch the embed for the currently-selected session into
+    /// `AttachMode::Focused`. Idempotent if already focused; no-op
+    /// if there's no embed (focus has nothing to grab) or no live
+    /// session under the cursor. Captures a fresh snapshot before
+    /// the respawn so the focused embed's first frame is the same
+    /// stable view the user just had in preview mode.
+    async fn enter_focus(&mut self) {
+        if self.embed_focused {
+            return;
+        }
+        let Some(session) = self.state.selected_session().map(|v| v.name().to_string()) else {
+            return;
+        };
+        if self.embed.is_none() {
+            // Without an embed (embed_enabled=false, or spawn
+            // failed), focus mode has nothing to attach to.
+            return;
+        }
+        // Flip the focus flag *before* the respawn so `preview_dims`
+        // (called inside `respawn_embed`) returns the shrunk
+        // dimensions that account for the focus border that's about
+        // to appear. If we did this after, the new PTY would be
+        // sized to the full preview rect and the inner app would
+        // wrap lines into the cells the border is about to claim —
+        // the same "Here's → ere's" clipping we're trying to fix.
+        self.embed_focused = true;
+        if let Err(e) = self
+            .respawn_embed(&session, crate::ui::embed_terminal::AttachMode::Focused)
+            .await
+        {
+            // Revert the flag so the UI doesn't sit in a focused
+            // state with no working PTY behind it.
+            self.embed_focused = false;
+            self.state.warning = Some(format!("focus: {e}"));
+        }
+    }
+
+    /// Switch the embed back to `AttachMode::Preview`. Mirrors
+    /// `enter_focus`. Always clears `embed_focused`, even if the
+    /// respawn itself failed — the user is no longer trying to
+    /// drive the session through bosun, so we'd rather fall back
+    /// to a polled preview than leave them stuck.
+    async fn exit_focus(&mut self) {
+        if !self.embed_focused {
+            return;
+        }
+        self.embed_focused = false;
+        let Some(session) = self.state.selected_session().map(|v| v.name().to_string()) else {
+            // Session disappeared while focused — drop the embed
+            // entirely; sync_embed will recreate it on the next
+            // selection change.
+            self.embed = None;
+            return;
+        };
+        if let Err(e) = self
+            .respawn_embed(&session, crate::ui::embed_terminal::AttachMode::Preview)
+            .await
+        {
+            // Best-effort fallback to the polled path — drop the
+            // embed and let the normal `sync_embed` flow on the
+            // next iteration try to bring one back in Preview mode.
+            tracing::warn!("exit_focus respawn: {e}");
+            self.embed = None;
+        }
+        self.state.warning = None;
+    }
+
+    /// Effective default fg/bg/cursor for the embed's OSC 10/11/12
+    /// responses: the colors probed from the outer terminal at startup
+    /// where available, else the active theme's (text for fg, bg for
+    /// bg, fg for cursor). 16-bit per channel. See issue #2.
+    fn embed_default_colors(&self) -> crate::terminal_query::DefaultColors {
+        use crate::terminal_query::Rgb16;
+        fn dup8(c: u8) -> u16 {
+            ((c as u16) << 8) | c as u16
+        }
+        fn theme_rgb(c: ratatui::style::Color) -> Rgb16 {
+            match c {
+                ratatui::style::Color::Rgb(r, g, b) => (dup8(r), dup8(g), dup8(b)),
+                _ => (0, 0, 0),
+            }
+        }
+        let fg = self
+            .term_colors
+            .fg
+            .unwrap_or_else(|| theme_rgb(self.theme.text));
+        let bg = self
+            .term_colors
+            .bg
+            .unwrap_or_else(|| theme_rgb(self.theme.bg));
+        let cursor = self.term_colors.cursor.unwrap_or(fg);
+        crate::terminal_query::DefaultColors { fg, bg, cursor }
+    }
+
+    /// Internal: drop the current embed and spawn a fresh one for
+    /// `session` in the given mode, priming with a synchronous
+    /// capture-pane snapshot so the transition is a single repaint
+    /// rather than the visible attach-replay animation. Used by
+    /// `enter_focus` / `exit_focus` — `sync_embed` has its own
+    /// inline spawn path because it also handles the no-target and
+    /// resize-only cases.
+    async fn respawn_embed(
+        &mut self,
+        session: &str,
+        mode: crate::ui::embed_terminal::AttachMode,
+    ) -> std::io::Result<()> {
+        let (rows, cols) = self.preview_dims();
+        let snapshot = self.client.capture_pane(session).await.ok();
+        // Drop the old embed *before* spawning the new one. Both
+        // attaches would otherwise briefly coexist on the same
+        // tmux session, which works fine but pointlessly fans out
+        // tmux's relay.
+        self.embed = None;
+        let embed = crate::ui::embed_terminal::EmbedTerminal::spawn(
+            self.socket.as_deref(),
+            session,
+            rows,
+            cols,
+            mode,
+            snapshot.as_deref(),
+            self.embed_default_colors(),
+            self.evt_tx.clone(),
+        )?;
+        self.embed = Some(embed);
+        Ok(())
+    }
+
+    /// Compute the current preview area dimensions in (rows, cols)
+    /// from cached `term_size` + `divider_x`. Returns the minimums
+    /// in the narrow-terminal case where there's no preview area at
+    /// all — the embed grid stays sized to something `vt100` accepts
+    /// even though no rendering happens.
+    ///
+    /// In single-window mode, shrink by 2 rows + 2 cols regardless
+    /// of focus state. The focused branch is the obvious case (the
+    /// focus border occupies the perimeter cells); the unfocused
+    /// branch reserves the same space as a blank "transparent
+    /// border" so the inner app's wrap width doesn't change when
+    /// the user toggles focus. Without this, every line would
+    /// reflow by one column on attach/detach and paragraphs would
+    /// visibly jump. The matching render-area shrink lives in
+    /// `ui::preview::render`.
+    /// True when the terminal is too narrow for the sidebar + preview
+    /// split, so focused mode hands the entire body to the embed. In
+    /// that layout no focus border is drawn, so the embed fills the
+    /// width edge-to-edge instead of reserving border cells. Keep the
+    /// threshold in lockstep with `layout::compute` and `preview::render`.
+    fn is_narrow(&self) -> bool {
+        self.state.term_size.0 < crate::ui::layout::PREVIEW_MIN_WIDTH
+    }
+
+    /// True when the sidebar is collapsed and the focused embed owns
+    /// the entire body: single-window + focused + the sticky
+    /// `sidebar_hidden` preference set. In this state the layout is
+    /// full-body (no sidebar, no divider) and no focus border is
+    /// drawn, so the border-reservation math in `preview_dims` /
+    /// `embed_rect` / `ui::preview::render` must all skip the inset.
+    /// Detaching clears `embed_focused`, which brings the sidebar
+    /// back regardless of the preference.
+    fn sidebar_collapsed(&self) -> bool {
+        self.state.single_window_mode && self.embed_focused && self.state.sidebar_hidden
+    }
+
+    /// Whether the embed reserves focus-border cells: wide single-
+    /// window layout that isn't collapsed to full body. The narrow
+    /// path draws no border (the embed fills edge-to-edge) and the
+    /// collapsed path hides the sidebar entirely, also borderless.
+    fn embed_has_border(&self) -> bool {
+        self.state.single_window_mode && !self.is_narrow() && !self.sidebar_collapsed()
+    }
+
+    fn preview_dims(&self) -> (u16, u16) {
+        match self.preview_rect() {
+            Some(p) => {
+                let tabs = self.tab_strip_height();
+                // Reserve the focus-border cells only when the embed
+                // actually draws one; narrow/mobile and the collapsed
+                // full-body layout draw none, so the PTY gets the full
+                // width (and full height minus the tab strip). Mirrors
+                // `preview::render` / `embed_rect`.
+                if self.embed_has_border() {
+                    (
+                        p.height.saturating_sub(2).saturating_sub(tabs),
+                        p.width.saturating_sub(2),
+                    )
+                } else {
+                    (p.height.saturating_sub(tabs), p.width)
+                }
+            }
+            None => (4, 20),
+        }
+    }
+
+    /// 1 row whenever the cursor sits on a container (so a tab
+    /// strip is drawn above the embed), else 0. The strip lives
+    /// outside the focus border, so it consumes one row from the
+    /// preview rect before the focus-border inset math runs.
+    fn tab_strip_height(&self) -> u16 {
+        match self.state.sidebar.visible().get(self.state.selected) {
+            Some(e) if e.container().is_some() => 1,
+            _ => 0,
+        }
+    }
+
+    /// On-screen rectangle the tab strip occupies, or `None` when
+    /// the cursor isn't on a container (no strip is drawn).
+    fn tab_strip_rect(&self) -> Option<ratatui::layout::Rect> {
+        let p = self.preview_rect()?;
+        if self.tab_strip_height() == 0 {
+            return None;
+        }
+        Some(ratatui::layout::Rect::new(p.x, p.y, p.width, 1))
+    }
+
+    /// Full preview rectangle (in terminal coords) for the current
+    /// layout. `None` on narrow terminals where the preview is
+    /// hidden — except when single-window mode is focused, in which
+    /// case the embed takes the entire body and we return that. Used
+    /// by hit-tests + PTY sizing.
+    fn preview_rect(&self) -> Option<ratatui::layout::Rect> {
+        use ratatui::layout::Rect;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: self.state.term_size.0,
+            height: self.state.term_size.1,
+        };
+        let layout =
+            crate::ui::layout::compute(area, self.state.divider_x, self.sidebar_collapsed());
+        if let Some(p) = layout.preview {
+            return Some(p);
+        }
+        // Narrow + focused + single-window: the embed gets the whole
+        // body. Matches the special-case render branch in `ui::draw`.
+        if self.state.single_window_mode && self.embed_focused {
+            return Some(layout.list);
+        }
+        None
+    }
+
+    /// Rectangle the embed actually renders into. Matches the
+    /// dimensions the PTY is sized for via `preview_dims`, so mouse
+    /// forwarding translates click coords against the same origin
+    /// the inner app's terminal grid was sized against. The tab
+    /// strip (when drawn) lives above the embed and is excluded;
+    /// in single-window mode the result is further inset by one
+    /// cell on every side for the focus-border reservation.
+    fn embed_rect(&self) -> Option<ratatui::layout::Rect> {
+        use ratatui::layout::Rect;
+        let p = self.preview_rect()?;
+        let tabs = self.tab_strip_height();
+        let after_tabs = Rect::new(p.x, p.y + tabs, p.width, p.height.saturating_sub(tabs));
+        // Inset for the focus border only when one is drawn; the
+        // narrow/mobile body and the collapsed full-body layout draw
+        // none, so the embed fills the full width. Mirrors
+        // `preview_dims` / `preview::render`.
+        if self.embed_has_border() {
+            if after_tabs.width < 2 || after_tabs.height < 2 {
+                return Some(Rect::new(after_tabs.x, after_tabs.y, 0, 0));
+            }
+            Some(Rect::new(
+                after_tabs.x + 1,
+                after_tabs.y + 1,
+                after_tabs.width - 2,
+                after_tabs.height - 2,
+            ))
+        } else {
+            Some(after_tabs)
+        }
+    }
+}
+
+/// True iff `(col, row)` lands inside `rect`. Both ratatui `Rect`
+/// and crossterm coords are 0-based + half-open, so this is the
+/// standard containment check.
+fn point_in_rect(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 #[cfg(test)]
@@ -1574,6 +3277,10 @@ mod tests {
     use std::time::SystemTime;
 
     fn ses(name: &str) -> SessionView {
+        ses_status(name, Status::Idle)
+    }
+
+    fn ses_status(name: &str, status: Status) -> SessionView {
         SessionView::new(
             TmuxSession {
                 name: name.into(),
@@ -1585,14 +3292,21 @@ mod tests {
                 current_path: None,
                 agent: None,
                 spec_path: None,
+                container_id: None,
+                // Stable default so the unread tests exercise pure
+                // content change; width-change tests use `ses_hw`.
+                pane_width: 80,
             },
-            Status::Idle,
+            status,
             None,
         )
     }
 
     fn state_with(sessions: Vec<SessionView>, selected: usize) -> AppState {
-        let ungrouped = sessions.iter().map(|s| s.name().to_string()).collect();
+        let ungrouped = sessions
+            .iter()
+            .map(|s| Container::single(s.name().to_string(), s.name().to_string()))
+            .collect();
         AppState {
             sessions,
             selected,
@@ -1681,6 +3395,144 @@ mod tests {
         let mut s = state_with(vec![ses("main")], 0);
         s.apply(AppMsg::Key(key(KeyCode::Enter)));
         assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    /// A session with a specific content-hash fingerprint, for the
+    /// unread (content-change) tests.
+    fn ses_h(name: &str, hash: u64) -> SessionView {
+        let mut v = ses(name);
+        v.content_hash = hash;
+        v
+    }
+
+    /// A session with both a content-hash and a pane width, for the
+    /// reflow (layout-vs-content) tests.
+    fn ses_hw(name: &str, hash: u64, width: u16) -> SessionView {
+        let mut v = ses_h(name, hash);
+        v.session.pane_width = width;
+        v
+    }
+
+    #[test]
+    fn first_sight_is_not_unread() {
+        // Both rows appear for the first time → baselined, none unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        assert!(!s.session_unread("a"));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn background_change_marks_unread() {
+        // Cursor on "a" (viewed). "b" is a background row whose pane
+        // changes between refreshes → "b" reads unread, "a" doesn't.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 2)]));
+        assert!(s.session_unread("b"));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn change_on_viewed_session_is_not_unread() {
+        // The selected row changing while the user watches it (the
+        // embed shows it live) must not light its own row.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 2)]));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn selecting_session_clears_unread() {
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 2)]));
+        assert!(s.session_unread("b"));
+        // Move the cursor onto "b" → viewing re-baselines it to its
+        // current content, clearing the dot.
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert_eq!(s.selected, 1);
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn unread_reappears_after_leaving_unresolved_change() {
+        // The Grav 2.0 case: a row changes (e.g. asks a question), the
+        // user views it (clears), then navigates away while it changes
+        // again → it goes unread again. Level-based, not one-shot.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        // Cursor onto "b" — viewed, baselined.
+        s.apply(AppMsg::Key(key(KeyCode::Down)));
+        assert!(!s.session_unread("b"));
+        // Back to "a"; meanwhile "b" keeps producing output.
+        s.apply(AppMsg::Key(key(KeyCode::Up)));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 9)]));
+        assert!(s.session_unread("b"));
+    }
+
+    #[test]
+    fn zero_hash_never_marks_unread() {
+        // A failed/empty capture (hash 0) is "no information" and must
+        // not flip the row to unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 0)]));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn dead_session_pruned_from_seen_content() {
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_h("a", 1), ses_h("b", 1)]));
+        // "b" is gone from the live list — its baseline is dropped.
+        s.apply(refreshed(vec![ses_h("a", 1)]));
+        assert!(!s.seen_content.contains_key("b"));
+    }
+
+    #[test]
+    fn reflow_does_not_mark_unread() {
+        // A background row whose pane *width* changes has reflowed
+        // (resize / focus-embed / another bosun instance attaching to
+        // the shared session). The text differs purely from layout, so
+        // it must not read as unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 1, 80)]));
+        // "b" reflows: new width, rewrapped text (new hash).
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        assert!(!s.session_unread("b"));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn another_instance_resize_does_not_contaminate() {
+        // Two bosun instances share the tmux server. When the other
+        // instance focuses "b", tmux resizes the shared pane; this
+        // instance sees the reflow but must not flip "b" to unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 1, 120)]));
+        // Other instance attaches narrower → "b" reflows to width 60.
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 9, 60)]));
+        // ...then flips back to our width as we become active again.
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 1, 120)]));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn unread_resumes_after_reflow_settles() {
+        // The settle window is short. Once the pane width is stable and
+        // it closes, a genuine content change marks unread again.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 1, 80)]));
+        // Reflow to width 50, then the redraw settles over a couple ticks.
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        assert!(!s.session_unread("b"));
+        // Genuine new output at the now-stable width → unread.
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 3, 50)]));
+        assert!(s.session_unread("b"));
     }
 
     fn mouse(kind: MouseEventKind, col: u16) -> MouseEvent {
@@ -1840,13 +3692,17 @@ mod tests {
         assert!(!s.dragging_divider);
     }
 
-    use crate::sidebar::Section;
+    use crate::sidebar::{Container, Section};
+
+    fn con(internal: &str) -> Container {
+        Container::single(internal.to_string(), internal.to_string())
+    }
 
     fn section(id: &str, name: &str, members: &[&str]) -> Section {
         Section {
             id: id.into(),
             name: name.into(),
-            members: members.iter().map(|s| s.to_string()).collect(),
+            members: members.iter().map(|s| con(s)).collect(),
             collapsed: false,
             banner_font: None,
         }
@@ -1854,9 +3710,47 @@ mod tests {
 
     fn model(ungrouped: &[&str], sections: Vec<Section>) -> SidebarModel {
         SidebarModel {
-            ungrouped: ungrouped.iter().map(|s| s.to_string()).collect(),
+            ungrouped: ungrouped.iter().map(|s| con(s)).collect(),
             sections,
         }
+    }
+
+    /// Active tab names of the ungrouped containers — what most
+    /// assertions actually want to compare.
+    fn ungrouped_names(s: &SidebarModel) -> Vec<String> {
+        s.ungrouped.iter().map(|c| c.active.clone()).collect()
+    }
+
+    /// Active tab names of a section's containers.
+    fn section_member_names(s: &SidebarModel, si: usize) -> Vec<String> {
+        s.sections[si]
+            .members
+            .iter()
+            .map(|c| c.active.clone())
+            .collect()
+    }
+
+    /// ID-free shape of the sidebar — what most reorder /
+    /// dissolve tests actually want to assert about. Compares
+    /// ungrouped active-tab names plus, per section, its `(id,
+    /// name, member-active-names)` triple. Container IDs change
+    /// every time `Container::single` is called so a whole-model
+    /// `assert_eq!` would always trip on the random ids.
+    #[allow(clippy::type_complexity)]
+    fn shape(m: &SidebarModel) -> (Vec<String>, Vec<(String, String, Vec<String>)>) {
+        let ungrouped = m.ungrouped.iter().map(|c| c.active.clone()).collect();
+        let sections = m
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.name.clone(),
+                    s.members.iter().map(|c| c.active.clone()).collect(),
+                )
+            })
+            .collect();
+        (ungrouped, sections)
     }
 
     /// Shift-J on a section header moves only that section among the
@@ -1880,14 +3774,14 @@ mod tests {
         s.apply(AppMsg::Key(shift_j));
 
         assert_eq!(
-            s.sidebar,
-            model(
+            shape(&s.sidebar),
+            shape(&model(
                 &[],
                 vec![
                     section("g2", "Second", &["c", "d"]),
                     section("g1", "First", &["a", "b"]),
                 ],
-            )
+            ))
         );
         // g1 is now the second section; its header flat index = 3
         // (0..=2 are g2 header + its two members).
@@ -1908,8 +3802,8 @@ mod tests {
 
         // b didn't move — it's at the end of ungrouped.
         assert_eq!(
-            s.sidebar,
-            model(&["a", "b"], vec![section("g1", "First", &["c"])])
+            shape(&s.sidebar),
+            shape(&model(&["a", "b"], vec![section("g1", "First", &["c"])]))
         );
     }
 
@@ -1922,12 +3816,13 @@ mod tests {
         s.sidebar = model(&["a", "b"], vec![section("g1", "First", &["c"])]);
         s.selected = 0; // ungrouped a
 
-        let shift_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        let shift_right =
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         s.apply(AppMsg::Key(shift_right));
 
         assert_eq!(
-            s.sidebar,
-            model(&["b"], vec![section("g1", "First", &["a", "c"])])
+            shape(&s.sidebar),
+            shape(&model(&["b"], vec![section("g1", "First", &["a", "c"])]))
         );
         // cursor follows to new member index: ungrouped has 1 entry,
         // then header, then a at member index 0 → flat index 2.
@@ -1944,12 +3839,12 @@ mod tests {
         // flat: 0=a, 1=g1 header, 2=b
         s.selected = 2;
 
-        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        let shift_left = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         s.apply(AppMsg::Key(shift_left));
 
         assert_eq!(
-            s.sidebar,
-            model(&["a", "b"], vec![section("g1", "First", &[])])
+            shape(&s.sidebar),
+            shape(&model(&["a", "b"], vec![section("g1", "First", &[])]))
         );
         // b is now ungrouped at index 1.
         assert_eq!(s.selected, 1);
@@ -1966,7 +3861,10 @@ mod tests {
         let mut out = Vec::new();
         s.insert_section("Work".to_string(), &mut out);
 
-        assert_eq!(s.sidebar.ungrouped, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            ungrouped_names(&s.sidebar),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(s.sidebar.sections.len(), 1);
         assert_eq!(s.sidebar.sections[0].name, "Work");
         assert!(s.sidebar.sections[0].members.is_empty());
@@ -1982,7 +3880,7 @@ mod tests {
 
         s.apply(AppMsg::Key(key(KeyCode::Char('d'))));
 
-        assert_eq!(s.sidebar, model(&["a", "b"], vec![]));
+        assert_eq!(shape(&s.sidebar), shape(&model(&["a", "b"], vec![])));
         assert_eq!(s.selected, 1); // stays at the old header position (now b)
         assert!(s.modals.is_empty());
     }
@@ -2032,13 +3930,25 @@ mod tests {
         }
     }
 
-    /// Right arrow (no shift) attaches the selected session.
+    /// Enter attaches the selected session. Plain Right used to do
+    /// this too but was reassigned to tab-cycle so arrow keys
+    /// navigate without accidentally attaching.
     #[test]
-    fn right_arrow_attaches_session() {
+    fn enter_attaches_session() {
+        let mut s = state_with(vec![ses("main")], 0);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        s.apply(AppMsg::Key(enter));
+        assert_eq!(s.pending_attach.as_deref(), Some("main"));
+    }
+
+    /// Plain Right cycles the active tab; on a single-tab container
+    /// it's a no-op (and crucially does *not* attach).
+    #[test]
+    fn right_arrow_does_not_attach_on_single_tab_container() {
         let mut s = state_with(vec![ses("main")], 0);
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         s.apply(AppMsg::Key(right));
-        assert_eq!(s.pending_attach.as_deref(), Some("main"));
+        assert!(s.pending_attach.is_none());
     }
 
     /// Pressing `2` on an ungrouped session jumps it directly to
@@ -2057,7 +3967,10 @@ mod tests {
 
         assert!(s.sidebar.ungrouped.is_empty());
         assert!(s.sidebar.sections[0].members.is_empty());
-        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 1),
+            vec!["bosun".to_string()]
+        );
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
             Some("bosun".to_string())
@@ -2075,7 +3988,7 @@ mod tests {
 
         s.apply(AppMsg::Key(key(KeyCode::Char('0'))));
 
-        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+        assert_eq!(ungrouped_names(&s.sidebar), vec!["bosun".to_string()]);
         assert!(s.sidebar.sections[0].members.is_empty());
     }
 
@@ -2089,7 +4002,7 @@ mod tests {
 
         // Only one section → `2` is out of range.
         s.apply(AppMsg::Key(key(KeyCode::Char('2'))));
-        assert_eq!(s.sidebar.ungrouped, vec!["bosun".to_string()]);
+        assert_eq!(ungrouped_names(&s.sidebar), vec!["bosun".to_string()]);
     }
 
     /// Shift-Right cycles through sections: pressing it again after
@@ -2104,11 +4017,14 @@ mod tests {
         );
         s.selected = 0; // bosun in ungrouped
 
-        let sr = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT);
+        let sr = KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT | KeyModifiers::CONTROL);
 
         s.apply(AppMsg::Key(sr));
         assert!(s.sidebar.ungrouped.is_empty());
-        assert_eq!(s.sidebar.sections[0].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 0),
+            vec!["bosun".to_string()]
+        );
         assert!(s.sidebar.sections[1].members.is_empty());
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
@@ -2118,7 +4034,10 @@ mod tests {
 
         s.apply(AppMsg::Key(sr));
         assert!(s.sidebar.sections[0].members.is_empty());
-        assert_eq!(s.sidebar.sections[1].members, vec!["bosun".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 1),
+            vec!["bosun".to_string()]
+        );
         assert_eq!(
             s.selected_session().map(|v| v.name().to_string()),
             Some("bosun".to_string()),
@@ -2164,7 +4083,10 @@ mod tests {
         });
 
         assert!(s.sidebar.ungrouped.is_empty());
-        assert_eq!(s.sidebar.sections[0].members, vec!["bosun-abc".to_string()]);
+        assert_eq!(
+            section_member_names(&s.sidebar, 0),
+            vec!["bosun-abc".to_string()]
+        );
     }
 
     /// Restart-swap: a pending swap captured at modal-confirm time
@@ -2186,12 +4108,12 @@ mod tests {
         });
 
         assert_eq!(
-            s.sidebar.sections[0].members,
+            section_member_names(&s.sidebar, 0),
             vec!["bosun-def".to_string()],
             "new internal inherits the dead row's slot"
         );
         assert_eq!(
-            s.sidebar.ungrouped,
+            ungrouped_names(&s.sidebar),
             vec!["bosun-other".to_string()],
             "no append of bosun-def to ungrouped"
         );
@@ -2229,7 +4151,7 @@ mod tests {
         });
         assert!(s.pending_restart_swap.is_none(), "swap consumed");
         assert_eq!(
-            s.sidebar.ungrouped,
+            ungrouped_names(&s.sidebar),
             vec!["bosun-def".to_string()],
             "new internal landed in the old slot"
         );
@@ -2250,6 +4172,56 @@ mod tests {
         assert_eq!(
             s.session_history.get("bosun-abc"),
             Some(&"WorkStuff".to_string())
+        );
+    }
+
+    /// Regression: a `SessionsRefreshed` that the actor had already
+    /// captured before processing our `KillSession` must not bring
+    /// the just-killed session back into the sidebar as a phantom
+    /// dead row. Without the `recently_killed` guard, the
+    /// still-momentarily-alive session would land in ungrouped as
+    /// `? <name>` for the brief window between confirm and the
+    /// next refresh — exactly the bug the user reported.
+    #[test]
+    fn refresh_in_flight_after_kill_does_not_resurrect_session() {
+        let mut s = AppState::default();
+        s.sidebar = model(&["bosun-keep", "bosun-doomed"], vec![]);
+        // Simulate the modal's KillSession bookkeeping that the run
+        // loop normally does: remove from sidebar + mark recently
+        // killed. (The full path runs through StackDispatch::Closed
+        // in the App, which we don't drive in this pure-reducer
+        // test.)
+        s.sidebar.remove_session("bosun-doomed");
+        s.recently_killed.insert("bosun-doomed".to_string());
+
+        // An in-flight refresh still has the doomed session alive.
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-keep"), ses("bosun-doomed")],
+            select_after: None,
+        });
+
+        assert_eq!(
+            ungrouped_names(&s.sidebar),
+            vec!["bosun-keep".to_string()],
+            "killed session must not reappear in ungrouped"
+        );
+        assert!(
+            s.sessions.iter().all(|v| v.name() != "bosun-doomed"),
+            "killed session must be filtered out of the sessions view"
+        );
+        assert!(
+            s.recently_killed.contains("bosun-doomed"),
+            "guard stays armed until the live list confirms the kill"
+        );
+
+        // Next refresh: kill confirmed (doomed gone from live).
+        s.apply(AppMsg::SessionsRefreshed {
+            sessions: vec![ses("bosun-keep")],
+            select_after: None,
+        });
+        assert!(
+            s.recently_killed.is_empty(),
+            "guard clears once the kill is observable in the live list"
         );
     }
 

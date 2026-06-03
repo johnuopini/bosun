@@ -18,13 +18,14 @@ use crate::tmux::session::TmuxSession;
 /// name, display name, or filesystem path.
 ///
 /// The trailing `@bosun_*` fields read user options we set at create time:
-/// - `@bosun_display` — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
-/// - `@bosun_agent`   — agent kind (claude / codex / terminal)
-/// - `@bosun_path`    — spec path the user typed into the new-session modal
+/// - `@bosun_display`      — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
+/// - `@bosun_agent`        — agent kind (claude / codex / terminal)
+/// - `@bosun_path`         — spec path the user typed into the new-session modal
+/// - `@bosun_container_id` — sidebar container this session belongs to (tabs feature)
 ///
-/// All three are empty strings for non-bosun sessions and get parsed as
+/// All four are empty strings for non-bosun sessions and get parsed as
 /// `None` so the UI renders them only when available.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}";
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}|||#{@bosun_container_id}|||#{pane_width}";
 
 const FIELD_SEP: &str = "|||";
 
@@ -68,12 +69,19 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         .ok_or_else(|| "missing session_activity".to_string())?;
     let path = parts.next().map(|s| s.to_string());
     let display_raw = parts.next().map(|s| s.to_string());
-    // `@bosun_agent` and `@bosun_path` are optional trailing fields
-    // — older tmux list-sessions outputs (from before we added them
-    // to LIST_SESSIONS_FORMAT) may not include them, and fixtures
-    // in tests sometimes omit them for brevity.
+    // `@bosun_agent`, `@bosun_path`, and `@bosun_container_id` are
+    // optional trailing fields — older tmux list-sessions outputs
+    // (from before we added them to LIST_SESSIONS_FORMAT) may not
+    // include them, and fixtures in tests sometimes omit them for
+    // brevity.
     let agent_raw = parts.next().map(|s| s.to_string());
     let spec_path_raw = parts.next().map(|s| s.to_string());
+    let container_id_raw = parts.next().map(|s| s.to_string());
+    // Current pane width. Used to tell a genuine content change from a
+    // mere reflow (resize / embed / a second bosun instance attaching),
+    // so a layout change doesn't read as unread. Optional trailing
+    // field: older outputs and terse test fixtures omit it → 0.
+    let pane_width_raw = parts.next();
 
     if parts.next().is_some() {
         return Err("unexpected extra field".into());
@@ -92,6 +100,7 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
 
     let created = parse_epoch(created_raw);
     let last_activity = parse_epoch(activity_raw);
+    let pane_width: u16 = pane_width_raw.and_then(|s| s.parse().ok()).unwrap_or(0);
 
     Ok(TmuxSession {
         name,
@@ -103,6 +112,8 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         display_name: display_raw.filter(|s| !s.is_empty()),
         agent: agent_raw.filter(|s| !s.is_empty()),
         spec_path: spec_path_raw.filter(|s| !s.is_empty()),
+        container_id: container_id_raw.filter(|s| !s.is_empty()),
+        pane_width,
     })
 }
 
@@ -135,6 +146,23 @@ mod tests {
         assert_eq!(s.current_path.as_deref(), Some("/tmp/code"));
         assert!(s.created.is_some());
         assert!(s.last_activity.is_some());
+    }
+
+    #[test]
+    fn parses_pane_width() {
+        // Full format including the trailing pane_width field.
+        let line =
+            "main|||1|||1|||1712000000|||1712003600|||/tmp|||Main|||claude|||/tmp|||cid|||128";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert_eq!(s.pane_width, 128);
+    }
+
+    #[test]
+    fn missing_pane_width_defaults_to_zero() {
+        // Terse fixtures / older tmux output omit the field.
+        let line = "main|||1|||1|||1712000000|||1712003600|||/tmp";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert_eq!(s.pane_width, 0);
     }
 
     #[test]

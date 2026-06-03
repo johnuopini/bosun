@@ -14,6 +14,13 @@ pub struct SessionSpec {
     pub agent: String,
     pub args: String,
     pub options: SpecOptions,
+    /// When `Some`, the actor stamps this container ID onto the
+    /// new tmux session's `@bosun_container_id` user option so the
+    /// freshly-created session appears as a tab inside the named
+    /// sidebar container. `None` (the default) creates a session
+    /// that gets its own fresh single-tab container on reconcile,
+    /// matching the pre-tabs behavior.
+    pub container_id: Option<String>,
 }
 
 /// Agent-specific flags the user toggled in the new-session modal.
@@ -86,6 +93,12 @@ pub enum Command {
     CreateSession(SessionSpec),
     /// Kill a session by its internal tmux name. `tmux kill-session -t`.
     KillSession(String),
+    /// Kill every tmux session named in `tabs` in one batch — used
+    /// by `Shift+D` to tear down all tabs in a container at once.
+    /// The actor iterates `KillSession` for each name; sidebar
+    /// reconcile drops the now-empty container on the next
+    /// refresh.
+    KillContainer { tabs: Vec<String> },
     /// Rename the pretty display name of a session. The internal tmux
     /// name never changes (we only update the `@bosun_display` user
     /// option); the UI picks up the new label on the next refresh.
@@ -98,6 +111,16 @@ pub enum Command {
     /// The new session gets a fresh internal name (new hex suffix)
     /// but keeps the same display name, path, agent and options.
     RestartSession(String),
+    /// Read the current `@bosun_*` metadata off a live session so
+    /// the modify-session modal can pre-fill its fields. The actor
+    /// replies with an `AppMsg::ModifySpecReady`.
+    OpenModifySession { internal: String },
+    /// Persist a new spec to the session's `@bosun_*` user options
+    /// (and update the display label if it changed). Does NOT
+    /// restart the running agent — the user picks that up next
+    /// time they hit `R`. Also upserts the recents row so the
+    /// recents picker reflects the latest spec.
+    ModifySession { internal: String, spec: SessionSpec },
     /// Delete a single recent entry from the SQLite store by its
     /// primary key. The RecentsModal emits this when the user hits
     /// `d` on a highlighted row.
@@ -157,6 +180,17 @@ pub enum AppMsg {
     /// between the session list and preview. Dropped by non-mouse
     /// consumers.
     Mouse(MouseEvent),
+    /// A paste event from the terminal (bracketed paste). Crossterm
+    /// decodes `\e[200~ ... \e[201~` sequences from the outer
+    /// terminal and hands us the inner text as a `String`. Outer
+    /// terminals also use bracketed paste to deliver drag-drop
+    /// content (file paths, image markers), so this is the path
+    /// for "I dropped a file onto bosun". When the embed is
+    /// focused we re-wrap and forward to the embed PTY; otherwise
+    /// bosun ignores it (no modal currently accepts pasted text
+    /// directly — they all go through `Key(c)` events for
+    /// individual characters).
+    Paste(String),
     /// Terminal was resized.
     Resize(u16, u16),
     /// Fresh session list from tmux, with smoothed status and optional
@@ -179,6 +213,36 @@ pub enum AppMsg {
     /// no longer in the list (it was killed between capture and
     /// delivery).
     PreviewRefreshed { name: String, bytes: Arc<[u8]> },
+    /// Response to `Command::OpenModifySession`: the actor has
+    /// read the live `@bosun_*` metadata off the named session and
+    /// the app should open the modify-session modal pre-filled
+    /// from `spec`. `internal` lets the modal remember which
+    /// session it's editing so the submit emits
+    /// `Command::ModifySession` against the right name.
+    ModifySpecReady { internal: String, spec: SessionSpec },
+    /// Lightweight status push for a single session. Sibling of
+    /// `PreviewRefreshed` — emitted by the tmux actor's fast tick
+    /// once it has captured + classified a pane, so the sidebar
+    /// glyph updates at the fast-tick cadence instead of waiting
+    /// for the 1Hz `SessionsRefreshed` reconcile. The app handler
+    /// updates the matching `SessionView.session.status` in place
+    /// and does nothing else — no list reconcile, no statusbar
+    /// diff, no detector re-run. A no-op if the named session is
+    /// no longer in the list.
+    StatusRefreshed {
+        name: String,
+        status: crate::tmux::detector::Status,
+    },
+    /// A chunk of bytes read from an embedded terminal's PTY (2.0+).
+    /// `session` is the internal tmux session name the embed was
+    /// spawned for. The app handler discards the chunk if the
+    /// currently-active embed isn't for the same session (stale
+    /// chunks from a previous embed instance after focus switch);
+    /// otherwise it feeds the bytes into the embed's vt100 parser.
+    /// Each chunk arrives from a dedicated reader thread inside
+    /// `EmbedTerminal` and triggers a normal redraw on the next
+    /// iteration of the app event loop.
+    EmbedBytes { session: String, bytes: Vec<u8> },
     /// An attach just started — the UI should render a placeholder
     /// while we block in `tmux attach`.
     AttachStarted { name: String },
@@ -192,4 +256,14 @@ pub enum AppMsg {
     Shutdown,
     /// SIGCONT — we came back from Ctrl-Z suspend, re-enter raw mode.
     Resume,
+    /// Terminal regained focus (e.g. switching back to the iTerm
+    /// window). Triggers a full repaint to recover from things like
+    /// iTerm's Cmd+R "reset" that clears the screen and exits alt
+    /// screen out from under us without notifying ratatui.
+    FocusGained,
+    /// Terminal lost focus. We only track it so the *next*
+    /// `FocusGained` is recognized as a genuine refocus (and not the
+    /// echo a terminal emits when focus reporting is re-enabled), so
+    /// recovery runs once instead of looping. See `App::has_focus`.
+    FocusLost,
 }

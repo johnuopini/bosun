@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::sidebar::{Section, SidebarModel};
+use crate::sidebar::{Container, Section, SidebarModel};
 
 /// Legacy Vec<SidebarEntry> shape from v0.2.8. Read-only, used for
 /// one-time migration to the new explicit-membership `SidebarModel`.
@@ -48,7 +48,9 @@ fn migrate_legacy_sidebar(old: Vec<LegacySidebarEntry>) -> SidebarModel {
                 });
             }
             LegacySidebarEntry::Session { internal } => {
-                model.ungrouped.push(internal);
+                model
+                    .ungrouped
+                    .push(Container::single(internal.clone(), internal));
             }
         }
     }
@@ -129,6 +131,33 @@ pub struct Config {
     /// full refresh). Override with `preview_tick_ms = 250` in
     /// `config.toml` or `BOSUN_PREVIEW_TICK_MS=300` in the env.
     pub preview_tick_ms: u64,
+    /// Embedded-terminal preview (2.0+): when true, the focused
+    /// session's preview pane is a real `vt100`-parsed embedded
+    /// terminal streaming from `tmux attach -r`, rather than a
+    /// periodic `capture-pane` snapshot. Default true. Disable with
+    /// `embed = false` in `config.toml` or `BOSUN_EMBED=0` /
+    /// `BOSUN_EMBED=off` in the env to fall back to the v0.4 polled
+    /// preview path. Non-focused sessions and section/empty-state
+    /// previews are unaffected — they always use the polled path
+    /// (they don't need a PTY).
+    pub embed_enabled: bool,
+    /// Single-window mode (2.0+): when true, `Enter` / `Right` on a
+    /// session opens it *inside* the preview pane (focused embed)
+    /// instead of tearing down ratatui and running a full-screen
+    /// `tmux attach`. The sidebar stays visible the whole time.
+    /// `Ctrl-Q` exits back to bosun navigation, same as it does
+    /// from a real tmux attach. Default false (matches v0.4
+    /// behavior). Toggled live with `s` and persisted to
+    /// `config.toml` as `single_window = true`. Env override:
+    /// `BOSUN_SINGLE_WINDOW=1|true|yes|on` enables, anything else
+    /// disables.
+    pub single_window_mode: bool,
+    /// Sticky "hide the sidebar while focused on a session" preference
+    /// (2.0.5+). Toggled live with `Ctrl+B` while the embed is
+    /// focused; persisted to `config.toml` as `sidebar_hidden = true`.
+    /// Only takes effect while focused — detaching always brings the
+    /// sidebar back so the session list is reachable. Default false.
+    pub sidebar_hidden: bool,
 }
 
 impl Default for Config {
@@ -144,6 +173,13 @@ impl Default for Config {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
+            // v2.0.2+: focused single-window mode is the only mode.
+            // The field is retained as `true` for callers that still
+            // gate on it, but it is no longer user-toggleable or
+            // persisted.
+            single_window_mode: true,
+            sidebar_hidden: false,
         }
     }
 }
@@ -151,6 +187,11 @@ impl Default for Config {
 /// Default fast preview tick in milliseconds. 200ms = 5 fps on the
 /// focused session's preview pane. See `Config::preview_tick_ms`.
 pub const DEFAULT_PREVIEW_TICK_MS: u64 = 200;
+
+/// Default for `Config::embed_enabled`. v2.0+ ships with the
+/// embedded-terminal preview on; set to false here to invert the
+/// default if early adopters report regressions.
+pub const DEFAULT_EMBED_ENABLED: bool = true;
 
 /// Shape of `config.toml` on disk. All fields are optional and
 /// defaulted independently so a half-written file still loads.
@@ -191,6 +232,16 @@ struct ConfigFile {
     /// Fast preview tick in milliseconds. See `Config::preview_tick_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preview_tick_ms: Option<u64>,
+    /// Embedded-terminal preview opt-out. See `Config::embed_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed: Option<bool>,
+    /// Single-window mode persistence. See `Config::single_window_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    single_window: Option<bool>,
+    /// Sticky hide-sidebar-while-focused preference. See
+    /// `Config::sidebar_hidden`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sidebar_hidden: Option<bool>,
 }
 
 impl Config {
@@ -237,7 +288,12 @@ impl Config {
         let sidebar = match file.sidebar {
             Some(s) => s,
             None => {
-                let ungrouped = file.session_order.unwrap_or_default();
+                let ungrouped = file
+                    .session_order
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| Container::single(n.clone(), n))
+                    .collect();
                 SidebarModel {
                     ungrouped,
                     sections: Vec::new(),
@@ -267,6 +323,27 @@ impl Config {
             .or(file.preview_tick_ms)
             .unwrap_or(DEFAULT_PREVIEW_TICK_MS);
 
+        // Embed opt-out: accept `0`, `false`, `off`, `no` (case-
+        // insensitive) as disable; anything else as enable. Mirrors
+        // the conventional shell-flag idiom. Env beats file beats
+        // default.
+        let embed_enabled = match env::var("BOSUN_EMBED") {
+            Ok(s) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => file.embed.unwrap_or(DEFAULT_EMBED_ENABLED),
+        };
+
+        // v2.0.2+: focused single-window is the only mode. The
+        // setting is no longer user-toggleable; we keep the field
+        // wired as `true` for code paths that gate on it.
+        let single_window_mode = true;
+
+        // Sticky preference only — no env override. It's flipped at
+        // runtime via Ctrl+B and read back on next launch.
+        let sidebar_hidden = file.sidebar_hidden.unwrap_or(false);
+
         Self {
             session_prefix,
             tmux_socket,
@@ -278,6 +355,9 @@ impl Config {
             banner_font,
             editor,
             preview_tick_ms,
+            embed_enabled,
+            single_window_mode,
+            sidebar_hidden,
         }
     }
 
@@ -392,6 +472,31 @@ pub fn write_theme(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the sticky hide-sidebar-while-focused preference to
+/// `config.toml`. Same read-modify-write approach as `write_theme`.
+/// Called from the `Ctrl+B` toggle; failure is surfaced as a status
+/// bar warning but the live toggle still applies.
+pub fn write_sidebar_hidden(hidden: bool) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.sidebar_hidden = Some(hidden);
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
+
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// Persist the global banner font to `config.toml`. Same
 /// read-modify-write approach as `write_theme`.
 pub fn write_banner_font(name: &str) -> std::io::Result<()> {
@@ -433,6 +538,30 @@ pub fn write_editor(editor: Option<&str>) -> std::io::Result<()> {
     let body = toml::to_string(&file)
         .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
 
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Persist the single-window-mode flag to `config.toml`. Same
+/// read-modify-write approach as `write_theme`. Writes `None`
+/// (skipped via `skip_serializing_if`) when the value is the
+/// default-false so the file stays clean of redundant entries.
+pub fn write_single_window(on: bool) -> std::io::Result<()> {
+    let dir =
+        config_dir().ok_or_else(|| std::io::Error::other("cannot resolve bosun config dir"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+
+    let mut file = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<ConfigFile>(&s).unwrap_or_default(),
+        Err(_) => ConfigFile::default(),
+    };
+    file.single_window = if on { Some(true) } else { None };
+
+    let body = toml::to_string(&file)
+        .map_err(|e| std::io::Error::other(format!("toml serialize: {e}")))?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
@@ -555,6 +684,9 @@ mod tests {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
+            single_window_mode: false,
+            sidebar_hidden: false,
         }
     }
 
@@ -594,6 +726,9 @@ mod tests {
             banner_font: crate::ui::banner::default_name().to_string(),
             editor: None,
             preview_tick_ms: DEFAULT_PREVIEW_TICK_MS,
+            embed_enabled: DEFAULT_EMBED_ENABLED,
+            single_window_mode: false,
+            sidebar_hidden: false,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));

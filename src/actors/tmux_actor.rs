@@ -307,6 +307,39 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::KillContainer { tabs } => {
+                    // Multi-kill: iterate each tab serially so a
+                    // failure on one doesn't abort the rest. The
+                    // sidebar reconcile after the final refresh
+                    // drops the now-tab-less container.
+                    let mut failed = Vec::new();
+                    for tab in &tabs {
+                        if let Err(e) = client.kill_session(tab).await {
+                            failed.push(format!("{}: {}", tab, e));
+                        } else if focused.as_deref() == Some(tab.as_str()) {
+                            focused = None;
+                        }
+                    }
+                    if !failed.is_empty() {
+                        let _ = evt_tx.send(AppMsg::Warn(format!(
+                            "kill container: {}",
+                            failed.join(", ")
+                        )));
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::DeleteRecent(id) => {
                     if let Err(e) = store.delete_recent(id) {
                         tracing::warn!("delete_recent({}): {}", id, e);
@@ -434,6 +467,79 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::OpenModifySession { internal } => {
+                    // JIT read of the live `@bosun_*` metadata so
+                    // the modify modal pre-fills against the
+                    // current state of the session (not whatever
+                    // was last cached in the recents store).
+                    // Surfacing this as a warning is fine because
+                    // the only way to land here is `m` on a session
+                    // that bosun didn't create — recoverable.
+                    match client.get_session_metadata(&internal).await {
+                        Ok(Some(meta)) => {
+                            let spec = metadata_to_spec(meta);
+                            let _ = evt_tx.send(AppMsg::ModifySpecReady {
+                                internal,
+                                spec,
+                            });
+                        }
+                        Ok(None) => {
+                            let _ = evt_tx.send(AppMsg::Warn(
+                                "modify: session predates metadata support".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(AppMsg::Warn(format!("modify read: {}", e)));
+                        }
+                    }
+                }
+                Command::ModifySession { internal, spec } => {
+                    // Write the new spec back as `@bosun_*` user
+                    // options on the live session. The agent
+                    // process keeps running with its old flags;
+                    // the next `R` (restart) picks the new spec up
+                    // via the same `get_session_metadata` path
+                    // RestartSession already uses.
+                    let meta = spec_to_metadata(&spec);
+                    let mut any_err = false;
+                    if let Err(e) =
+                        client.set_display_name(&internal, &meta.display_name).await
+                    {
+                        any_err = true;
+                        let _ = evt_tx
+                            .send(AppMsg::Warn(format!("modify display: {}", e)));
+                    }
+                    if let Err(e) =
+                        client.set_session_metadata(&internal, &meta).await
+                    {
+                        any_err = true;
+                        let _ = evt_tx
+                            .send(AppMsg::Warn(format!("modify metadata: {}", e)));
+                    }
+                    if let Err(e) = store.upsert_recent(&spec) {
+                        tracing::warn!("modify upsert_recent: {}", e);
+                    }
+                    if !any_err {
+                        let _ = evt_tx.send(AppMsg::Warn(format!(
+                            "modified {} — press R to apply",
+                            spec.name
+                        )));
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::Attach { .. } => {
                     tracing::warn!("tmux_actor received Attach — ignored; app task handles attach");
                 }
@@ -542,29 +648,97 @@ pub fn spawn(
                         None => { std::future::pending::<()>().await; }
                     }
                 } => {
-                    // Cheap focused-session-only preview refresh.
-                    // Captures one pane (the focused session), packages
-                    // the bytes into an Arc, and sends a lightweight
-                    // PreviewRefreshed. Skipped entirely when no
-                    // session is focused (the empty-state and
-                    // section-header views don't need pane data).
-                    if let Some(name) = focused.as_deref() {
-                        match client.capture_pane(name).await {
-                            Ok(bytes) => {
-                                let arc: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
-                                let _ = evt_tx.send(AppMsg::PreviewRefreshed {
-                                    name: name.to_string(),
-                                    bytes: arc,
+                    // Fast tick: live status + preview for the
+                    // *focused* session only.
+                    //
+                    // We used to `capture-pane` every managed session
+                    // on this tick to keep the whole sidebar's
+                    // Running/Waiting glyphs at `preview_tick_ms`
+                    // latency. That meant `1 + N` tmux execs every tick
+                    // (one `list-sessions` + one `capture-pane` per
+                    // session) — with a dozen sessions and a 200ms
+                    // tick that's ~60 short-lived `tmux` processes a
+                    // second, *per bosun instance*. macOS Gatekeeper
+                    // re-scans each exec of an ad-hoc-signed binary
+                    // (Homebrew's tmux included) and never caches the
+                    // verdict, so a high exec rate pins `syspolicyd` at
+                    // hundreds of percent CPU. See the project notes.
+                    //
+                    // Background sessions don't need sub-second glyphs:
+                    // the 1Hz `preview_tick` already captures and
+                    // detects every managed session via `refresh_all`,
+                    // so they stay live at 1s. Only the session the
+                    // user is actually watching needs the tight
+                    // cadence, so the fast tick now captures just that
+                    // one — dropping the per-tick cost from `1 + N` to
+                    // `1 + 1`. capture-pane failures are silently
+                    // dropped; the 1Hz tick reconciles membership.
+                    //
+                    // Nothing focused → nothing needs the tight
+                    // cadence, so skip the tick outright and don't
+                    // even pay the `list-sessions` exec.
+                    if focused.is_none() {
+                        continue;
+                    }
+                    match client.list_sessions().await {
+                        Ok(raw) => {
+                            let now = SystemTime::now();
+                            for s in raw
+                                .into_iter()
+                                .filter(|s| config.manages(&s.name))
+                                .filter(|s| Some(s.name.as_str()) == focused.as_deref())
+                            {
+                                let bytes = match client.capture_pane(&s.name).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "fast capture {}: {}", s.name, e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let plain = crate::tmux::detector::strip_ansi(&bytes);
+                                let prev = smoothers
+                                    .get(&s.name)
+                                    .map(|sm| sm.current());
+                                let ctx = DetectContext::from_parts(
+                                    &bytes,
+                                    &plain,
+                                    s.last_activity,
+                                    now,
+                                    prev,
+                                    &s.name,
+                                );
+                                let detected = registry.detect(&ctx);
+                                let smoothed = smoothers
+                                    .entry(s.name.clone())
+                                    .or_default()
+                                    .observe(detected);
+                                let publish = if smoothed == Status::Unknown {
+                                    Status::Idle
+                                } else {
+                                    smoothed
+                                };
+                                let _ = evt_tx.send(AppMsg::StatusRefreshed {
+                                    name: s.name.clone(),
+                                    status: publish,
                                 });
+                                // Focused session also gets the
+                                // preview bytes so the right-pane
+                                // capture (and any non-embed preview
+                                // path) stays live at this cadence.
+                                if Some(s.name.as_str()) == focused.as_deref() {
+                                    let arc: Arc<[u8]> =
+                                        Arc::from(bytes.into_boxed_slice());
+                                    let _ = evt_tx.send(AppMsg::PreviewRefreshed {
+                                        name: s.name.clone(),
+                                        bytes: arc,
+                                    });
+                                }
                             }
-                            Err(e) => {
-                                // Capture can fail if the session died
-                                // between focus and the next tick.
-                                // The next full refresh will drop the
-                                // session from the list; nothing
-                                // urgent to do here.
-                                tracing::debug!("fast capture {}: {}", name, e);
-                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("fast list-sessions: {}", e);
                         }
                     }
                 }
@@ -724,6 +898,7 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         },
         claude_skip_permissions: spec.options.claude.skip_permissions,
         codex_yolo: spec.options.codex.yolo,
+        container_id: spec.container_id.clone(),
     }
 }
 
@@ -749,6 +924,7 @@ fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
                 yolo: meta.codex_yolo,
             },
         },
+        container_id: meta.container_id,
     }
 }
 
@@ -902,7 +1078,12 @@ async fn refresh_all(
         } else {
             None
         };
-        out.push(SessionView::new(
+        // Fingerprint the visible text so the app can tell when a row
+        // has changed since the user last looked at it (the unread
+        // dot). Cheap, and rides the capture we already did — no extra
+        // tmux exec.
+        let content_hash = content_hash(&plain);
+        let mut view = SessionView::new(
             s,
             if smoothed == Status::Unknown {
                 // Never surface Unknown to the UI — fall back to Idle so the
@@ -912,10 +1093,95 @@ async fn refresh_all(
                 smoothed
             },
             preview,
-        ));
+        );
+        view.content_hash = content_hash;
+        out.push(view);
     }
 
     Ok(out)
+}
+
+/// Layout-independent fingerprint of a pane's visible plain text, used
+/// for unread detection (see `AppState::session_unread`).
+///
+/// The point is to hash the *text*, not how it happens to be laid out
+/// for the currently attached client. A resize — most visibly,
+/// re-attaching from a different-size device like a phone — reflows
+/// every pane, and naively hashing the raw capture would then read
+/// every session as unread even though no agent produced new output.
+/// Two normalizations keep the hash about content:
+///
+/// - `capture_pane` already passes `-J`, which rejoins lines tmux
+///   wrapped to the pane width, so a width change doesn't re-split a
+///   long line into a different number of pieces.
+/// - here we trim each line's trailing whitespace (tmux pads to the
+///   pane width) and drop blank lines entirely, so trailing-space
+///   padding and vertical blank-row differences don't perturb it — this
+///   also covers an idle pane whose only "change" is cursor parking on
+///   a blank row.
+///
+/// Returns `0` for empty/whitespace-only text (a failed or blank
+/// capture) so the app treats it as "no information" rather than a
+/// change.
+fn content_hash(plain: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for line in plain.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        any = true;
+        trimmed.hash(&mut h);
+        0u8.hash(&mut h); // unambiguous separator between lines
+    }
+    if !any {
+        return 0;
+    }
+    h.finish()
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::content_hash;
+
+    #[test]
+    fn empty_capture_is_zero() {
+        assert_eq!(content_hash(""), 0);
+        assert_eq!(content_hash("   \n  \n\n"), 0);
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_change_hash() {
+        // tmux pads each line to the pane width; the padding must not
+        // count as content, or a width change would read as unread.
+        let a = content_hash("hello\nworld");
+        let b = content_hash("hello   \nworld\t");
+        assert_eq!(a, b);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn blank_line_padding_does_not_change_hash() {
+        // A shorter terminal shows fewer/more blank rows; ignore them.
+        let a = content_hash("line one\nline two");
+        let b = content_hash("\nline one\n\n\nline two\n\n");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_text_changes_hash() {
+        assert_ne!(content_hash("answer yes?"), content_hash("answer no?"));
+    }
+
+    #[test]
+    fn line_boundaries_are_significant() {
+        // "ab" on one line is not the same content as "a"/"b" on two —
+        // the separator keeps these distinct so we don't collide real
+        // text differences.
+        assert_ne!(content_hash("ab"), content_hash("a\nb"));
+    }
 }
 
 #[cfg(test)]

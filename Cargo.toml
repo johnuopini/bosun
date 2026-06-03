@@ -1,6 +1,6 @@
 [package]
 name = "bosun-tmux"
-version = "0.4.1"
+version = "2.0.8"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Andy Miller <hello@skulkworks.dev>"]
@@ -38,6 +38,21 @@ signal-hook = "0.4"
 retrofont = "0.2"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+# 2.0 embedded-terminal stack. tui-term 0.3.x targets ratatui-core 0.1 /
+# ratatui-widgets 0.3, the widget surface ratatui 0.30 re-exports. The
+# vt100 repo has been quiet but tui-term actively tracks it, and the dep is
+# small enough to vendor in a one-file swap if maintenance ever stops. See
+# RESEARCH_2_0.md for the choice rationale + the Step 4 fallback to
+# alacritty_terminal if focus-mode hits vt100's mouse / HVP gaps.
+portable-pty = "0.9"
+vt100 = "0.16"
+tui-term = "0.3"
+
+# Unix `poll`/`read` for the timed outer-terminal color probe at
+# startup (OSC 10/11/12). Already in the tree transitively; pinned
+# direct so the probe code can call it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 insta = "1.47"

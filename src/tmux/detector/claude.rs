@@ -1,21 +1,38 @@
 //! Claude Code detector.
 //!
-//! Heuristic stack, cheapest first:
-//!   1. OSC title scan: Claude Code writes `ESC ] 0 ; ...` title updates.
-//!      When it's waiting on a prompt, the title often contains braille
-//!      spinner characters (e.g. ⠋⠙⠹). We look at the most recent OSC
-//!      title in the capture.
-//!   2. Trailing prompt markers in the plain text — "Do you want to"
-//!      confirmation prompt, "❯" selection marker, etc.
-//!   3. Thinking markers — Claude prints ``· Thinking…`` animations.
+//! Strategy: Claude Code has a recognizable bottom-of-screen UI (a
+//! box-drawn prompt with `╭─/│ > /╰─`) and emits known patterns
+//! around it. Confining most heuristics to the bottom region of the
+//! visible capture is the single biggest reliability win — it filters
+//! out stale "Thinking…" strings sitting in scrollback above the
+//! prompt and stops random shell output from triggering false
+//! positives.
 //!
-//! If none match we return `Unknown` and let the generic detector take
-//! over. Returning Unknown is fine — the registry will fall through.
+//! Stack, cheapest first:
+//!   1. Strong Claude anchor: the prompt-box corners (`╭` … `╮` …
+//!      `╰` … `╯`) appear in the bottom region. Falls back to the
+//!      classic substring anchors if the box isn't currently visible
+//!      (e.g. during a full-screen response).
+//!   2. Confirmation prompts ("Do you want to", `❯` option marker,
+//!      `(y/n)`) anywhere on screen → Waiting.
+//!   3. Active spinner: braille glyph in the OSC title OR a
+//!      "Thinking / Pondering / …" verb with ellipsis in the bottom
+//!      region → Running.
+//!   4. Idle fallback when none of the above fire.
+//!
+//! If the pane doesn't look like Claude at all, return Unknown so
+//! the registry falls through to the next detector.
 //!
 //! Tested against real Claude Code `capture-pane -e` fixtures under
 //! `tests/fixtures/detector/`.
 
 use super::{DetectContext, Status, StatusDetector};
+
+/// How many trailing non-empty lines to consider "the prompt region."
+/// Claude's prompt box is 3 lines; the surrounding hint / spinner /
+/// confirmation rows live within ~10 lines of it. Wider than that and
+/// we start matching stale output again.
+const BOTTOM_REGION_LINES: usize = 12;
 
 pub struct ClaudeDetector;
 
@@ -29,40 +46,68 @@ impl StatusDetector for ClaudeDetector {
     }
 
     fn detect(&self, ctx: &DetectContext<'_>) -> Status {
-        if !looks_like_claude(ctx.plain) {
+        let bottom = bottom_region(ctx.plain);
+
+        if !looks_like_claude(ctx.plain, &bottom) {
             return Status::Unknown;
         }
 
-        // Prompt markers — user needs to answer.
-        if has_prompt_marker(ctx.plain) {
+        // Prompt markers — user needs to answer. Scoped to the bottom
+        // region so a "(y/n)" in code output doesn't pin the glyph to
+        // Waiting forever.
+        if has_prompt_marker(&bottom) {
             return Status::Waiting;
         }
 
-        // Thinking / spinner markers — busy.
-        if has_thinking_marker(ctx.plain) || has_spinner_title(ctx.ansi) {
+        // Thinking / spinner markers — busy. Spinner title scan stays
+        // whole-capture (the OSC sequence lives outside the visible
+        // grid); the verb scan is bottom-region only.
+        if has_thinking_marker(&bottom) || has_spinner_title(ctx.ansi) {
             return Status::Running;
         }
 
-        // Looks like Claude but no explicit marker — use the last line
-        // to guess between Waiting (empty prompt line) and Idle (shell).
-        let last = tail_non_empty_line(ctx.plain);
-        if last.is_empty() || last.trim_start().starts_with('>') || last.contains('❯') {
-            return Status::Waiting;
-        }
-
+        // Claude is up but neither answering a prompt nor actively
+        // working. That covers an empty composer (a fresh instance you
+        // haven't tasked yet), a composer with unsubmitted text, the
+        // splash screen, and shell output after exit. None of these
+        // need your attention, so they all read as Idle — only an
+        // explicit confirmation/question (handled above) counts as
+        // Waiting. Previously a visible prompt box pinned the glyph to
+        // Waiting, which made every idle Claude look like it was asking
+        // for something.
         Status::Idle
     }
 }
 
-fn looks_like_claude(plain: &str) -> bool {
-    // Anchors unique enough that we won't collide with plain shell output.
-    plain.contains("claude")
-        || plain.contains("Claude")
-        || plain.contains("? for shortcuts")
-        || plain.contains("▐▛███▜▌") // Claude splash art
+/// Last N non-empty lines of `plain`, joined with `\n` in source
+/// order. Cheap to re-scan in subsequent helpers and small enough
+/// that substring checks stay free.
+fn bottom_region(plain: &str) -> String {
+    let mut lines: Vec<&str> = plain
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(BOTTOM_REGION_LINES)
+        .collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
-fn has_prompt_marker(plain: &str) -> bool {
+fn looks_like_claude(plain: &str, bottom: &str) -> bool {
+    // Strongest signal: Claude's box-drawn prompt corners visible in
+    // the bottom region. Unique enough that no plain shell pane will
+    // hit it by accident.
+    if bottom.contains('╭') && bottom.contains('╰') {
+        return true;
+    }
+    // Fall back to broader anchors for transient states where the
+    // box isn't currently rendered (full-screen modal, splash, etc.).
+    plain.contains("? for shortcuts")
+        || plain.contains("▐▛███▜▌") // splash art
+        || plain.contains("Claude Code")
+}
+
+fn has_prompt_marker(region: &str) -> bool {
     const PROMPTS: &[&str] = &[
         "Do you want to",
         "Would you like to",
@@ -72,14 +117,32 @@ fn has_prompt_marker(plain: &str) -> bool {
         "(Y/n)",
         "(y/N)",
     ];
-    PROMPTS.iter().any(|p| plain.contains(p))
+    if PROMPTS.iter().any(|p| region.contains(p)) {
+        return true;
+    }
+    // `❯` heads the *selected* row of a confirmation menu — but recent
+    // Claude versions ALSO use `❯` as the composer's input glyph
+    // (`│ ❯ …`), so a bare `❯` no longer means "waiting on a choice."
+    // Claude's menus are numbered (`❯ 1. Yes`), so only count `❯` when
+    // the text right after it starts with a digit. That matches the
+    // option arrow while ignoring an empty or typed-into composer.
+    region.lines().any(|l| match l.find('❯') {
+        Some(i) => l[i + '❯'.len_utf8()..]
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit()),
+        None => false,
+    })
 }
 
-fn has_thinking_marker(plain: &str) -> bool {
+fn has_thinking_marker(region: &str) -> bool {
     // Claude prints rotating verbs: "Thinking", "Pondering", etc., often
-    // preceded by a middle-dot bullet. We look for any of the common
-    // verbs combined with an ellipsis to avoid false positives from
-    // normal text.
+    // preceded by a `✻` / middle-dot bullet. We look for any of the
+    // common verbs combined with an ellipsis to avoid false positives
+    // from normal text. Scoped to the bottom region so a "Thinking…"
+    // line that scrolled past the prompt no longer pegs the glyph to
+    // Running.
     const VERBS: &[&str] = &[
         "Thinking",
         "Pondering",
@@ -89,10 +152,14 @@ fn has_thinking_marker(plain: &str) -> bool {
         "Formulating",
         "Contemplating",
         "Analyzing",
+        "Reasoning",
+        "Crafting",
+        "Considering",
+        "Working",
     ];
     VERBS
         .iter()
-        .any(|v| plain.contains(&format!("{}…", v)) || plain.contains(&format!("{}...", v)))
+        .any(|v| region.contains(&format!("{}…", v)) || region.contains(&format!("{}...", v)))
 }
 
 fn has_spinner_title(ansi: &[u8]) -> bool {
@@ -131,14 +198,6 @@ fn is_braille(c: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&c)
 }
 
-fn tail_non_empty_line(plain: &str) -> &str {
-    plain
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
@@ -158,31 +217,155 @@ mod tests {
     }
 
     #[test]
-    fn prompt_marker_yields_waiting() {
-        let ctx =
-            ctx_plain("Claude is ready\n> write some code\n\nDo you want to proceed? (y/n)\n");
+    fn empty_prompt_box_is_idle() {
+        // Steady-state Claude UI: prompt box visible, no spinner, no
+        // confirmation. A fresh/idle composer doesn't need the user's
+        // attention, so it reads as Idle — not Waiting.
+        let pane = "\
+Claude Code v2.1.152
+some prior output
+
+╭──────────────────────────────╮
+│ >                             │
+╰──────────────────────────────╯
+  ? for shortcuts
+";
+        let ctx = ctx_plain(pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
+    }
+
+    #[test]
+    fn caret_composer_glyph_is_idle() {
+        // Recent Claude uses `❯` as the composer input glyph. A bare
+        // `❯` in the prompt box must NOT read as a confirmation menu —
+        // this is the "fresh instance shows as waiting" bug.
+        let pane = "\
+Claude Code v2.1.152
+
+╭──────────────────────────────╮
+│ ❯                             │
+╰──────────────────────────────╯
+  ? for shortcuts
+";
+        let ctx = ctx_plain(pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
+    }
+
+    #[test]
+    fn caret_typed_into_composer_is_idle() {
+        // `❯` followed by free-form text (a typed-but-unsubmitted
+        // message) is still the composer, not a numbered menu.
+        let pane = "\
+Claude Code v2.1.152
+
+╭──────────────────────────────╮
+│ ❯ Fix the parser bug          │
+╰──────────────────────────────╯
+";
+        let ctx = ctx_plain(pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
+    }
+
+    #[test]
+    fn numbered_caret_menu_is_waiting() {
+        // The real confirmation menu: `❯` heads a numbered option.
+        let pane = "\
+Claude Code v2.1.152
+running a tool
+
+╭──────────────────────────────╮
+│ Edit file.rs?                 │
+│ ❯ 1. Yes                      │
+│   2. No                       │
+╰──────────────────────────────╯
+";
+        let ctx = ctx_plain(pane);
         assert_eq!(ClaudeDetector.detect(&ctx), Status::Waiting);
     }
 
     #[test]
-    fn thinking_yields_running() {
-        let ctx = ctx_plain("claude is working\n· Thinking…\n");
+    fn typed_but_unsubmitted_prompt_is_idle() {
+        // Text sitting in the composer (not yet submitted) still means
+        // Claude isn't doing anything — Idle, not Waiting.
+        let pane = "\
+Claude Code v2.1.152
+
+╭──────────────────────────────╮
+│ > fix the parser bug          │
+╰──────────────────────────────╯
+  ? for shortcuts
+";
+        let ctx = ctx_plain(pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
+    }
+
+    #[test]
+    fn confirm_prompt_yields_waiting() {
+        let pane = "\
+Claude Code v2.1.152
+running tool…
+
+Do you want to proceed? (y/n)
+❯ 1. Yes
+  2. No
+";
+        let ctx = ctx_plain(pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Waiting);
+    }
+
+    #[test]
+    fn thinking_in_bottom_region_yields_running() {
+        let pane = "\
+Claude Code session
+some output
+
+✻ Thinking… (3s · esc to interrupt)
+╭──────────────────────────────╮
+│ > my prompt                   │
+╰──────────────────────────────╯
+";
+        let ctx = ctx_plain(pane);
         assert_eq!(ClaudeDetector.detect(&ctx), Status::Running);
+    }
+
+    #[test]
+    fn stale_thinking_in_scrollback_does_not_trigger_running() {
+        // "Thinking…" appears far above the visible prompt, simulating
+        // a stale line that scrolled almost-off (still in the visible
+        // capture but well outside the bottom region). The live prompt
+        // box is an empty composer, so the pane reads as Idle — the
+        // key assertion is that the stale verb does NOT peg it Running.
+        let pane = format!(
+            "Claude Code v2.1.152\n· Thinking…\n{}\n╭──────╮\n│ >     │\n╰──────╯\n",
+            "filler line\n".repeat(20)
+        );
+        let ctx = ctx_plain(&pane);
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
     }
 
     #[test]
     fn spinner_title_yields_running() {
-        let ansi = b"Claude\n\x1b]0;\xe2\xa0\x8b Working\x07$ ";
-        let plain = strip_ansi(ansi);
+        // Build the byte stream by hand: OSC title with a braille
+        // spinner glyph, followed by a Claude prompt box. Mixing
+        // multi-byte UTF-8 into a byte string literal isn't allowed,
+        // so we concatenate.
+        let mut ansi: Vec<u8> = Vec::new();
+        ansi.extend_from_slice(b"Claude Code\n\x1b]0;\xe2\xa0\x8b Working\x07");
+        ansi.extend_from_slice("╭──╮\n│ > │\n╰──╯".as_bytes());
+        let plain = strip_ansi(&ansi);
         let now = SystemTime::now();
-        let ctx = DetectContext::from_parts(ansi, &plain, Some(now), now, None, "test");
+        let ctx = DetectContext::from_parts(&ansi, &plain, Some(now), now, None, "test");
         assert_eq!(ClaudeDetector.detect(&ctx), Status::Running);
     }
 
     #[test]
-    fn bare_prompt_line_is_waiting() {
-        let ctx = ctx_plain("Claude Code session\n\n> \n");
-        assert_eq!(ClaudeDetector.detect(&ctx), Status::Waiting);
+    fn bare_prompt_line_is_idle() {
+        // Pre-box fallback: still recognized as Claude via the splash /
+        // shortcuts anchor, but a bare `>` composer line is idle — the
+        // instance is up and waiting for you to type a task, which is
+        // not the same as the agent needing a decision.
+        let ctx = ctx_plain("Claude Code session\n? for shortcuts\n\n> \n");
+        assert_eq!(ClaudeDetector.detect(&ctx), Status::Idle);
     }
 
     #[test]

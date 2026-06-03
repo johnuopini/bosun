@@ -21,8 +21,8 @@
 //!   * Global bindings are removed by `ActorStatusBar::drop` when the
 //!     actor task ends, and by the panic hook via `emergency_uninstall`.
 //!   * Per-session options on still-living sessions are left in place
-//!     after bosun exits (the session still reads "⚓ bosun" in the
-//!     bar until it's killed). Harmless, and the next bosun run will
+//!     after bosun exits (the session keeps bosun's status-right hint
+//!     until it's killed). Harmless, and the next bosun run will
 //!     reuse them.
 //!
 //! This module is synchronous. Its callers are the `tmux_actor` task
@@ -57,17 +57,17 @@ pub struct BarSession {
 /// `#{@bosun_display}` in the context of whichever session the bar is
 /// being drawn for.
 ///
-/// Stays static — no conditional, no chip strip. The prefix+1..9
-/// jump bindings still install (see `bind_jump_keys`) so users who
-/// memorize them can use them, but the bar itself just shows the
-/// session name. Trying to render chips conditionally on
-/// `client_prefix` produced visible flicker on session switch in
-/// real-world testing, and a 10+ session chip list adds little for
-/// users who navigate via S-←/S-→ or the bosun TUI anyway.
-const STATUS_LEFT: &str = "#[bg=#7c5cff,fg=#0b0d12,bold] ⚓ bosun #[default] \
-                           #[fg=#e6e9ef,bold]#{?#{@bosun_display},#{@bosun_display},#S} ";
-/// Wide enough for the brand chip plus a 30-ish-char display name.
-const STATUS_LEFT_LEN: &str = "60";
+/// Empty by design. The active session's display name already shows
+/// in bosun's tab strip at the top of the pane, and bosun's own TUI
+/// footer carries the brand — so a tmux status-left segment here is
+/// pure redundancy fighting the agent UI running inside the pane.
+/// The status-right hint (detach / cycle / jump keys) still renders,
+/// and the prefix+1..9 jump bindings still install regardless (see
+/// `bind_jump_keys`).
+const STATUS_LEFT: &str = "";
+/// Unused now that `STATUS_LEFT` is empty, but kept so the
+/// `set-option` call site stays uniform with `status-right`.
+const STATUS_LEFT_LEN: &str = "0";
 const STATUS_RIGHT_LEN: &str = "120";
 const STATUS_STYLE: &str = "bg=default,fg=#e6e9ef";
 
@@ -233,13 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn status_left_renders_display_name_from_option() {
-        // Bar pulls the display name from each session's
-        // `@bosun_display` option (set when bosun creates the session)
-        // and falls back to `#S` if missing.
-        assert!(STATUS_LEFT.contains("@bosun_display"));
-        assert!(STATUS_LEFT.contains("#S"));
-        assert!(STATUS_LEFT.contains("⚓ bosun"));
+    fn status_left_is_empty() {
+        // The pane's tmux status-left was dropped entirely: the session
+        // name lives in bosun's tab strip and the brand in its TUI
+        // footer, so a left segment here would just be redundant.
+        assert_eq!(STATUS_LEFT, "");
     }
 
     #[test]

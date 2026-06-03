@@ -51,9 +51,17 @@ enum Field {
 }
 
 impl Field {
-    /// Ordered list of fields visible for the currently-selected agent.
-    fn visible_for(agent: &str) -> Vec<Field> {
-        let mut v = vec![Field::Name, Field::Path, Field::Agent, Field::Args];
+    /// Ordered list of fields the user can tab between for the
+    /// currently-selected agent. `lock_path` drops `Field::Path`
+    /// from the list — used in add-tab mode where the path is
+    /// inherited from the container and isn't editable.
+    fn visible_for(agent: &str, lock_path: bool) -> Vec<Field> {
+        let mut v = vec![Field::Name];
+        if !lock_path {
+            v.push(Field::Path);
+        }
+        v.push(Field::Agent);
+        v.push(Field::Args);
         match agent {
             "claude" => {
                 v.push(Field::ClaudeSession);
@@ -90,6 +98,22 @@ pub struct NewSessionModal {
     /// Whether the path dropdown overlay is showing. Dismissed by
     /// Escape; re-activated by typing, backspace, or arrow-down.
     path_dropdown_active: bool,
+    /// Internal session name this modal is editing in modify mode.
+    /// `None` is the standard "create new session" flow that emits
+    /// `Command::CreateSession`. `Some(internal)` switches the
+    /// submit path to `Command::ModifySession` against that
+    /// session — pre-filled from its stored metadata. The internal
+    /// name is never user-editable, so we stash it once at
+    /// construction and read it back on submit.
+    modify_for: Option<String>,
+    /// Container ID this modal is adding a tab to. `None` is the
+    /// standard "create a fresh sidebar container" flow.
+    /// `Some(container_id)` locks the path field to the container's
+    /// path (read-only) and stamps the id onto the emitted
+    /// `SessionSpec.container_id` so the new tmux session joins
+    /// that container as another tab. Tab mode is mutually
+    /// exclusive with modify mode.
+    add_tab_to: Option<String>,
 }
 
 /// One row in the filesystem dropdown. `name` is the last path
@@ -128,9 +152,74 @@ impl NewSessionModal {
             path_suggestion_idx: None,
             path_suggestion_scroll: 0,
             path_dropdown_active: true,
+            modify_for: None,
+            add_tab_to: None,
         };
         modal.apply_remembered_options();
         modal
+    }
+
+    /// Construct the modal in modify mode: pre-fill every field
+    /// from `spec` and remember `internal` so submit emits
+    /// `Command::ModifySession` against the right tmux session
+    /// instead of a fresh `CreateSession`. Recents are still
+    /// passed in for Ctrl+R access — modifying lets the user pull
+    /// flags from a past session just like creating does.
+    pub fn for_modify(internal: String, spec: SessionSpec, recents: Vec<Recent>) -> Self {
+        let mut modal = Self {
+            name: String::new(),
+            path: String::new(),
+            agent_idx: 0,
+            args: String::new(),
+            claude: ClaudeOptions::default(),
+            codex: CodexOptions::default(),
+            field: Field::Name,
+            error: None,
+            recents,
+            path_suggestion_idx: None,
+            path_suggestion_scroll: 0,
+            path_dropdown_active: false,
+            modify_for: Some(internal),
+            add_tab_to: None,
+        };
+        modal.fill_from_spec(spec);
+        modal
+    }
+
+    /// Construct the modal in add-tab mode: pre-fill the path from
+    /// the container (rendered read-only — all tabs share one
+    /// path) and remember `container_id` so submit stamps it onto
+    /// the new session's `@bosun_container_id` and reconcile routes
+    /// the new tmux session as a tab on the container instead of a
+    /// fresh sidebar row. The `name` field starts empty so the user
+    /// types a fresh tab label — the container's existing internal
+    /// tmux name is not a useful seed.
+    pub fn for_add_tab(container_id: String, container_path: String, recents: Vec<Recent>) -> Self {
+        let mut modal = Self {
+            name: String::new(),
+            path: container_path,
+            agent_idx: 0,
+            args: String::new(),
+            claude: ClaudeOptions::default(),
+            codex: CodexOptions::default(),
+            field: Field::Name,
+            error: None,
+            recents,
+            path_suggestion_idx: None,
+            path_suggestion_scroll: 0,
+            path_dropdown_active: false,
+            modify_for: None,
+            add_tab_to: Some(container_id),
+        };
+        modal.apply_remembered_options();
+        modal
+    }
+
+    /// True when this modal is adding a tab to an existing
+    /// container (path is locked, no path dropdown, submit emits
+    /// `CreateSession` with the container_id stamped on the spec).
+    pub fn is_add_tab(&self) -> bool {
+        self.add_tab_to.is_some()
     }
 
     /// Filesystem entries that match the current `self.path`.
@@ -233,7 +322,7 @@ impl NewSessionModal {
     }
 
     fn next_field(&mut self) {
-        let visible = Field::visible_for(self.agent());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab());
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + 1) % visible.len()];
         if self.field == Field::Path {
@@ -242,7 +331,7 @@ impl NewSessionModal {
     }
 
     fn prev_field(&mut self) {
-        let visible = Field::visible_for(self.agent());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab());
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + visible.len() - 1) % visible.len()];
         if self.field == Field::Path {
@@ -257,7 +346,7 @@ impl NewSessionModal {
     /// (agent can only change while on Field::Agent) — but the clamp
     /// is cheap and keeps the invariant obvious.
     fn clamp_field_for_agent(&mut self) {
-        let visible = Field::visible_for(self.agent());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab());
         if !visible.contains(&self.field) {
             self.field = Field::Agent;
         }
@@ -343,6 +432,7 @@ impl NewSessionModal {
                 claude: self.claude.clone(),
                 codex: self.codex.clone(),
             },
+            container_id: self.add_tab_to.clone(),
         })
     }
 }
@@ -424,7 +514,16 @@ impl Modal for NewSessionModal {
                     }
                 }
                 match self.build_spec() {
-                    Ok(spec) => ModalResult::Close(Some(Command::CreateSession(spec))),
+                    Ok(spec) => {
+                        let cmd = match &self.modify_for {
+                            Some(internal) => Command::ModifySession {
+                                internal: internal.clone(),
+                                spec,
+                            },
+                            None => Command::CreateSession(spec),
+                        };
+                        ModalResult::Close(Some(cmd))
+                    }
                     Err(e) => {
                         self.error = Some(e);
                         ModalResult::Consumed
@@ -592,10 +691,22 @@ impl Modal for NewSessionModal {
             rect.height.saturating_sub(2),
         );
 
+        let title_text = if self.is_add_tab() {
+            "Add tab"
+        } else if self.modify_for.is_some() {
+            "Modify session"
+        } else {
+            "New session"
+        };
+        let path_label = if self.is_add_tab() {
+            "path (locked to container)"
+        } else {
+            "path"
+        };
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(vec![
                 Span::styled(
-                    "New session",
+                    title_text,
                     Style::default()
                         .fg(theme.text)
                         .bg(body_bg)
@@ -610,7 +721,7 @@ impl Modal for NewSessionModal {
             label_line("name", self.field == Field::Name, theme),
             input_line(&self.name, self.field == Field::Name, inner.width, theme),
             Line::from(""),
-            label_line("path", self.field == Field::Path, theme),
+            label_line(path_label, self.field == Field::Path, theme),
             input_line(&self.path, self.field == Field::Path, inner.width, theme),
         ];
 
@@ -1302,6 +1413,7 @@ mod tests {
                 claude: ClaudeOptions::default(),
                 codex: CodexOptions { yolo: true },
             },
+            container_id: None,
         };
         m.on_child_closed(ModalData::FillSessionSpec(spec));
         assert_eq!(m.name, "api");

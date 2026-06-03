@@ -32,6 +32,21 @@ pub struct TmuxSession {
     /// which is more stable than `current_path` (which tracks the
     /// shell's cwd and can drift). `None` for non-bosun sessions.
     pub spec_path: Option<String>,
+    /// Container ID stored in `@bosun_container_id` at create time.
+    /// Identifies which sidebar container this tmux session belongs
+    /// to ("tab" semantics — multiple sessions sharing one sidebar
+    /// row). `None` for non-bosun sessions and for older bosun
+    /// sessions from before the container feature shipped; those
+    /// reconcile into their own fresh single-tab containers.
+    pub container_id: Option<String>,
+    /// Width (columns) of the session's active pane on this poll, from
+    /// `#{pane_width}`. Used by the unread tracker to distinguish a real
+    /// content change from a reflow: a different width means the pane
+    /// was resized (terminal resize, the focus-embed sizing it to the
+    /// preview area, or a second bosun instance attaching), which
+    /// rewraps the text without any new agent output. `0` when unknown
+    /// (older tmux output / terse test fixtures).
+    pub pane_width: u16,
 }
 
 impl TmuxSession {
@@ -60,6 +75,13 @@ pub struct SessionView {
     /// can render without cloning the whole buffer on every frame.
     /// `None` for sessions we skipped capturing on this tick.
     pub preview: Option<Arc<[u8]>>,
+    /// Hash of the visible pane's plain text on this poll. The app
+    /// compares it against the hash the user last *saw* (when the
+    /// session was selected) to decide whether the row has unviewed
+    /// changes — the "unread" notification dot. `0` means "no usable
+    /// capture this tick" (empty / failed) and never counts as a
+    /// change. Computed by the actor in `refresh_all`.
+    pub content_hash: u64,
 }
 
 impl SessionView {
@@ -68,6 +90,7 @@ impl SessionView {
             session,
             status,
             preview,
+            content_hash: 0,
         }
     }
 
@@ -79,5 +102,12 @@ impl SessionView {
     /// The pretty display name — use this in the UI.
     pub fn display(&self) -> &str {
         self.session.display()
+    }
+
+    /// Width of the session's active pane on this poll (see
+    /// [`TmuxSession::pane_width`]). Paired with [`Self::content_hash`]
+    /// by the unread tracker so a reflow isn't mistaken for new output.
+    pub fn width(&self) -> u16 {
+        self.session.pane_width
     }
 }

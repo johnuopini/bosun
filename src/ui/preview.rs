@@ -22,9 +22,21 @@ use ratatui::Frame;
 
 use crate::app::AppState;
 use crate::sidebar::{Location, VisibleKind};
-use crate::ui::{banner, section_preview, Theme};
+use crate::ui::embed_terminal::EmbedTerminal;
+use crate::ui::{banner, section_preview, tab_strip, Theme};
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    embed: Option<&EmbedTerminal>,
+    // Whether the embed reserves focus-border cells. False for the
+    // full-body layouts (narrow terminal, or sidebar collapsed via
+    // Ctrl+B) where no border is drawn and the embed fills edge to
+    // edge. Mirrors `App::embed_has_border`.
+    with_border: bool,
+) {
     // Reset every cell in the preview area to Color::Reset before drawing
     // so any leftover styling from a previous frame (e.g. the placeholder
     // text) doesn't bleed through into a later TUI capture.
@@ -38,6 +50,37 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
         section_preview::render_empty(frame.buffer_mut(), area, font, theme);
         return;
     }
+
+    // If the cursor is on a container, carve a 1-row tab strip off
+    // the top of the preview rect. Single-tab containers get the
+    // strip too so the `+` add-tab button is always reachable
+    // without having to first create a second tab. The strip lives
+    // above the focus border, so embed-area math (focus-border
+    // inset) operates on the *remaining* rect.
+    let mut working_area = area;
+    if let Some(container) = state
+        .sidebar
+        .visible()
+        .get(state.selected)
+        .and_then(|e| e.container())
+    {
+        if area.height > 0 && area.width > 0 {
+            let strip_area = Rect::new(area.x, area.y, area.width, 1);
+            let tab_views: Vec<Option<&crate::tmux::session::SessionView>> = container
+                .members
+                .iter()
+                .map(|m| state.session_by_name(m))
+                .collect();
+            tab_strip::render(frame.buffer_mut(), strip_area, container, &tab_views, theme);
+            working_area = Rect::new(
+                area.x,
+                area.y + 1,
+                area.width,
+                area.height.saturating_sub(1),
+            );
+        }
+    }
+    let area = working_area;
 
     // Section header selected: render banner + per-section table.
     // The cursor location tells us which section, regardless of how
@@ -53,7 +96,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 let members: Vec<&crate::tmux::session::SessionView> = sec
                     .members
                     .iter()
-                    .filter_map(|n| state.session_by_name(n))
+                    .filter_map(|c| state.session_by_name(&c.active))
                     .collect();
                 section_preview::render_section(
                     frame.buffer_mut(),
@@ -63,6 +106,46 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                     font,
                     theme,
                 );
+                return;
+            }
+        }
+    }
+
+    // 2.0 fast path: if there's a live embed and its session matches
+    // the cursor's selection, render the vt100 grid via tui-term.
+    // The embed gets a real-time stream from the PTY, no scroll math
+    // required — vt100 already maintains the right scrollback row
+    // alignment inside its screen grid. Falls through to the polled
+    // snapshot path for non-focused sessions, when the embed is
+    // disabled, or when the spawn failed.
+    //
+    // Shrink by 1 cell on each side whenever single-window mode is
+    // on — focused or not. When focused the focus border occupies
+    // those reserved cells; when unfocused they stay blank, acting
+    // as a transparent placeholder. Reserving the space in both
+    // states keeps the inner app's wrap width constant across focus
+    // toggles, so attaching / detaching no longer shifts every line
+    // by a column (which used to reflow paragraphs and look like
+    // the content was jumping). The matching PTY shrink lives in
+    // `App::preview_dims` so the inner app's terminal dimensions
+    // match the area we actually render into.
+    if let Some(embed) = embed {
+        if let Some(name) = state.selected_session_name() {
+            if embed.session() == name {
+                // Reserve the focus-border cells only when the caller
+                // says a border is drawn (the wide sidebar + preview
+                // layout). On a narrow terminal or with the sidebar
+                // collapsed via Ctrl+B the embed owns the whole body
+                // and no border is painted, so insetting would just
+                // leave dead padding on the sides — give it the full
+                // width instead. Keep in sync with `App::preview_dims`
+                // / `App::embed_rect` / `App::embed_has_border`.
+                let render_area = if with_border && state.single_window_mode {
+                    shrink_for_focus_border(area)
+                } else {
+                    area
+                };
+                embed.render(frame.buffer_mut(), render_area);
                 return;
             }
         }
@@ -94,6 +177,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     Paragraph::new(text)
         .scroll((scroll_y, 0))
         .render(area, frame.buffer_mut());
+}
+
+/// Inset `area` by one cell on every side. Returns a zero-sized
+/// rect if the area is too small to inset safely — callers should
+/// already have wider minimum-rect handling, so this is a last-line
+/// guard rather than a meaningful fallback.
+fn shrink_for_focus_border(area: Rect) -> Rect {
+    if area.width < 2 || area.height < 2 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
 }
 
 fn reset_area(buf: &mut Buffer, area: Rect) {

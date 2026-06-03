@@ -69,6 +69,31 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Pick a legible foreground for text drawn on top of `bg`.
+    /// Chooses near-black or near-white by the background's perceived
+    /// luminance (ITU-R BT.601 weights), so accent-filled surfaces —
+    /// the "bosun" status chip, the active tab — stay readable on
+    /// both light and dark accents across every theme, built-in or
+    /// user-supplied. Non-RGB backgrounds (which we can't measure)
+    /// fall back to the theme's primary text color.
+    ///
+    /// The threshold leans slightly toward dark ink: a mid-tone
+    /// accent reads better with dark text than white, and that's the
+    /// case the default themes hit.
+    pub fn on(&self, bg: Color) -> Color {
+        match bg {
+            Color::Rgb(r, g, b) => {
+                let luminance = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                if luminance > 140.0 {
+                    Color::Rgb(0x10, 0x12, 0x18) // near-black ink
+                } else {
+                    Color::Rgb(0xf2, 0xf3, 0xf5) // near-white ink
+                }
+            }
+            _ => self.text,
+        }
+    }
+
     /// Resolve a theme by name. Checks the user theme directory
     /// first, then the built-in set, then falls back to opencode.
     pub fn load(name: &str, user_dir: Option<&Path>) -> Self {
@@ -174,6 +199,108 @@ impl Theme {
     }
 }
 
+/// Whether the outer terminal can render 24-bit ("true") color.
+/// Modern terminals (iTerm2, Ghostty, WezTerm, Warp, kitty, Alacritty,
+/// …) advertise it through `COLORTERM=truecolor` / `24bit`. Apple
+/// Terminal.app does not — it speaks only the 256-color xterm palette
+/// and renders 24-bit SGR sequences as garbage, which is why bosun's
+/// all-`Rgb` chrome looked broken there. `BOSUN_TRUECOLOR=1`/`0`
+/// forces the decision for terminals that misreport or for testing.
+///
+/// Resolved once and cached: the environment can't change under a
+/// running process, and `ui::draw` calls this every frame.
+pub fn terminal_truecolor() -> bool {
+    use std::sync::OnceLock;
+    static TRUECOLOR: OnceLock<bool> = OnceLock::new();
+    *TRUECOLOR.get_or_init(|| {
+        if let Some(v) = std::env::var_os("BOSUN_TRUECOLOR") {
+            return v == "1" || v == "true";
+        }
+        matches!(
+            std::env::var("COLORTERM").as_deref(),
+            Ok("truecolor") | Ok("24bit")
+        )
+    })
+}
+
+/// Replace every 24-bit `Rgb` color in `buf` with the nearest
+/// xterm-256 indexed color. Run once per frame (after all rendering)
+/// when the outer terminal can't do truecolor, so bosun's chrome
+/// *and* any truecolor an embedded pane emitted both land on a palette
+/// the terminal can actually display. Doing it as a single post-pass
+/// over the finished buffer means the theme, the `on()` helper, and
+/// every render site stay blissfully truecolor — only this chokepoint
+/// knows about the fallback. Named colors / already-indexed cells pass
+/// through untouched.
+pub fn degrade_buffer_to_256(buf: &mut ratatui::buffer::Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            cell.fg = to_256(cell.fg);
+            cell.bg = to_256(cell.bg);
+            cell.underline_color = to_256(cell.underline_color);
+        }
+    }
+}
+
+/// Map a single color into the 256-color space. Only `Rgb` is
+/// rewritten; `Reset`, named ANSI, and `Indexed` colors are already
+/// representable and pass through.
+fn to_256(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Indexed(rgb_to_xterm256(r, g, b)),
+        other => other,
+    }
+}
+
+/// Nearest xterm-256 index for a 24-bit color. Considers both the
+/// 6×6×6 color cube (indices 16–231) and the 24-step grayscale ramp
+/// (232–255) and picks whichever is closer in Euclidean RGB distance —
+/// grays in particular look far better off the ramp than off the
+/// coarse cube. The 16 system colors (0–15) are skipped on purpose:
+/// their actual RGB is terminal/theme-defined and unreliable, so we
+/// never quantize *to* them.
+fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
+    const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+    // Nearest cube step for one channel → (step index, step value).
+    let nearest_step = |c: u8| -> (usize, u8) {
+        let mut best = 0usize;
+        let mut best_d = u16::MAX;
+        for (i, &s) in STEPS.iter().enumerate() {
+            let d = (s as i16 - c as i16).unsigned_abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        (best, STEPS[best])
+    };
+    let (ri, rv) = nearest_step(r);
+    let (gi, gv) = nearest_step(g);
+    let (bi, bv) = nearest_step(b);
+    let cube_code = (16 + 36 * ri + 6 * gi + bi) as u8;
+
+    // Nearest gray on the 232..=255 ramp (values 8, 18, … 238).
+    let avg = ((r as u16 + g as u16 + b as u16) / 3) as i16;
+    let gray_i = (((avg - 8) as f32 / 10.0).round() as i16).clamp(0, 23);
+    let gray_v = (8 + gray_i * 10) as u8;
+    let gray_code = 232 + gray_i as u8;
+
+    let dist = |cr: u8, cg: u8, cb: u8| -> i32 {
+        let dr = r as i32 - cr as i32;
+        let dg = g as i32 - cg as i32;
+        let db = b as i32 - cb as i32;
+        dr * dr + dg * dg + db * db
+    };
+    if dist(rv, gv, bv) <= dist(gray_v, gray_v, gray_v) {
+        cube_code
+    } else {
+        gray_code
+    }
+}
+
 mod hex_color {
     use ratatui::style::Color;
     use serde::{Deserialize, Deserializer};
@@ -201,6 +328,57 @@ mod hex_color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgb_to_256_maps_cube_corners() {
+        // Pure black / white are the cube corners 16 / 231.
+        assert_eq!(rgb_to_xterm256(0, 0, 0), 16);
+        assert_eq!(rgb_to_xterm256(255, 255, 255), 231);
+        // Exact cube primaries land on their cube codes.
+        assert_eq!(rgb_to_xterm256(255, 0, 0), 196); // 16 + 36*5
+        assert_eq!(rgb_to_xterm256(0, 255, 0), 46); // 16 + 6*5
+        assert_eq!(rgb_to_xterm256(0, 0, 255), 21); // 16 + 5
+    }
+
+    #[test]
+    fn rgb_to_256_prefers_grayscale_ramp_for_grays() {
+        // A neutral mid-gray (#808080) is closer to the 232+ ramp than
+        // to any cube step, so it must resolve into the ramp range.
+        let idx = rgb_to_xterm256(0x80, 0x80, 0x80);
+        assert!((232..=255).contains(&idx), "expected ramp, got {idx}");
+    }
+
+    #[test]
+    fn to_256_passes_through_non_rgb() {
+        assert_eq!(to_256(Color::Reset), Color::Reset);
+        assert_eq!(to_256(Color::Indexed(42)), Color::Indexed(42));
+        assert_eq!(to_256(Color::Red), Color::Red);
+        assert!(matches!(to_256(Color::Rgb(10, 20, 30)), Color::Indexed(_)));
+    }
+
+    #[test]
+    fn on_picks_dark_ink_for_light_accent() {
+        let t = Theme::builtin("tokyonight").expect("tokyonight must parse");
+        // tokyonight's accent is a light blue → dark ink for contrast.
+        assert_eq!(t.on(t.accent), Color::Rgb(0x10, 0x12, 0x18));
+        // An explicitly light background → dark ink.
+        assert_eq!(
+            t.on(Color::Rgb(0xff, 0xff, 0xff)),
+            Color::Rgb(0x10, 0x12, 0x18)
+        );
+    }
+
+    #[test]
+    fn on_picks_light_ink_for_dark_accent() {
+        let t = Theme::builtin("opencode").expect("opencode must parse");
+        // opencode's accent is a mid-dark purple → light ink stays readable.
+        assert_eq!(t.on(t.accent), Color::Rgb(0xf2, 0xf3, 0xf5));
+        // An explicitly dark background → light ink.
+        assert_eq!(
+            t.on(Color::Rgb(0x00, 0x00, 0x00)),
+            Color::Rgb(0xf2, 0xf3, 0xf5)
+        );
+    }
 
     #[test]
     fn builtin_opencode_parses() {

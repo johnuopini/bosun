@@ -113,8 +113,28 @@ pub fn spawn(tx: mpsc::UnboundedSender<AppMsg>) -> Handle {
                             break;
                         }
                     }
-                    Ok(Event::FocusGained) | Ok(Event::FocusLost) | Ok(Event::Paste(_)) => {
-                        // Not interested — drop the event and keep polling.
+                    Ok(Event::Paste(text)) => {
+                        if tx.send(AppMsg::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::FocusGained) => {
+                        // iTerm's Cmd+R "reset" clears the screen and
+                        // exits alt screen without telling ratatui;
+                        // when the user re-focuses the pane we force a
+                        // full repaint to recover. See `App::run`.
+                        if tx.send(AppMsg::FocusGained).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::FocusLost) => {
+                        // Track focus loss so the next `FocusGained`
+                        // is treated as a genuine refocus (recovery
+                        // runs once) rather than the echo a terminal
+                        // emits when focus reporting is re-enabled.
+                        if tx.send(AppMsg::FocusLost).is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(AppMsg::Fatal(format!("input read: {e}")));
