@@ -1,6 +1,6 @@
 # Bosun
 
-![Bosun Screenshot](screenshot.png)
+![Bosun Screenshot](screenshot.png?3939393)
 
 Tmux-native orchestrator for AI agent sessions. Written in Rust with
 [ratatui](https://ratatui.rs/).
