@@ -4,19 +4,361 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.8] — 2026-06-03
+
+### Fixed
+- **Unread dots no longer fire on layout changes.** The unread
+  fingerprint is now keyed on each session's pane width, so a reflow is
+  treated as layout instead of new output: resizing the terminal,
+  moving the selection (which sizes the focused pane to the preview
+  area), re-attaching from a different-size device, or a second bosun
+  instance attaching to the shared tmux server. Previously any of these
+  re-wrapped the captured text and lit sessions as unread with no agent
+  activity — connecting from a phone could mark everything unread, and
+  just moving off a session could mark it unread. Crucially, one bosun
+  instance resizing a shared pane can no longer flip another instance's
+  dots. The fingerprint also ignores per-line trailing whitespace and
+  blank rows, so pane-width padding doesn't perturb it.
+
+## [2.0.7] — 2026-06-01
+
+### Added
+- **`opencode` banner font, now the default.** A custom lowercase pixel
+  font modeled on the opencode CLI logo: square-cornered glyphs with a
+  5-row body and 1-row ascender/descender legs, rendered with half-block
+  cells so it sits at the same compact scale as the other banner fonts.
+  It ships as a color TheDraw font (`themes/banners/opencode.tdf`) and is
+  the new default for section headers and the empty-state splash; press
+  `f` to cycle to the previous fonts (`eatmex`, `metalix`, …). Generated
+  by, and tweakable via, `scripts/gen_opencode_tdf.py`.
+
+## [2.0.6] — 2026-06-01
+
+### Added
+- **Unread indicator for sessions with unviewed activity.** Each
+  sidebar row now shows a red notification dot in the gutter and a
+  bold name when that session's pane has changed since you last looked
+  at it — a finished turn, a permission prompt, a question, any new
+  output. It works by fingerprinting each session's visible text on
+  the refresh bosun already runs (no extra tmux calls) and comparing
+  against the snapshot from the last time the row was selected.
+  Selecting a row marks it seen and clears the dot; it lights again if
+  the session keeps changing while you're looking elsewhere. New rows
+  and failed captures never start unread.
+
+### Fixed
+- **A fresh or idle Claude no longer shows as "waiting" (◐).** Recent
+  Claude versions use `❯` as the composer's input glyph, which the
+  detector read as a confirmation menu — so an untasked instance
+  sitting at its prompt looked like it needed an answer. `Waiting` is
+  now limited to genuine decision points (numbered `❯ 1.` menus,
+  `Do you want to…`, `(y/n)`); an empty or typed-but-unsubmitted
+  composer reads as `Idle`.
+
+## [2.0.5] — 2026-05-29
+
+### Added
+- **Hide / show the sidebar with `Ctrl+B`.** While focused on a
+  session, `Ctrl+B` collapses the sidebar so the embedded pane takes
+  the full width, and brings it back. The preference is sticky
+  (persisted to `config.toml` as `sidebar_hidden`) and only applies
+  while focused — detaching with `Ctrl+Q` always restores the sidebar
+  so the session list stays reachable, and re-focusing re-applies your
+  choice. Documented in the help cheat-sheet.
+- **Terminal background detection for embedded agents.** Apps like
+  Codex and Neovim probe the terminal's default background (OSC 10/11)
+  at startup to pick a light vs dark palette. Inside bosun those
+  queries dead-ended at the embed's parser, so Codex assumed a dark
+  background and rendered diffs with dark colors on a light terminal.
+  bosun now probes the real outer terminal for its fg/bg/cursor at
+  startup and answers those queries on the embedded session's PTY
+  (falling back to the active theme's colors if the terminal doesn't
+  report). Fixes [#2](https://github.com/yetidevworks/bosun/issues/2).
+
+### Changed
+- **The add-tab `+` button now sits beside the last tab.** It used to
+  float at the far right edge of the tab strip; it now follows the
+  last tab directly and renders on a slightly raised background so it
+  reads as a small button instead of getting lost.
+
+### Fixed
+- **Fast flicker in Ghostty and other focus-reporting terminals.** The
+  2.0.3 `Cmd+R` recovery re-enabled focus reporting on every focus
+  gain; terminals that echo their focus state when reporting is
+  enabled (Ghostty) looped — recover → echoed FocusGained → recover —
+  as a continuous full-screen flicker. Recovery now runs only on a
+  genuine lost→gained transition, so the echo is swallowed. iTerm's
+  `Cmd+R` repaint still works.
+- **Unreadable colors in terminals without 24-bit color.** bosun's
+  themes are all true-color, which Apple Terminal can't render, so its
+  UI came out garbled and often illegible. On a terminal that doesn't
+  advertise `COLORTERM=truecolor`, bosun now down-samples every color
+  to the nearest xterm-256 palette entry in a final pass over the
+  frame. Modern terminals (iTerm2, Ghostty, Warp, WezTerm, …) are
+  unaffected and keep full 24-bit color. `BOSUN_TRUECOLOR=1`/`0`
+  overrides the detection.
+
+## [2.0.4] — 2026-05-28
+
+### Changed
+- **Dropped the embedded pane's tmux `status-left`.** The `⚓ bosun`
+  chip and the session name are redundant once you're focused: the
+  session name already shows in bosun's tab strip and the brand in
+  its own TUI footer, so the pane's left status segment was just
+  noise fighting the agent UI. The right-side key hint
+  (detach / cycle / jump) stays.
+
+### Fixed
+- **Narrow / mobile embed now fills the full pane width.** Focused
+  mode reserved a one-cell focus-border inset on every side even on
+  narrow terminals — where no border is actually drawn — leaving
+  dead padding down the left and right (and top/bottom). The embed
+  now renders edge-to-edge in that layout, with the PTY size and
+  mouse hit-testing reclaiming the same cells so everything stays
+  aligned.
+
+## [2.0.3] — 2026-05-28
+
+### Added
+- **Word-wise editing in the focused embed.** `Option+Delete`
+  deletes the previous word and `Option+Left`/`Option+Right` move
+  the cursor by word inside the embedded session. bosun now emits
+  the readline word-motion bytes (`ESC \x7f` for delete-word,
+  `ESC b`/`ESC f` for word-left/right) that zsh, bash, and Claude
+  Code honor, instead of the xterm `\e[1;3D` Alt-arrow form those
+  apps ignore.
+- **Kitty keyboard protocol at startup.** bosun requests the
+  `DISAMBIGUATE_ESCAPE_CODES` enhancement (gated on
+  `supports_keyboard_enhancement`, so it's a no-op on terminals
+  that don't speak it). This is what makes `Option`+key chords
+  arrive with their modifier bits intact; without it the outer
+  terminal falls back to legacy encoding and hands bosun bare
+  keys, so word-motion and word-delete couldn't be distinguished
+  from a plain arrow or backspace. Popped and re-pushed around the
+  full-screen `tmux attach` path and on panic.
+- **`BOSUN_KEYLOG` debug facility.** Setting the env var appends
+  every focused-mode key event (code, modifiers, kind) to
+  `/tmp/bosun-keys.log` — useful for diagnosing how a given
+  terminal encodes a chord without a rebuild.
+- **`Ctrl+L` redraw and focus-gain recovery.** `Ctrl+L` forces a
+  full repaint — re-enters alt screen, re-arms mouse / paste /
+  focus reporting, re-pushes the keyboard flags, and clears
+  ratatui's cached frame — and still forwards `^L` to the inner
+  shell. bosun also listens for focus events now, so switching
+  back to the window after iTerm's `Cmd+R` "reset" repaints
+  automatically. The help cheat-sheet documents both, plus the
+  Option word-motion / word-delete keys.
+
+### Fixed
+- **syspolicyd CPU storm from the fast preview tick.** The fast
+  status tick was running `tmux capture-pane` for *every* managed
+  session every ~200ms (`1 + N` short-lived `tmux` execs per tick).
+  At a dozen sessions that's ~60 process spawns a second per bosun
+  instance, and because macOS Gatekeeper re-scans every exec of an
+  ad-hoc-signed binary (Homebrew's `tmux` included) without caching
+  the verdict, `syspolicyd` could peg every core. The fast tick now
+  captures only the *focused* session — the one whose preview you're
+  watching — and skips entirely when nothing is focused; background
+  sessions keep their 1Hz status refresh. Per-instance fast-tick
+  exec rate drops ~6×.
+- **Unreadable text on accent-colored chips.** The "bosun" status
+  chip and the active tab (top strip and sidebar pill) drew light
+  text on the theme accent, which was low-contrast on light accents
+  (tokyonight) and illegible in some terminals. A new luminance-aware
+  `Theme::on` picks near-black or near-white ink per the accent's
+  brightness, so the label stays readable across every built-in and
+  user theme.
+
+## [2.0.2] — 2026-05-28
+
+### Changed
+- **Single-window focused mode is now the only mode.** The `s`
+  toggle, the `Command::SaveSingleWindow` persistence, the
+  `BOSUN_SINGLE_WINDOW` env var, and the legacy full-screen
+  `tmux attach` path are all gone. `Enter` on a session always
+  opens it in the embedded focused PTY; `Ctrl+Q` always brings
+  you back to the sidebar. Result: consistent keybindings — tab
+  cycle, session cycle, modals — regardless of where you came
+  from, and no more "bosun is paused while you're attached" trap
+  where bosun couldn't intercept keys.
+- **Plain `→`/`←` cycle tabs** within the selected container in
+  sidebar mode (no-op on single-tab containers). `Enter` is now
+  the only attach key; the old "Right also attaches" muscle
+  memory collided with arrow-key navigation. `Shift+→/←` and
+  `] [` still cycle tabs too, for parity with focused mode.
+
+### Added
+- **Mobile / narrow-terminal focused mode.** Below
+  `PREVIEW_MIN_WIDTH` (80 cols), `Enter` on a session hands the
+  entire body to the embed — sidebar hidden, embed full width —
+  so bosun's key handlers stay alive on a phone via mosh.
+  `Ctrl+Q` detaches back to the sidebar. Previously narrow
+  mode silently disabled focused mode, dropping users into a
+  full-screen `tmux attach` where bosun couldn't intercept tab
+  chords.
+- **Tab list under multi-tab containers in narrow mode.**
+  Without the preview pane visible, the tab strip wasn't
+  reachable. The sidebar now renders a third line per container
+  listing each tab, with the active tab styled like the `bosun`
+  chip, so tab membership and the active tab are visible at a
+  glance on mobile.
+
+### Fixed
+- **Sidebar `Shift+arrow` matching with extra modifier bits.**
+  Some mobile SSH clients ship Shift+arrow with extra flags
+  (`SHIFT|KEYPAD`, `SHIFT|ALT`, etc.). The sidebar handler used
+  exact `KeyModifiers::SHIFT` matching and silently dropped
+  those, even though the focused handler caught them via
+  `modifiers.contains(SHIFT)`. Sidebar now normalises arrow
+  events to just SHIFT/CONTROL before matching, bringing the
+  two paths in line.
+
+## [2.0.0] — 2026-05-28
+
+The 2.0 release turns bosun from a session *picker* into a session
+*workspace*. The preview pane is now a real embedded terminal, the
+focused session is interactive from inside bosun, and each sidebar
+row can hold multiple tabs.
+
+### Added — Embedded terminal preview
+
+- **Live embedded preview.** The selected session renders from a
+  real PTY (`portable-pty` + `vt100` + `tui-term`), not a polled
+  snapshot. The vt100 parser is primed with a `capture-pane`
+  snapshot on every switch so the first frame is correct — no
+  multi-second scrollback replay animation.
+- **Single-window focus mode (`s` toggles, persisted).** Press
+  Enter on a session and it opens *inside* the preview pane in
+  writable mode; the sidebar stays visible. `Ctrl+Q` exits focus,
+  same chord as the classic full-screen detach.
+- **Focus border.** Accent-colored 1-cell outline around whichever
+  pane has the keyboard. Single-window mode reserves the border's
+  space on both panes so the layout doesn't shift when focus
+  toggles.
+- **Two-way mouse navigation.** Click a session row to jump and
+  exit focus. Click inside the preview to enter focus on the
+  selected session. The triggering click isn't forwarded into the
+  embed; subsequent clicks pass through.
+- **Input correctness in the embed.** DECCKM cursor-key
+  application mode, modifyOtherKeys for Shift+Enter / Ctrl+Tab /
+  Ctrl+Backspace, bracketed paste forwarding (drag-drop an image
+  → Claude Code sees `[Image #N]`), SGR 1006 mouse forwarding for
+  click-to-cursor and scrollback.
+- **Divider drag survives the cursor crossing into the preview**
+  even when the inner app has mouse tracking on.
+
+### Added — Tabs (multi-session containers per sidebar row)
+
+- **Container abstraction.** Each sidebar row is now a `Container`
+  that owns 1..N tmux sessions ("tabs"). Single-tab containers
+  behave identically to the pre-2.0 single-session rows.
+- **Browser-style tab strip.** Pill tabs above the embed (always
+  visible while a container is selected so the `+` is always
+  reachable). Active tab uses the same accent-chip styling as the
+  `bosun` / `SW` status-bar pills. Each tab carries a per-tab
+  status glyph so background tabs surface Running / Waiting state
+  without focus.
+- **`(N)` tab-count badge** on multi-tab sidebar rows; small
+  accent dot when any non-active tab is busy.
+- **Add-tab modal.** `Ctrl+T` (sidebar) or click the `+` button
+  opens a slimmed new-session modal with the path field locked to
+  the container's path. Submit stamps `@bosun_container_id` onto
+  the new tmux session so siblings regroup correctly after a tmux
+  server restart.
+- **Auto-detach when opening the modal from focused mode** so
+  keystrokes reach the form; auto-restore focus on the new tab
+  after submit (or the original tab on Esc).
+- **Tab keybindings.** `Shift+→ / ←` cycles the active tab,
+  `Shift+↓ / ↑` cycles sessions in sidebar order — identical
+  chords in both sidebar and focused-embed modes. Sidebar-only
+  `]` / `[` mirrors the tab cycle. `Shift+D` kills the whole
+  container; plain `d` kills the active tab (drops the container
+  when the last tab goes).
+- **Tab-strip windowing.** When tabs overflow the available
+  width, the strip slides so the active tab stays visible —
+  earlier tabs scroll off the left edge instead of being silently
+  dropped.
+
+### Added — Sessions / sections
+
+- **Sections** for grouping sessions into named, collapsible
+  buckets (`g` to create, `Tab` to collapse). Persisted in
+  `config.toml`. Banner fonts cyclable per-section (`f` on a
+  header).
+- **Modify-session modal (`m`).** Pre-fills from the highlighted
+  session's stored `@bosun_*` metadata. Save-only: the running
+  agent keeps its current flags; the next `R` (restart) picks up
+  the new spec.
+- **Editor key (`e`).** Opens the session's path in your
+  configured editor. Set with `bosun editor <cmd>`.
+- **Sidebar-order session cycle** in both sidebar and focused
+  modes (was added as Shift+→/← in focused mode in 2.0, then
+  moved to Shift+↓/↑ to free Shift+→/← for tab cycling).
+- **Live per-session status detection at the fast tick.** The
+  `●◐○✕` sidebar glyphs update at ~5 Hz across **every** managed
+  session (not just the focused one), driven off the same fast
+  cadence as the preview. Claude and Codex detectors rewritten to
+  scope substring scans to the bottom ~12 visible lines and to
+  recognize Claude's box-drawn prompt directly — kills the "stale
+  Thinking… pegs Running forever" failure mode.
+
+### Changed
+
+- **Sidebar persistence is now eager.** `SidebarModel::reconcile`
+  reports whether it mutated the model; the `SessionsRefreshed`
+  handler saves `config.toml` whenever a fresh session shows up
+  via reconcile (not just on explicit organize actions). Fixes
+  the long-standing bug where users who never reorganized would
+  find `config.toml` had only `theme = "..."` and no `[sidebar]`
+  block — after a reboot the sidebar would come up empty instead
+  of preserving dead rows for re-attach.
+- **Shift-arrow chord layout.** Plain `Shift+arrows` is now
+  reserved for tab/session navigation (`Shift+→/←` tabs,
+  `Shift+↓/↑` sessions) — same in sidebar and focused modes. The
+  reorder / move-to-bucket actions moved to `Ctrl+Shift+arrows`
+  (with `Shift+J/K` still working for vim-style row reorder).
+
+### Fixed
+
+- Mouse coordinates inside the focused embed were one row + one
+  column off because the click-to-local-coord translation used
+  the outer preview rect instead of the focus-border-inset embed
+  rect. Click-to-cursor and drag-to-select now land on the actual
+  click position.
+- Focus border drawing through the tab strip (border now starts
+  one row below the preview rect when a tab strip is shown).
+- Sidebar's first-row title getting clipped by the focus border
+  in single-window mode (sidebar content insets by one cell so
+  the border has its own perimeter).
+- Add-tab modal: `name` field starts empty instead of pre-filling
+  with the container's internal tmux name.
+- Clicks outside an open modal could activate the background
+  preview pane — focus enter / click-out / tab-strip click paths
+  are all gated on `modals.is_empty()` now.
+
+### Internal
+
+- New `Container { id, name, members, active }` struct;
+  `SidebarModel.ungrouped` and `Section.members` migrated from
+  `Vec<String>` to `Vec<Container>`. `VisibleEntry` carries
+  `&Container`. Backwards-compat `#[serde(untagged)]` deserialize
+  so 0.x configs (bare-string members) load unchanged and save
+  in the new table form on first write.
+- New `@bosun_container_id` tmux user option carries the
+  container assignment across tmux server restarts.
+- `tab_strip` module owns layout + render + click hit-test
+  (pure-function `compute` shared by render and `app::run`).
+- `AttachMode::Preview` vs `Focused` selection now flows through
+  `sync_embed` based on `embed_focused` so an active-tab change
+  while attached respawns in the right mode automatically.
+
 ## [0.4.1] — 2026-05-27
 
 ### Fixed
-- **Brief stale-preview blink between detach and the first async
-  refresh.** Returning from `Enter` (full-screen `tmux attach`)
-  used to leave the preview pane showing a buffer captured up to
-  200ms before detach until the next async refresh round-trip
-  completed. The app now does a single synchronous `capture-pane`
-  on the focused session between attach return and the next
-  draw, so the first post-detach frame shows the session's
-  current state immediately. `capture-pane` is ~1-3ms on a
-  normal pane; the rest of the refresh path stays async as
-  before.
+
+- Synchronous `capture_pane` on attach exit so the preview snapshot
+  is current the moment focus returns to bosun — a stale snapshot
+  used to flash for one tick before the next refresh overwrote it.
 
 ## [0.4.0] — 2026-05-27
 
