@@ -1101,20 +1101,87 @@ async fn refresh_all(
     Ok(out)
 }
 
-/// Stable hash of a pane's visible plain text, used for unread
-/// detection. Trailing blank lines are trimmed so an idle pane whose
-/// only "change" is cursor parking doesn't churn the hash. Returns `0`
-/// for empty/whitespace-only text (a failed or blank capture) so the
-/// app can treat it as "no information" rather than a change.
+/// Layout-independent fingerprint of a pane's visible plain text, used
+/// for unread detection (see `AppState::session_unread`).
+///
+/// The point is to hash the *text*, not how it happens to be laid out
+/// for the currently attached client. A resize — most visibly,
+/// re-attaching from a different-size device like a phone — reflows
+/// every pane, and naively hashing the raw capture would then read
+/// every session as unread even though no agent produced new output.
+/// Two normalizations keep the hash about content:
+///
+/// - `capture_pane` already passes `-J`, which rejoins lines tmux
+///   wrapped to the pane width, so a width change doesn't re-split a
+///   long line into a different number of pieces.
+/// - here we trim each line's trailing whitespace (tmux pads to the
+///   pane width) and drop blank lines entirely, so trailing-space
+///   padding and vertical blank-row differences don't perturb it — this
+///   also covers an idle pane whose only "change" is cursor parking on
+///   a blank row.
+///
+/// Returns `0` for empty/whitespace-only text (a failed or blank
+/// capture) so the app treats it as "no information" rather than a
+/// change.
 fn content_hash(plain: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let trimmed = plain.trim_end();
-    if trimmed.is_empty() {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for line in plain.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        any = true;
+        trimmed.hash(&mut h);
+        0u8.hash(&mut h); // unambiguous separator between lines
+    }
+    if !any {
         return 0;
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    trimmed.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::content_hash;
+
+    #[test]
+    fn empty_capture_is_zero() {
+        assert_eq!(content_hash(""), 0);
+        assert_eq!(content_hash("   \n  \n\n"), 0);
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_change_hash() {
+        // tmux pads each line to the pane width; the padding must not
+        // count as content, or a width change would read as unread.
+        let a = content_hash("hello\nworld");
+        let b = content_hash("hello   \nworld\t");
+        assert_eq!(a, b);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn blank_line_padding_does_not_change_hash() {
+        // A shorter terminal shows fewer/more blank rows; ignore them.
+        let a = content_hash("line one\nline two");
+        let b = content_hash("\nline one\n\n\nline two\n\n");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_text_changes_hash() {
+        assert_ne!(content_hash("answer yes?"), content_hash("answer no?"));
+    }
+
+    #[test]
+    fn line_boundaries_are_significant() {
+        // "ab" on one line is not the same content as "a"/"b" on two —
+        // the separator keeps these distinct so we don't collide real
+        // text differences.
+        assert_ne!(content_hash("ab"), content_hash("a\nb"));
+    }
 }
 
 #[cfg(test)]

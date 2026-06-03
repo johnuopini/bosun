@@ -64,6 +64,7 @@ fn ses_with_status(name: &str, attached: bool, status: Status) -> SessionView {
             // snapshot would drift across machines. `/tmp` can never be
             // anyone's HOME, so both environments render identically.
             spec_path: Some("/tmp/work".into()),
+            pane_width: 80,
         },
         status,
         None,

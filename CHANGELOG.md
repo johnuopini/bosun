@@ -4,6 +4,22 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.8] — 2026-06-03
+
+### Fixed
+- **Unread dots no longer fire on layout changes.** The unread
+  fingerprint is now keyed on each session's pane width, so a reflow is
+  treated as layout instead of new output: resizing the terminal,
+  moving the selection (which sizes the focused pane to the preview
+  area), re-attaching from a different-size device, or a second bosun
+  instance attaching to the shared tmux server. Previously any of these
+  re-wrapped the captured text and lit sessions as unread with no agent
+  activity — connecting from a phone could mark everything unread, and
+  just moving off a session could mark it unread. Crucially, one bosun
+  instance resizing a shared pane can no longer flip another instance's
+  dots. The fingerprint also ignores per-line trailing whitespace and
+  blank rows, so pane-width padding doesn't perturb it.
+
 ## [2.0.7] — 2026-06-01
 
 ### Added

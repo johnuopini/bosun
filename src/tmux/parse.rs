@@ -25,7 +25,7 @@ use crate::tmux::session::TmuxSession;
 ///
 /// All four are empty strings for non-bosun sessions and get parsed as
 /// `None` so the UI renders them only when available.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}|||#{@bosun_container_id}";
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}|||#{@bosun_container_id}|||#{pane_width}";
 
 const FIELD_SEP: &str = "|||";
 
@@ -77,6 +77,11 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
     let agent_raw = parts.next().map(|s| s.to_string());
     let spec_path_raw = parts.next().map(|s| s.to_string());
     let container_id_raw = parts.next().map(|s| s.to_string());
+    // Current pane width. Used to tell a genuine content change from a
+    // mere reflow (resize / embed / a second bosun instance attaching),
+    // so a layout change doesn't read as unread. Optional trailing
+    // field: older outputs and terse test fixtures omit it → 0.
+    let pane_width_raw = parts.next();
 
     if parts.next().is_some() {
         return Err("unexpected extra field".into());
@@ -95,6 +100,7 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
 
     let created = parse_epoch(created_raw);
     let last_activity = parse_epoch(activity_raw);
+    let pane_width: u16 = pane_width_raw.and_then(|s| s.parse().ok()).unwrap_or(0);
 
     Ok(TmuxSession {
         name,
@@ -107,6 +113,7 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         agent: agent_raw.filter(|s| !s.is_empty()),
         spec_path: spec_path_raw.filter(|s| !s.is_empty()),
         container_id: container_id_raw.filter(|s| !s.is_empty()),
+        pane_width,
     })
 }
 
@@ -139,6 +146,23 @@ mod tests {
         assert_eq!(s.current_path.as_deref(), Some("/tmp/code"));
         assert!(s.created.is_some());
         assert!(s.last_activity.is_some());
+    }
+
+    #[test]
+    fn parses_pane_width() {
+        // Full format including the trailing pane_width field.
+        let line =
+            "main|||1|||1|||1712000000|||1712003600|||/tmp|||Main|||claude|||/tmp|||cid|||128";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert_eq!(s.pane_width, 128);
+    }
+
+    #[test]
+    fn missing_pane_width_defaults_to_zero() {
+        // Terse fixtures / older tmux output omit the field.
+        let line = "main|||1|||1|||1712000000|||1712003600|||/tmp";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert_eq!(s.pane_width, 0);
     }
 
     #[test]

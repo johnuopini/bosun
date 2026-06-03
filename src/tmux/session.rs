@@ -39,6 +39,14 @@ pub struct TmuxSession {
     /// sessions from before the container feature shipped; those
     /// reconcile into their own fresh single-tab containers.
     pub container_id: Option<String>,
+    /// Width (columns) of the session's active pane on this poll, from
+    /// `#{pane_width}`. Used by the unread tracker to distinguish a real
+    /// content change from a reflow: a different width means the pane
+    /// was resized (terminal resize, the focus-embed sizing it to the
+    /// preview area, or a second bosun instance attaching), which
+    /// rewraps the text without any new agent output. `0` when unknown
+    /// (older tmux output / terse test fixtures).
+    pub pane_width: u16,
 }
 
 impl TmuxSession {
@@ -94,5 +102,12 @@ impl SessionView {
     /// The pretty display name — use this in the UI.
     pub fn display(&self) -> &str {
         self.session.display()
+    }
+
+    /// Width of the session's active pane on this poll (see
+    /// [`TmuxSession::pane_width`]). Paired with [`Self::content_hash`]
+    /// by the unread tracker so a reflow isn't mistaken for new output.
+    pub fn width(&self) -> u16 {
+        self.session.pane_width
     }
 }

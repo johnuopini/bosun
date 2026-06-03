@@ -179,13 +179,39 @@ pub struct AppState {
     /// which is what clears the dot. Pruned to live sessions on every
     /// `SessionsRefreshed`. Rendered as the left-gutter notification
     /// dot in `session_list`.
-    pub seen_content: std::collections::HashMap<String, u64>,
+    pub seen_content: std::collections::HashMap<String, SeenState>,
+}
+
+/// What the user has "seen" for one session — the baseline the unread
+/// dot is computed against (see [`AppState::seen_content`] and
+/// [`AppState::session_unread`]). Keyed on pane width as well as
+/// content so a reflow (resize / focus-embed / a second bosun instance
+/// attaching to the shared session) is treated as layout, not new
+/// output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeenState {
+    /// Fingerprint of the pane text the user last saw.
+    pub hash: u64,
+    /// Pane width that fingerprint was captured at. A different width
+    /// on a later poll means the pane reflowed, so we re-baseline
+    /// rather than mark unread.
+    pub width: u16,
+    /// Refreshes remaining during which a content change is treated as
+    /// the post-reflow redraw settling rather than new output. Set when
+    /// a width change is detected; counts down to 0.
+    pub settle: u8,
 }
 
 /// Number of wheel events that must accumulate in one direction before
 /// the selection steps. Tuned for macOS trackpads, which fire ~10
 /// events per modest two-finger swipe.
 const SCROLL_TICKS_PER_STEP: i32 = 2;
+
+/// Refreshes to suppress unread for a session after its pane width
+/// changes. The reflow itself is re-baselined immediately; this short
+/// window then absorbs the agent TUI's redraw, which lands a beat after
+/// the resize at the new width and would otherwise read as new output.
+const REFLOW_SETTLE_TICKS: u8 = 2;
 
 impl AppState {
     /// Resolve a dead session's internal name into the friendliest
@@ -584,7 +610,7 @@ impl AppState {
             return false;
         }
         match self.seen_content.get(name) {
-            Some(seen) => *seen != cur,
+            Some(seen) => seen.hash != cur,
             None => false,
         }
     }
@@ -635,21 +661,54 @@ impl AppState {
 
                 self.sessions = sessions;
 
-                // Unread tracking: baseline any session we're seeing for
-                // the first time (a fresh row must not start unread) and
-                // drop baselines for sessions that are gone. We do NOT
-                // touch the baseline of a session we've seen before, so a
-                // pane that changed since the user last looked stays
-                // unread until they select it — `sync_focus` re-baselines
-                // the selected row, which is what clears the dot. A 0
-                // hash (empty/failed capture) is no information, so it
-                // never establishes a baseline. This rides the existing
-                // 1Hz refresh; no extra captures.
+                // Unread tracking, keyed on (content, pane width).
+                //
+                // Baseline a row the first time we see it (a fresh row
+                // must not start unread). On later refreshes:
+                //
+                // * If the pane *width* changed, the text reflowed — a
+                //   terminal resize, the focus-embed sizing the pane to
+                //   the preview area, or a *second bosun instance*
+                //   attaching to the shared tmux session. That's layout,
+                //   not new agent output, so adopt the reflowed content
+                //   as "seen" and hold a short settle window for the
+                //   redraw that lands a beat later. This is what stops
+                //   one instance's resize from lighting up unread in
+                //   another, and a device switch from lighting up
+                //   everything.
+                // * Otherwise leave the baseline be, so a change since
+                //   the user last looked stays unread until they select
+                //   the row — `sync_focus` re-baselines the selected row,
+                //   which is what clears the dot.
+                //
+                // A 0 hash (empty/failed capture) is no information and
+                // never baselines or trips unread. Dead sessions are
+                // pruned. Rides the existing 1Hz refresh; no extra exec.
                 for v in &self.sessions {
-                    if v.content_hash != 0 {
-                        self.seen_content
-                            .entry(v.name().to_string())
-                            .or_insert(v.content_hash);
+                    if v.content_hash == 0 {
+                        continue;
+                    }
+                    match self.seen_content.get_mut(v.name()) {
+                        None => {
+                            self.seen_content.insert(
+                                v.name().to_string(),
+                                SeenState {
+                                    hash: v.content_hash,
+                                    width: v.width(),
+                                    settle: 0,
+                                },
+                            );
+                        }
+                        Some(seen) if seen.width != v.width() => {
+                            seen.hash = v.content_hash;
+                            seen.width = v.width();
+                            seen.settle = REFLOW_SETTLE_TICKS;
+                        }
+                        Some(seen) if seen.settle > 0 => {
+                            seen.hash = v.content_hash;
+                            seen.settle -= 1;
+                        }
+                        Some(_) => {}
                     }
                 }
                 self.seen_content
@@ -887,6 +946,11 @@ impl AppState {
                 // `handle_mouse` needs the current area to compute
                 // the divider column, and it can't ask the terminal
                 // directly from inside a pure reducer.
+                //
+                // Unread tracking absorbs the reflow per-session: a
+                // resize changes each pane's width, which the
+                // SessionsRefreshed reducer treats as layout (re-baseline)
+                // rather than new output — so there's nothing to arm here.
                 self.term_size = (w, h);
                 // ratatui auto-redraws next frame, no command to emit.
             }
@@ -919,8 +983,8 @@ impl AppState {
         // off/onto a header doesn't churn capture work.
         let current = self
             .selected_session()
-            .map(|v| (v.name().to_string(), v.content_hash));
-        if let Some((name, hash)) = &current {
+            .map(|v| (v.name().to_string(), v.content_hash, v.width()));
+        if let Some((name, hash, width)) = &current {
             // Landing the cursor on a session counts as viewing it —
             // in single-window mode the embed shows it live the moment
             // it's selected — so re-baseline its content to "now."
@@ -928,7 +992,14 @@ impl AppState {
             // user hasn't seen since this moment count going forward.
             // A 0 hash (no capture yet) leaves the prior baseline be.
             if *hash != 0 {
-                self.seen_content.insert(name.clone(), *hash);
+                self.seen_content.insert(
+                    name.clone(),
+                    SeenState {
+                        hash: *hash,
+                        width: *width,
+                        settle: 0,
+                    },
+                );
             }
             if self.focus_sent.as_deref() != Some(name.as_str()) {
                 out.push(Command::FocusPreview { name: name.clone() });
@@ -3222,6 +3293,9 @@ mod tests {
                 agent: None,
                 spec_path: None,
                 container_id: None,
+                // Stable default so the unread tests exercise pure
+                // content change; width-change tests use `ses_hw`.
+                pane_width: 80,
             },
             status,
             None,
@@ -3331,6 +3405,14 @@ mod tests {
         v
     }
 
+    /// A session with both a content-hash and a pane width, for the
+    /// reflow (layout-vs-content) tests.
+    fn ses_hw(name: &str, hash: u64, width: u16) -> SessionView {
+        let mut v = ses_h(name, hash);
+        v.session.pane_width = width;
+        v
+    }
+
     #[test]
     fn first_sight_is_not_unread() {
         // Both rows appear for the first time → baselined, none unread.
@@ -3407,6 +3489,50 @@ mod tests {
         // "b" is gone from the live list — its baseline is dropped.
         s.apply(refreshed(vec![ses_h("a", 1)]));
         assert!(!s.seen_content.contains_key("b"));
+    }
+
+    #[test]
+    fn reflow_does_not_mark_unread() {
+        // A background row whose pane *width* changes has reflowed
+        // (resize / focus-embed / another bosun instance attaching to
+        // the shared session). The text differs purely from layout, so
+        // it must not read as unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 1, 80)]));
+        // "b" reflows: new width, rewrapped text (new hash).
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        assert!(!s.session_unread("b"));
+        assert!(!s.session_unread("a"));
+    }
+
+    #[test]
+    fn another_instance_resize_does_not_contaminate() {
+        // Two bosun instances share the tmux server. When the other
+        // instance focuses "b", tmux resizes the shared pane; this
+        // instance sees the reflow but must not flip "b" to unread.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 1, 120)]));
+        // Other instance attaches narrower → "b" reflows to width 60.
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 9, 60)]));
+        // ...then flips back to our width as we become active again.
+        s.apply(refreshed(vec![ses_hw("a", 1, 120), ses_hw("b", 1, 120)]));
+        assert!(!s.session_unread("b"));
+    }
+
+    #[test]
+    fn unread_resumes_after_reflow_settles() {
+        // The settle window is short. Once the pane width is stable and
+        // it closes, a genuine content change marks unread again.
+        let mut s = state_with(vec![], 0);
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 1, 80)]));
+        // Reflow to width 50, then the redraw settles over a couple ticks.
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 2, 50)]));
+        assert!(!s.session_unread("b"));
+        // Genuine new output at the now-stable width → unread.
+        s.apply(refreshed(vec![ses_hw("a", 1, 80), ses_hw("b", 3, 50)]));
+        assert!(s.session_unread("b"));
     }
 
     fn mouse(kind: MouseEventKind, col: u16) -> MouseEvent {
