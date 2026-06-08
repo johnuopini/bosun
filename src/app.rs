@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::actors::{input_actor, tmux_actor};
 use crate::config::Config;
 use crate::error::{BosunError, Result};
-use crate::events::{AppMsg, Command};
+use crate::events::{AppMsg, Command, SessionSpec};
 use crate::sidebar::{Location, SidebarModel, VisibleKind};
 use crate::store::{Recent, Store};
 use crate::tmux::attach::attach_with_ctrl_q_detach;
@@ -143,6 +143,12 @@ pub struct AppState {
     /// downward steps, negative = pending upward steps; resets on
     /// direction change so a flick the other way feels immediate.
     pub scroll_accum: i32,
+    /// Timestamp + entry index of the last left-click that landed on a
+    /// session row. A second click on the same row within
+    /// `DOUBLE_CLICK_MS` is treated as a double-click and attaches,
+    /// mirroring Enter. `None` until the first list click. Cleared
+    /// after a double-click fires so a third click starts fresh.
+    pub last_list_click: Option<(std::time::Instant, usize)>,
     /// Always `true` as of v2.0.2 — focused single-window mode is
     /// the only attach behavior. The field is retained so callers
     /// that branch on it keep compiling; remove once those callers
@@ -206,6 +212,11 @@ pub struct SeenState {
 /// the selection steps. Tuned for macOS trackpads, which fire ~10
 /// events per modest two-finger swipe.
 const SCROLL_TICKS_PER_STEP: i32 = 2;
+
+/// Max gap between two clicks on the same session row for the second to
+/// count as a double-click (which attaches, like Enter). Matches the
+/// common desktop default.
+const DOUBLE_CLICK_MS: u128 = 400;
 
 /// Refreshes to suppress unread for a session after its pane width
 /// changes. The reflow itself is re-baselined immediately; this short
@@ -1199,16 +1210,35 @@ impl AppState {
                     // which reads metadata off the live tmux session.
                     let internal = sel.name().to_string();
                     let display = sel.display().to_string();
+                    let agent = sel.session.agent.as_deref();
                     let title = "Restart session?";
                     let msg = format!(
                         "This kills and recreates '{}' with the same config.",
                         display
                     );
-                    self.modals.push(Box::new(ConfirmModal::new(
+                    let mut modal = ConfirmModal::new(
                         title,
                         msg,
-                        Command::RestartSession(internal),
-                    )));
+                        Command::RestartSession {
+                            internal: internal.clone(),
+                            continue_session: false,
+                        },
+                    );
+                    // Agents that can pick up where they left off get an
+                    // extra `r` action that restarts into their resume
+                    // invocation (claude `--continue`, codex `resume
+                    // --last`) for this one restart only.
+                    if matches!(agent, Some("claude") | Some("codex")) {
+                        modal = modal.with_alt(
+                            'r',
+                            "resume",
+                            Command::RestartSession {
+                                internal,
+                                continue_session: true,
+                            },
+                        );
+                    }
+                    self.modals.push(Box::new(modal));
                 } else if let Some(internal) = self.selected_session_name() {
                     // Dead/missing entry — the tmux session and its
                     // stored metadata are gone, so we can't use
@@ -1227,17 +1257,29 @@ impl AppState {
                     if let Some(recent) = self.recent_for_internal(&internal) {
                         let spec = recent.to_spec();
                         let display = spec.name.clone();
+                        let agent = spec.agent.clone();
                         let title = "Restart from recents?";
                         let msg = format!(
                             "Recreate '{}' from its last-saved spec? \
                              The old dead row stays — `d` to remove it after.",
                             display
                         );
-                        self.modals.push(Box::new(ConfirmModal::new(
-                            title,
-                            msg,
-                            Command::CreateSession(spec),
-                        )));
+                        let mut modal =
+                            ConfirmModal::new(title, msg, Command::CreateSession(spec.clone()));
+                        // Same one-shot resume action as the live restart:
+                        // claude/codex can be recreated straight into their
+                        // resume invocation. `resume` rides on the spec but
+                        // is never persisted, so the recreated session's
+                        // saved mode is unchanged.
+                        if matches!(agent.as_str(), "claude" | "codex") {
+                            let resume_spec = SessionSpec {
+                                resume: true,
+                                ..spec
+                            };
+                            modal =
+                                modal.with_alt('r', "resume", Command::CreateSession(resume_spec));
+                        }
+                        self.modals.push(Box::new(modal));
                     } else {
                         self.warning = Some(format!(
                             "no recent found for '{}' — can't restart",
@@ -1700,6 +1742,15 @@ impl AppState {
                 if let Some(idx) = crate::ui::session_list::entry_at_row(self, content_rect, m.row)
                 {
                     self.selected = idx;
+                    // Double-click on the same row attaches, mirroring
+                    // Enter. `selected_session` returns None on a header
+                    // (not attachable), so a double-click there is a
+                    // harmless no-op.
+                    if self.register_list_click(idx, std::time::Instant::now()) {
+                        if let Some(s) = self.selected_session() {
+                            self.pending_attach = Some(s.name().to_string());
+                        }
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
@@ -1725,6 +1776,20 @@ impl AppState {
             }
             _ => {}
         }
+    }
+
+    /// Record a left-click on session-row `idx` at time `now` and
+    /// report whether it completes a double-click — two clicks on the
+    /// same row within `DOUBLE_CLICK_MS`. On a double-click the click
+    /// history resets so a third click starts a fresh pair (a triple
+    /// click isn't two overlapping double-clicks).
+    fn register_list_click(&mut self, idx: usize, now: std::time::Instant) -> bool {
+        let is_double = self
+            .last_list_click
+            .map(|(t, last)| last == idx && now.duration_since(t).as_millis() <= DOUBLE_CLICK_MS)
+            .unwrap_or(false);
+        self.last_list_click = if is_double { None } else { Some((now, idx)) };
+        is_double
     }
 
     /// Accumulate one wheel tick in the given direction (+1 = down,
@@ -3552,6 +3617,50 @@ mod tests {
             term_size: (120, 30),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn second_click_same_row_in_window_is_double() {
+        let mut s = wide_state();
+        let t0 = std::time::Instant::now();
+        assert!(!s.register_list_click(2, t0), "first click is single");
+        let t1 = t0 + std::time::Duration::from_millis(200);
+        assert!(s.register_list_click(2, t1), "second click is double");
+    }
+
+    #[test]
+    fn second_click_resets_so_third_is_single() {
+        let mut s = wide_state();
+        let t0 = std::time::Instant::now();
+        s.register_list_click(2, t0);
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        assert!(s.register_list_click(2, t1), "second click is double");
+        let t2 = t1 + std::time::Duration::from_millis(100);
+        assert!(
+            !s.register_list_click(2, t2),
+            "third click starts a fresh pair, not another double"
+        );
+    }
+
+    #[test]
+    fn slow_second_click_is_not_double() {
+        let mut s = wide_state();
+        let t0 = std::time::Instant::now();
+        s.register_list_click(2, t0);
+        let late = t0 + std::time::Duration::from_millis(DOUBLE_CLICK_MS as u64 + 1);
+        assert!(!s.register_list_click(2, late), "past the window = single");
+    }
+
+    #[test]
+    fn second_click_different_row_is_not_double() {
+        let mut s = wide_state();
+        let t0 = std::time::Instant::now();
+        s.register_list_click(2, t0);
+        let t1 = t0 + std::time::Duration::from_millis(50);
+        assert!(
+            !s.register_list_click(3, t1),
+            "different row resets, not a double"
+        );
     }
 
     #[test]

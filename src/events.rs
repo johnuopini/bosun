@@ -21,6 +21,16 @@ pub struct SessionSpec {
     /// that gets its own fresh single-tab container on reconcile,
     /// matching the pre-tabs behavior.
     pub container_id: Option<String>,
+    /// One-shot resume override for this launch only. When true and the
+    /// agent supports it, the actor swaps in the resume invocation
+    /// (claude `--continue`, codex `resume --last`) instead of whatever
+    /// `options` would otherwise produce. This is the `r` action on the
+    /// restart prompt for a dead session being recreated from recents.
+    /// It is deliberately NOT persisted — `spec_to_metadata` and the
+    /// recents store both ignore it — so it never sticks to the
+    /// recreated session's saved spec; the next plain restart goes back
+    /// to the stored mode.
+    pub resume: bool,
 }
 
 /// Agent-specific flags the user toggled in the new-session modal.
@@ -110,7 +120,17 @@ pub enum Command {
     /// as `@bosun_*` tmux user options when it was first created.
     /// The new session gets a fresh internal name (new hex suffix)
     /// but keeps the same display name, path, agent and options.
-    RestartSession(String),
+    ///
+    /// `continue_session` is a one-shot override for this restart: when
+    /// true and the agent supports it, the actor swaps in the resume
+    /// invocation (claude `--continue`, codex `resume --last`) instead
+    /// of the persisted session mode. The restart modal sets it when
+    /// the user picks the `r` (resume) action instead of a plain
+    /// restart. The stored `@bosun_*` metadata is left untouched.
+    RestartSession {
+        internal: String,
+        continue_session: bool,
+    },
     /// Read the current `@bosun_*` metadata off a live session so
     /// the modify-session modal can pre-fill its fields. The actor
     /// replies with an `AppMsg::ModifySpecReady`.

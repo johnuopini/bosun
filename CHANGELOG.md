@@ -4,6 +4,21 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.9] — 2026-06-08
+
+### Added
+- **Restart can resume the agent's last conversation.** The `Shift+R`
+  restart prompt now offers an `r` action (alongside the usual `y`/`n`)
+  for claude and codex sessions, on both the live restart and the
+  recreate-from-recents (dead session) prompts. Plain restart relaunches
+  with the saved config; `r` restarts into the agent's resume invocation
+  for that one launch only — claude `--continue`, codex `resume --last`
+  — without changing the session's stored spec, so the next plain
+  restart goes back to the saved mode.
+- **Double-click a session to attach.** Double-clicking a row in the
+  session list now attaches to it, the same as pressing Enter. A single
+  click still just moves the selection.
+
 ## [2.0.8] — 2026-06-03
 
 ### Fixed

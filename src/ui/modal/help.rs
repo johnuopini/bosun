@@ -249,6 +249,7 @@ fn build_rows() -> Vec<Row> {
         Section("Navigation"),
         Binding("↑ ↓ / k j", "Move selection"),
         Binding("Enter", "Attach to selected session"),
+        Binding("Double-click", "Attach to clicked session"),
         Binding("→ ← / ] [", "Cycle next / prev tab within container"),
         Binding("Tab", "Collapse / expand section (on header)"),
         Binding("/", "Quick-switch — type-ahead session picker"),
@@ -258,7 +259,10 @@ fn build_rows() -> Vec<Row> {
         Section("Sessions"),
         Binding("n", "New session"),
         Binding("r", "Rename session (on header: rename section)"),
-        Binding("R", "Restart — kill + recreate with same spec"),
+        Binding(
+            "R",
+            "Restart — kill + recreate with same spec (r in prompt: resume agent)",
+        ),
         Binding(
             "m",
             "Modify session (path, agent, flags) — applies on next R",

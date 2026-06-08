@@ -41,6 +41,7 @@ impl Recent {
                 codex: self.codex.clone(),
             },
             container_id: None,
+            resume: false,
         }
     }
 }
@@ -206,6 +207,7 @@ mod tests {
             args: String::new(),
             options: SpecOptions::default(),
             container_id: None,
+            resume: false,
         }
     }
 

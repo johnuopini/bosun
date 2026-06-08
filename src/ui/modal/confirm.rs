@@ -1,5 +1,9 @@
 //! Generic yes/no confirmation modal. Takes a message and a Command
 //! that fires if the user confirms (Enter or 'y'). Esc or 'n' cancels.
+//!
+//! An optional third action (`with_alt`) binds another key to its own
+//! Command — used by the restart modal to offer `r · resume` alongside
+//! the plain restart, mirroring the existing `y`/`n` keys.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -14,7 +18,52 @@ use crate::ui::Theme;
 use super::{center_rect, Modal, ModalResult};
 
 const MODAL_WIDTH: u16 = 54;
-const MODAL_HEIGHT: u16 = 9;
+/// Wider when an alt action is present so the three-action footer
+/// (`enter / y · … r · … esc / n · …`) fits on one line.
+const MODAL_WIDTH_ALT: u16 = 64;
+/// Horizontal padding consumed by the accent bar + insets, subtracted
+/// from the modal width to get the usable text column for the message.
+const H_PAD: u16 = 4;
+
+/// Greedy word-wrap into lines no wider than `width` columns. Used so a
+/// long confirmation message flows onto extra lines instead of being
+/// clipped. A single word longer than `width` is left on its own
+/// (over-long) line rather than hard-split — fine for our short
+/// messages. Always returns at least one line.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// An optional third action bound to a single key, rendered in the
+/// footer between the confirm and cancel hints.
+struct AltAction {
+    key: char,
+    label: String,
+    /// `Option` so it can be `.take()`n on close — `Command` isn't Clone.
+    command: Option<Command>,
+}
 
 pub struct ConfirmModal {
     title: String,
@@ -25,6 +74,8 @@ pub struct ConfirmModal {
     /// If true, the accent color shifts to red to signal a destructive
     /// action (kill, delete).
     destructive: bool,
+    /// Optional extra key-bound action (e.g. `r · resume`).
+    alt: Option<AltAction>,
 }
 
 impl ConfirmModal {
@@ -34,12 +85,46 @@ impl ConfirmModal {
             message: message.into(),
             on_yes: Some(on_yes),
             destructive: false,
+            alt: None,
         }
     }
 
     pub fn destructive(mut self) -> Self {
         self.destructive = true;
         self
+    }
+
+    /// Bind a third action to `key` (matched case-insensitively),
+    /// labelled `label`, firing `command` on press. The footer shows
+    /// it as `{key} · {label}`.
+    pub fn with_alt(mut self, key: char, label: impl Into<String>, command: Command) -> Self {
+        self.alt = Some(AltAction {
+            key: key.to_ascii_lowercase(),
+            label: label.into(),
+            command: Some(command),
+        });
+        self
+    }
+
+    fn width(&self) -> u16 {
+        if self.alt.is_some() {
+            MODAL_WIDTH_ALT
+        } else {
+            MODAL_WIDTH
+        }
+    }
+
+    /// The message wrapped to the usable text width.
+    fn message_lines(&self) -> Vec<String> {
+        wrap_text(&self.message, self.width().saturating_sub(H_PAD) as usize)
+    }
+
+    /// Total modal height. The body is title + blank + N message lines +
+    /// blank + footer (4 + N), plus the top/bottom border rows and two
+    /// rows of trailing padding — so a one-line message keeps the
+    /// original 9-row look and longer messages grow downward.
+    fn height(&self) -> u16 {
+        8 + self.message_lines().len() as u16
     }
 }
 
@@ -52,6 +137,13 @@ impl Modal for ConfirmModal {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ModalResult::Close(None);
         }
+        if let Some(alt) = self.alt.as_mut() {
+            if let KeyCode::Char(c) = key.code {
+                if c.to_ascii_lowercase() == alt.key {
+                    return ModalResult::Close(alt.command.take());
+                }
+            }
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => ModalResult::Close(None),
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -62,7 +154,7 @@ impl Modal for ConfirmModal {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let rect = center_rect(area, MODAL_WIDTH, MODAL_HEIGHT);
+        let rect = center_rect(area, self.width(), self.height());
         let body_bg = theme.panel_alt;
         let buf = frame.buffer_mut();
 
@@ -114,19 +206,28 @@ impl Modal for ConfirmModal {
             .bg(body_bg)
             .add_modifier(Modifier::BOLD);
 
-        let lines: Vec<Line<'static>> = vec![
-            Line::from(Span::styled(self.title.clone(), title_style)),
-            Line::from(""),
-            Line::from(Span::styled(
-                self.message.clone(),
+        let footer = match &self.alt {
+            Some(alt) => format!(
+                " enter / y · confirm   {} · {}   esc / n · cancel",
+                alt.key, alt.label
+            ),
+            None => " enter / y · confirm      esc / n · cancel".to_string(),
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(self.title.clone(), title_style)));
+        lines.push(Line::from(""));
+        for msg_line in self.message_lines() {
+            lines.push(Line::from(Span::styled(
+                msg_line,
                 Style::default().fg(theme.text).bg(body_bg),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                " enter / y · confirm      esc / n · cancel",
-                Style::default().fg(theme.text_muted).bg(body_bg),
-            )),
-        ];
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            footer,
+            Style::default().fg(theme.text_muted).bg(body_bg),
+        )));
 
         Paragraph::new(lines)
             .style(Style::default().bg(body_bg))
@@ -179,11 +280,99 @@ mod tests {
     }
 
     #[test]
+    fn wrap_splits_on_word_boundaries() {
+        let lines = wrap_text("the quick brown fox jumps", 10);
+        assert!(lines.iter().all(|l| l.chars().count() <= 10));
+        assert_eq!(lines.join(" "), "the quick brown fox jumps");
+        assert!(lines.len() > 1);
+    }
+
+    #[test]
+    fn wrap_short_message_is_one_line() {
+        assert_eq!(wrap_text("are you sure?", 54), vec!["are you sure?"]);
+    }
+
+    #[test]
+    fn wrap_empty_yields_one_empty_line() {
+        assert_eq!(wrap_text("", 54), vec![String::new()]);
+    }
+
+    #[test]
+    fn long_message_grows_modal_height() {
+        let short = ConfirmModal::new("t", "short", Command::KillSession("x".into()));
+        let long = ConfirmModal::new(
+            "t",
+            "this is a considerably longer confirmation message that must wrap \
+             across several lines inside the modal body without being clipped",
+            Command::KillSession("x".into()),
+        );
+        assert!(long.height() > short.height());
+    }
+
+    #[test]
     fn other_keys_consumed() {
         let mut m = ConfirmModal::new("", "", Command::KillSession("x".into()));
         assert!(matches!(
             m.handle(key(KeyCode::Char('z'))),
             ModalResult::Consumed
         ));
+    }
+
+    #[test]
+    fn alt_key_fires_its_command() {
+        let mut m = ConfirmModal::new(
+            "Restart?",
+            "",
+            Command::RestartSession {
+                internal: "foo".into(),
+                continue_session: false,
+            },
+        )
+        .with_alt(
+            'r',
+            "resume",
+            Command::RestartSession {
+                internal: "foo".into(),
+                continue_session: true,
+            },
+        );
+        match m.handle(key(KeyCode::Char('r'))) {
+            ModalResult::Close(Some(Command::RestartSession {
+                continue_session, ..
+            })) => assert!(continue_session),
+            _ => panic!("expected Close with continuing RestartSession"),
+        }
+    }
+
+    #[test]
+    fn alt_key_is_case_insensitive() {
+        let mut m = ConfirmModal::new("", "", Command::KillSession("x".into())).with_alt(
+            'r',
+            "resume",
+            Command::KillSession("alt".into()),
+        );
+        match m.handle(key(KeyCode::Char('R'))) {
+            ModalResult::Close(Some(Command::KillSession(name))) => assert_eq!(name, "alt"),
+            _ => panic!("expected Close with alt command on uppercase key"),
+        }
+    }
+
+    #[test]
+    fn enter_still_fires_primary_with_alt_present() {
+        let mut m = ConfirmModal::new(
+            "",
+            "",
+            Command::RestartSession {
+                internal: "foo".into(),
+                continue_session: false,
+            },
+        )
+        .with_alt('r', "resume", Command::KillSession("alt".into()));
+        match m.handle(key(KeyCode::Enter)) {
+            ModalResult::Close(Some(Command::RestartSession {
+                continue_session, ..
+            })) => assert!(!continue_session),
+            _ => panic!("expected primary RestartSession on Enter"),
+        }
     }
 }

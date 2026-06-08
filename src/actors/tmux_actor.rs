@@ -345,7 +345,10 @@ pub fn spawn(
                         tracing::warn!("delete_recent({}): {}", id, e);
                     }
                 }
-                Command::RestartSession(internal) => {
+                Command::RestartSession {
+                    internal,
+                    continue_session,
+                } => {
                     // In-place restart: C-c × 3 to kill the running
                     // agent, type the launch command again, send C-l
                     // to force a redraw. The session, its internal
@@ -354,8 +357,12 @@ pub fn spawn(
                     match client.get_session_metadata(&internal).await {
                         Ok(Some(meta)) => {
                             let spec = metadata_to_spec(meta);
-                            let command =
-                                build_agent_command(&spec.agent, &spec.options, &spec.args);
+                            let command = build_launch_command(
+                                &spec.agent,
+                                &spec.options,
+                                &spec.args,
+                                continue_session,
+                            );
                             if let Err(e) = client.restart_in_place(&internal, &command).await {
                                 let _ = evt_tx.send(AppMsg::Warn(format!("restart: {}", e)));
                                 continue;
@@ -866,13 +873,46 @@ fn build_agent_command(agent: &str, options: &SpecOptions, args: &str) -> String
     }
 }
 
+/// Build the launch command, optionally forcing a one-shot resume.
+/// When `resume` is true and the agent supports it, swap in the resume
+/// invocation — claude `--continue`, codex `resume --last` — instead of
+/// whatever the persisted `options` would produce. Callers that resume
+/// (the restart prompt's `r` action) never persist the override, so the
+/// next plain launch goes back to the saved mode. For agents with no
+/// resume concept (or `resume == false`) this is identical to
+/// `build_agent_command`.
+fn build_launch_command(agent: &str, options: &SpecOptions, args: &str, resume: bool) -> String {
+    if !resume {
+        return build_agent_command(agent, options, args);
+    }
+    match agent {
+        "claude" => {
+            let mut options = options.clone();
+            options.claude.session_mode = ClaudeSessionMode::Continue;
+            build_agent_command(agent, &options, args)
+        }
+        "codex" => {
+            let args = args.trim();
+            let mut parts: Vec<String> = vec!["codex".into(), "resume".into(), "--last".into()];
+            if options.codex.yolo {
+                parts.push("--yolo".into());
+            }
+            if !args.is_empty() {
+                parts.push(args.to_string());
+            }
+            parts.join(" ")
+        }
+        _ => build_agent_command(agent, options, args),
+    }
+}
+
 async fn create_session(
     client: &dyn TmuxClient,
     config: &Config,
     spec: SessionSpec,
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
-    let command = build_agent_command(&spec.agent, &spec.options, &spec.args);
+    let command = build_launch_command(&spec.agent, &spec.options, &spec.args, spec.resume);
     let metadata = Some(spec_to_metadata(&spec));
     let create = CreateSpec {
         name: internal.clone(),
@@ -925,6 +965,7 @@ fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
             },
         },
         container_id: meta.container_id,
+        resume: false,
     }
 }
 
@@ -1258,6 +1299,64 @@ mod build_cmd_tests {
             "vim .zshrc"
         );
         assert_eq!(build_agent_command("terminal", &opts(), ""), "");
+    }
+
+    #[test]
+    fn launch_without_resume_matches_plain_build() {
+        assert_eq!(build_launch_command("claude", &opts(), "", false), "claude");
+    }
+
+    #[test]
+    fn launch_resume_forces_claude_continue() {
+        // Persisted mode is the default (New); the one-shot resume
+        // override swaps in `--continue` without touching the options.
+        assert_eq!(
+            build_launch_command("claude", &opts(), "", true),
+            "claude --continue"
+        );
+    }
+
+    #[test]
+    fn launch_resume_keeps_other_claude_flags() {
+        let o = SpecOptions {
+            claude: ClaudeOptions {
+                session_mode: ClaudeSessionMode::New,
+                skip_permissions: true,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            build_launch_command("claude", &o, "--model=opus", true),
+            "claude --continue --dangerously-skip-permissions --model=opus"
+        );
+    }
+
+    #[test]
+    fn launch_resume_uses_codex_resume_last() {
+        assert_eq!(
+            build_launch_command("codex", &opts(), "", true),
+            "codex resume --last"
+        );
+    }
+
+    #[test]
+    fn launch_resume_codex_keeps_yolo_and_args() {
+        let o = SpecOptions {
+            codex: CodexOptions { yolo: true },
+            ..Default::default()
+        };
+        assert_eq!(
+            build_launch_command("codex", &o, "--model gpt-5", true),
+            "codex resume --last --yolo --model gpt-5"
+        );
+    }
+
+    #[test]
+    fn launch_resume_noop_for_terminal() {
+        assert_eq!(
+            build_launch_command("terminal", &opts(), "vim .zshrc", true),
+            "vim .zshrc"
+        );
     }
 
     #[test]

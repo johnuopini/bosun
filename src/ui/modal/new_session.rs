@@ -433,6 +433,7 @@ impl NewSessionModal {
                 codex: self.codex.clone(),
             },
             container_id: self.add_tab_to.clone(),
+            resume: false,
         })
     }
 }
@@ -1414,6 +1415,7 @@ mod tests {
                 codex: CodexOptions { yolo: true },
             },
             container_id: None,
+            resume: false,
         };
         m.on_child_closed(ModalData::FillSessionSpec(spec));
         assert_eq!(m.name, "api");
