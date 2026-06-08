@@ -19,6 +19,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session list now attaches to it, the same as pressing Enter. A single
   click still just moves the selection.
 
+### Fixed
+- **Codex/Neovim now detect a light terminal background on freshly
+  created sessions (issue #2).** The OSC 10/11/12 responder added in
+  2.0.5 only existed once a session's embedded terminal had attached,
+  but a new session typed its agent command the instant the pane was
+  created — seconds before the embed, on a cold start. Codex probes the
+  background within ~100ms and permanently caches a miss, so it fell
+  back to its dark diff palette. Bosun now creates the pane as a bare
+  shell and defers the agent launch until the embed (and its
+  background-color responder) has attached, so the startup probe gets a
+  real answer. Only applies when the embedded terminal is enabled; with
+  it off the agent launches inline as before.
+
 ## [2.0.8] — 2026-06-03
 
 ### Fixed

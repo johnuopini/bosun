@@ -410,6 +410,59 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::LaunchAgent { internal } => {
+                    // Deferred agent launch for a session created as a
+                    // bare shell (issue #2). The app fires this once the
+                    // OSC-answering embed has attached, so the agent's
+                    // startup background probe gets a real answer. We
+                    // rebuild the command from the same persisted
+                    // metadata restart uses; `restart_in_place` waits
+                    // for the shell, types the command, and bursts a
+                    // redraw. A `terminal` session has an empty command
+                    // and is left as a plain shell.
+                    match client.get_session_metadata(&internal).await {
+                        Ok(Some(meta)) => {
+                            let spec = metadata_to_spec(meta);
+                            let command = build_launch_command(
+                                &spec.agent,
+                                &spec.options,
+                                &spec.args,
+                                spec.resume,
+                            );
+                            if command.is_empty() {
+                                continue;
+                            }
+                            if let Err(e) = client.restart_in_place(&internal, &command).await {
+                                let _ = evt_tx.send(AppMsg::Warn(format!("launch: {}", e)));
+                                continue;
+                            }
+                            for delay_ms in [200u64, 600, 1200] {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                let _ = do_refresh(
+                                    &*client,
+                                    &config,
+                                    &registry,
+                                    &mut smoothers,
+                                    focused.as_deref(),
+                                    socket.as_deref(),
+                                    &mut last_bar_state,
+                                    &mut globals,
+                                    &evt_tx,
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(None) => {
+                            // No metadata — nothing to launch. Leave the
+                            // shell as-is rather than guessing a command.
+                            tracing::debug!("launch: no metadata for {}", internal);
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(AppMsg::Warn(format!("launch read: {}", e)));
+                        }
+                    }
+                }
                 Command::RenameSession {
                     internal,
                     new_display,
@@ -445,7 +498,13 @@ pub fn spawn(
                         }
                     };
 
-                    match create_session(&*client, &config, spec.clone()).await {
+                    // Defer the agent launch to a post-embed
+                    // `LaunchAgent` whenever embeds are on, so the OSC
+                    // background-color responder is live before the
+                    // agent probes (issue #2). With embeds off there's
+                    // no responder anyway, so launch inline.
+                    let defer_launch = config.embed_enabled;
+                    match create_session(&*client, &config, spec.clone(), defer_launch).await {
                         Ok(internal_name) => {
                             focused = Some(internal_name.clone());
                             // Save the recent (on the resolved spec —
@@ -910,9 +969,20 @@ async fn create_session(
     client: &dyn TmuxClient,
     config: &Config,
     spec: SessionSpec,
+    defer_launch: bool,
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
-    let command = build_launch_command(&spec.agent, &spec.options, &spec.args, spec.resume);
+    // `defer_launch` creates the pane as a bare shell and leaves the
+    // agent command for a later `Command::LaunchAgent` — fired by the
+    // app once the OSC-answering embed has attached (issue #2). The
+    // metadata still carries the full spec, so LaunchAgent can rebuild
+    // the exact command. When not deferring (embeds off), the command
+    // runs as part of create, matching the pre-issue-#2 behavior.
+    let command = if defer_launch {
+        String::new()
+    } else {
+        build_launch_command(&spec.agent, &spec.options, &spec.args, spec.resume)
+    };
     let metadata = Some(spec_to_metadata(&spec));
     let create = CreateSpec {
         name: internal.clone(),

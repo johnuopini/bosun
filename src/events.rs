@@ -131,6 +131,17 @@ pub enum Command {
         internal: String,
         continue_session: bool,
     },
+    /// Type the agent launch command into a session that was created as
+    /// a bare shell (deferred-launch path, issue #2). Emitted by the
+    /// app once the embedded terminal — which answers the OSC 10/11/12
+    /// background-color queries Codex/Neovim probe at startup — has
+    /// attached to the new session. The actor reads the session's
+    /// `@bosun_*` metadata, rebuilds the command, and types it via the
+    /// same `restart_in_place` path restart uses. Launching only after
+    /// the OSC responder is live is what lets Codex detect a light
+    /// background instead of caching a dark one. No-op if the session
+    /// already left its shell (the agent is somehow already running).
+    LaunchAgent { internal: String },
     /// Read the current `@bosun_*` metadata off a live session so
     /// the modify-session modal can pre-fill its fields. The actor
     /// replies with an `AppMsg::ModifySpecReady`.

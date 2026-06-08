@@ -56,6 +56,14 @@ pub struct AppState {
     /// this on the next turn, tears down the terminal, and performs the
     /// blocking `tmux attach` on the controlling tty.
     pub pending_attach: Option<String>,
+    /// Internal names of freshly-created sessions whose agent launch was
+    /// deferred until their OSC-answering embed attaches (issue #2). The
+    /// run loop marks a session here when a create lands (and embeds are
+    /// on), then fires `Command::LaunchAgent` for it after `sync_embed`
+    /// has spawned its embed — so Codex/Neovim get a real answer to
+    /// their startup background probe instead of caching a dark default.
+    /// A `HashSet` so several rapid creates each launch correctly.
+    pub pending_agent_launch: std::collections::HashSet<String>,
     /// Last session name we told the tmux actor to prioritize for preview
     /// capture. Used to debounce FocusPreview commands.
     pub focus_sent: Option<String>,
@@ -1792,6 +1800,30 @@ impl AppState {
         is_double
     }
 
+    /// If the currently-selected session is awaiting its deferred agent
+    /// launch (issue #2), remove it from the pending set and return its
+    /// internal name so the caller can fire `Command::LaunchAgent`. By
+    /// the time this is checked the embed for the selection has been
+    /// (re)spawned, so the OSC background-color responder is live. Also
+    /// prunes pending entries whose session has vanished, so a create
+    /// that never landed (or was killed first) can't leave a stuck
+    /// entry behind.
+    fn take_pending_launch(&mut self) -> Option<String> {
+        if self.pending_agent_launch.is_empty() {
+            return None;
+        }
+        let sel = self.selected_session().map(|v| v.name().to_string());
+        let live: std::collections::HashSet<String> =
+            self.sessions.iter().map(|v| v.name().to_string()).collect();
+        self.pending_agent_launch.retain(|n| live.contains(n));
+        let sel = sel?;
+        if self.pending_agent_launch.remove(&sel) {
+            Some(sel)
+        } else {
+            None
+        }
+    }
+
     /// Accumulate one wheel tick in the given direction (+1 = down,
     /// -1 = up). Every `SCROLL_TICKS_PER_STEP` ticks in one direction
     /// advances the selection by one row; the accumulator resets on
@@ -2527,7 +2559,27 @@ impl App {
             // command that could mutate the recents table, so it's
             // the right edge to re-cache on.
             let should_reload_recents = matches!(msg, AppMsg::SessionsRefreshed { .. });
+            // A fresh create (select_after) whose agent launch the actor
+            // deferred until the embed attaches (issue #2). Captured
+            // before `apply` consumes `msg`; marked pending so the
+            // post-`sync_embed` step below fires `Command::LaunchAgent`.
+            // Only when embeds are on — with embeds off the actor
+            // launches inline, so there's nothing to defer.
+            let created_session = if self.embed_enabled {
+                match &msg {
+                    AppMsg::SessionsRefreshed {
+                        select_after: Some(name),
+                        ..
+                    } => Some(name.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let mut queue: Vec<Command> = self.state.apply(msg);
+            if let Some(name) = created_session {
+                self.state.pending_agent_launch.insert(name);
+            }
             if should_reload_recents {
                 self.state.recents = self.store.list_recents(200).unwrap_or_default();
             }
@@ -2822,6 +2874,17 @@ impl App {
             // because spawn now primes the parser with a
             // synchronous capture-pane snapshot.
             self.sync_embed().await;
+
+            // Deferred agent launch (issue #2): the embed for the
+            // just-created session is now attached, so its OSC
+            // background-color responder is live. Type the agent
+            // command into the shell we created. Fired after
+            // `sync_embed` so the responder exists before the agent
+            // probes; the actor's `restart_in_place` adds its own
+            // shell-settle delay on top.
+            if let Some(internal) = self.state.take_pending_launch() {
+                let _ = self.cmd_tx.send(Command::LaunchAgent { internal });
+            }
 
             // Force-redraw requested (Ctrl+L in sidebar mode). Recover
             // every terminal mode and invalidate ratatui's cached
@@ -3388,6 +3451,48 @@ mod tests {
             sessions,
             select_after: None,
         }
+    }
+
+    #[test]
+    fn pending_launch_fires_for_selected_session() {
+        let mut s = state_with(vec![ses("a"), ses("b")], 1);
+        s.pending_agent_launch.insert("b".into());
+        assert_eq!(s.take_pending_launch().as_deref(), Some("b"));
+        assert!(
+            s.pending_agent_launch.is_empty(),
+            "taken entry is removed so it can't double-launch"
+        );
+    }
+
+    #[test]
+    fn pending_launch_skips_when_selection_elsewhere() {
+        let mut s = state_with(vec![ses("a"), ses("b")], 0);
+        s.pending_agent_launch.insert("b".into());
+        assert_eq!(
+            s.take_pending_launch(),
+            None,
+            "selection is on 'a', not 'b'"
+        );
+        assert!(
+            s.pending_agent_launch.contains("b"),
+            "still pending until its own embed lands"
+        );
+    }
+
+    #[test]
+    fn pending_launch_prunes_vanished_session() {
+        // 'b' was queued for launch but never made it into the list
+        // (killed first / create failed). It must not linger.
+        let mut s = state_with(vec![ses("a")], 0);
+        s.pending_agent_launch.insert("b".into());
+        assert_eq!(s.take_pending_launch(), None);
+        assert!(s.pending_agent_launch.is_empty(), "stale entry pruned");
+    }
+
+    #[test]
+    fn pending_launch_empty_is_noop() {
+        let mut s = state_with(vec![ses("a")], 0);
+        assert_eq!(s.take_pending_launch(), None);
     }
 
     #[test]
