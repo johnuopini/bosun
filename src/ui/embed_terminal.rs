@@ -133,6 +133,15 @@ pub struct EmbedTerminal {
     /// Incremental scanner that spots those queries in the inner byte
     /// stream, carrying an incomplete trailing sequence between reads.
     color_query_scanner: crate::terminal_query::QueryScanner,
+    /// Flips true the first time the reader thread delivers PTY bytes
+    /// via `feed` — proof the `tmux attach -r` client actually
+    /// connected and tmux is relaying the pane (the initial repaint).
+    /// `spawn` returning only means the attach *child* was forked, not
+    /// that it connected, so the OSC color responder isn't truly live
+    /// until this is set. The deferred agent launch (issue #2) waits on
+    /// it so Codex's startup background probe always reaches a relaying
+    /// client, even when the attach is slow to land.
+    attach_confirmed: bool,
 }
 
 impl EmbedTerminal {
@@ -284,7 +293,16 @@ impl EmbedTerminal {
             mode,
             default_colors,
             color_query_scanner: crate::terminal_query::QueryScanner::default(),
+            attach_confirmed: false,
         })
+    }
+
+    /// True once the reader thread has delivered at least one chunk of
+    /// PTY bytes — i.e. the `tmux attach` client is connected and
+    /// relaying, so the OSC 10/11/12 color responder will actually be
+    /// reached by an inner-app query. Gates the deferred agent launch.
+    pub fn attach_confirmed(&self) -> bool {
+        self.attach_confirmed
     }
 
     /// Write key bytes into the PTY master. Only meaningful in
@@ -341,6 +359,11 @@ impl EmbedTerminal {
     /// and assume a dark background (issue #2). The query bytes still
     /// flow into the parser too — harmless, vt100 drops them.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // First real byte from the reader = the attach is live and
+        // relaying, so the OSC responder below can be reached.
+        if !bytes.is_empty() {
+            self.attach_confirmed = true;
+        }
         for (kind, term) in self.color_query_scanner.scan(bytes) {
             let reply = self.default_colors.response(kind, term);
             if let Err(e) = self.write_raw(&reply) {

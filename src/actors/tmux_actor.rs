@@ -349,21 +349,30 @@ pub fn spawn(
                     internal,
                     continue_session,
                 } => {
-                    // In-place restart: C-c × 3 to kill the running
-                    // agent, type the launch command again, send C-l
-                    // to force a redraw. The session, its internal
-                    // name, and the pane all stay the same — no
-                    // sidebar churn, no ghost row, no slot change.
+                    // In-place restart, two phases split across the
+                    // actor and the app so the agent never relaunches
+                    // before its OSC background responder is live
+                    // (issue #2). Here we only do the *stop* half:
+                    // `restart_in_place` with an empty command sends
+                    // C-c until the pane drops back to a shell, then
+                    // leaves it clean. The session, its internal name,
+                    // and the pane all stay the same — no sidebar
+                    // churn, no ghost row, no slot change. We then emit
+                    // `DeferRelaunch`; the app waits for `sync_embed`
+                    // to (re)attach the embed and fires
+                    // `Command::LaunchAgent`, which types the command
+                    // into the now-OSC-answering pane. This matches the
+                    // fresh-create deferral so a cold-start `R` (whose
+                    // embed may not be attached yet) no longer relaunches
+                    // Codex against a dead pane and caches a dark diff.
                     match client.get_session_metadata(&internal).await {
                         Ok(Some(meta)) => {
                             let spec = metadata_to_spec(meta);
-                            let command = build_launch_command(
-                                &spec.agent,
-                                &spec.options,
-                                &spec.args,
-                                continue_session,
-                            );
-                            if let Err(e) = client.restart_in_place(&internal, &command).await {
+                            // Stop only — no line prep, so the relaunch
+                            // call below is the sole place the prompt's
+                            // precmd hooks fire (issue #2; was running a
+                            // `git status` precmd twice per restart).
+                            if let Err(e) = client.restart_in_place(&internal, "", false).await {
                                 let _ = evt_tx.send(AppMsg::Warn(format!("restart: {}", e)));
                                 continue;
                             }
@@ -376,29 +385,13 @@ pub fn spawn(
                             }
                             let _ =
                                 evt_tx.send(AppMsg::Warn(format!("restarted {}", spec.name)));
-                            // Burst a few refreshes so the preview
-                            // catches the agent's splash painting in
-                            // real time instead of waiting up to a
-                            // full preview_tick (1s) for the next
-                            // capture. Each capture grabs the pane's
-                            // current visible buffer, so spacing the
-                            // calls picks up the redraw progression.
-                            for delay_ms in [200u64, 600, 1200] {
-                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                let _ = do_refresh(
-                                    &*client,
-                                    &config,
-                                    &registry,
-                                    &mut smoothers,
-                                    focused.as_deref(),
-                                    socket.as_deref(),
-                                    &mut last_bar_state,
-                                    &mut globals,
-                                    &evt_tx,
-                                    None,
-                                )
-                                .await;
-                            }
+                            // Hand the relaunch back to the app so it
+                            // gates on the embed (OSC responder) being
+                            // attached before the agent starts.
+                            let _ = evt_tx.send(AppMsg::DeferRelaunch {
+                                internal: internal.clone(),
+                                resume: continue_session,
+                            });
                         }
                         Ok(None) => {
                             let _ = evt_tx.send(AppMsg::Warn(
@@ -410,16 +403,20 @@ pub fn spawn(
                         }
                     }
                 }
-                Command::LaunchAgent { internal } => {
-                    // Deferred agent launch for a session created as a
-                    // bare shell (issue #2). The app fires this once the
-                    // OSC-answering embed has attached, so the agent's
-                    // startup background probe gets a real answer. We
-                    // rebuild the command from the same persisted
-                    // metadata restart uses; `restart_in_place` waits
-                    // for the shell, types the command, and bursts a
-                    // redraw. A `terminal` session has an empty command
-                    // and is left as a plain shell.
+                Command::LaunchAgent { internal, resume } => {
+                    // Deferred agent launch for a session that's sitting
+                    // at a bare shell — either freshly created or just
+                    // stopped by an in-place restart (issue #2). The app
+                    // fires this once the OSC-answering embed has
+                    // attached, so the agent's startup background probe
+                    // gets a real answer. We rebuild the command from the
+                    // persisted metadata; `resume` overrides the launch
+                    // mode for this one launch (`None` = use the stored
+                    // mode for a fresh create, `Some(b)` = the restart's
+                    // one-shot choice). `restart_in_place` waits for the
+                    // shell, types the command, and bursts a redraw. A
+                    // `terminal` session has an empty command and is left
+                    // as a plain shell.
                     match client.get_session_metadata(&internal).await {
                         Ok(Some(meta)) => {
                             let spec = metadata_to_spec(meta);
@@ -427,12 +424,15 @@ pub fn spawn(
                                 &spec.agent,
                                 &spec.options,
                                 &spec.args,
-                                spec.resume,
+                                resume.unwrap_or(spec.resume),
                             );
                             if command.is_empty() {
                                 continue;
                             }
-                            if let Err(e) = client.restart_in_place(&internal, &command).await {
+                            // prep_line = true: this call does the single
+                            // C-u/Enter/C-u cleanup right before typing.
+                            if let Err(e) = client.restart_in_place(&internal, &command, true).await
+                            {
                                 let _ = evt_tx.send(AppMsg::Warn(format!("launch: {}", e)));
                                 continue;
                             }

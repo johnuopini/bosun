@@ -141,7 +141,17 @@ pub enum Command {
     /// the OSC responder is live is what lets Codex detect a light
     /// background instead of caching a dark one. No-op if the session
     /// already left its shell (the agent is somehow already running).
-    LaunchAgent { internal: String },
+    ///
+    /// `resume` is a one-shot override for the launch mode: `None`
+    /// uses the persisted `@bosun_*` session mode (the fresh-create
+    /// path), `Some(b)` forces resume on/off for this launch only
+    /// (the in-place restart path, where the restart modal's `r`
+    /// action passes `Some(true)` to relaunch into the agent's resume
+    /// invocation without touching stored metadata).
+    LaunchAgent {
+        internal: String,
+        resume: Option<bool>,
+    },
     /// Read the current `@bosun_*` metadata off a live session so
     /// the modify-session modal can pre-fill its fields. The actor
     /// replies with an `AppMsg::ModifySpecReady`.
@@ -287,6 +297,15 @@ pub enum AppMsg {
     Shutdown,
     /// SIGCONT — we came back from Ctrl-Z suspend, re-enter raw mode.
     Resume,
+    /// An in-place restart (`R`) has stopped the old agent and left a
+    /// bare shell; the app should defer the relaunch until its embed
+    /// has (re)attached so the OSC 10/11/12 background responder is
+    /// live before the agent's startup probe (issue #2). Mirrors the
+    /// fresh-create deferral, but carries the restart's one-shot
+    /// `resume` choice so the `r` action still relaunches into the
+    /// agent's resume invocation. The app marks the session pending and
+    /// fires `Command::LaunchAgent` for it after the next `sync_embed`.
+    DeferRelaunch { internal: String, resume: bool },
     /// Terminal regained focus (e.g. switching back to the iTerm
     /// window). Triggers a full repaint to recover from things like
     /// iTerm's Cmd+R "reset" that clears the screen and exits alt

@@ -4,6 +4,33 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.11] — 2026-06-20
+
+### Fixed
+- **Restart (`Shift+R`) now waits for the embedded terminal too, so
+  Codex/Neovim still detect a light background after an in-place restart
+  (issue #2).** The 2.0.10 deferral only covered freshly-created
+  sessions; `Shift+R` rebuilt and relaunched the agent immediately,
+  before the embed's OSC 10/11/12 responder was guaranteed live, so a
+  cold-start restart could still cache a dark diff palette. Restart now
+  stops the agent to a bare shell and defers the relaunch through the
+  same gate as create.
+- **The deferred launch now waits for the embed to actually attach, not
+  just for it to be spawned.** Previously the agent launched as soon as
+  `EmbedTerminal::spawn` returned, but that only forks `tmux attach` —
+  it doesn't mean the client has connected and is relaying. On a slow
+  attach the agent could still probe a pane with no responder behind it.
+  The launch now holds until the embed reports its first bytes (proof
+  the attach is live), with a 20s fall-back so a hung attach can't
+  strand a bare shell. This closes the slow-attach race on both the
+  create and restart paths.
+- **Restart no longer fires the shell prompt's `precmd` hooks before
+  relaunching.** The split restart was prepping the shell line twice and
+  submitting empty lines, so a prompt with a baked-in `git status` ran
+  it two or three times (with stray blank prompts) on every `Shift+R`.
+  The stop step now only kills the agent, and the launch step clears the
+  line without submitting an empty Enter.
+
 ## [2.0.10] — 2026-06-08
 
 ### Fixed

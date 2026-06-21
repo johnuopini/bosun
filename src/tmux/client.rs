@@ -102,7 +102,13 @@ pub trait TmuxClient: Send + Sync {
     /// running underneath), the session's internal name doesn't
     /// change, and bosun's sidebar position is preserved with zero
     /// model churn.
-    async fn restart_in_place(&self, session: &str, command: &str) -> Result<()>;
+    ///
+    /// `prep_line` controls whether the C-u/Enter/C-u line-cleanup runs
+    /// before typing. The issue-#2 deferral splits a restart into a bare
+    /// stop (no command, `prep_line = false`) and a later launch
+    /// (`prep_line = true`), so the cleanup — whose `Enter` re-runs the
+    /// shell prompt's precmd hooks — happens once, at launch, not twice.
+    async fn restart_in_place(&self, session: &str, command: &str, prep_line: bool) -> Result<()>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -494,7 +500,7 @@ impl TmuxClient for TokioTmuxClient {
         Ok(())
     }
 
-    async fn restart_in_place(&self, session: &str, command: &str) -> Result<()> {
+    async fn restart_in_place(&self, session: &str, command: &str, prep_line: bool) -> Result<()> {
         // Strategy: poll `#{pane_current_command}` instead of guessing
         // timings with fixed sleeps. The two questions we need answered
         // are "has the old agent actually exited?" and "has the new
@@ -573,15 +579,26 @@ impl TmuxClient for TokioTmuxClient {
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         // ── Phase 2: prep the shell line for input ───────────────────
-        send_keys(vec!["C-u"]).await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        send_keys(vec!["Enter"]).await;
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        send_keys(vec!["C-u"]).await;
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Clear any residue on the input line (C-u) and settle, then
+        // type. We deliberately do NOT press Enter here: an empty Enter
+        // at the shell re-runs the prompt's precmd hooks (e.g. a
+        // `git status` baked into the prompt), which the user sees as a
+        // spurious newline + `git status` before every relaunch. C-u
+        // alone is a no-op on an already-empty line, so it's safe; the
+        // settle gives an async prompt framework (powerlevel10k,
+        // spaceship) time to finish painting before we send the command.
+        //
+        // Skipped entirely when `prep_line` is false — the issue-#2
+        // deferral's bare *stop* call only kills the agent and must not
+        // touch the line at all (the matching launch call preps).
+        if prep_line {
+            send_keys(vec!["C-u"]).await;
+            tokio::time::sleep(Duration::from_millis(160)).await;
+        }
 
-        // Empty command means "leave a clean shell prompt" (terminal
-        // agent with no args). Nothing else to do.
+        // Empty command means "leave the shell as-is" — either a bare
+        // stop (prep_line = false) or a terminal agent with no args.
+        // Nothing else to type.
         if command.is_empty() {
             return Ok(());
         }

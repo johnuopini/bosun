@@ -62,8 +62,14 @@ pub struct AppState {
     /// on), then fires `Command::LaunchAgent` for it after `sync_embed`
     /// has spawned its embed — so Codex/Neovim get a real answer to
     /// their startup background probe instead of caching a dark default.
-    /// A `HashSet` so several rapid creates each launch correctly.
-    pub pending_agent_launch: std::collections::HashSet<String>,
+    /// Sessions sitting at a bare shell whose agent launch is deferred
+    /// until their OSC-answering embed has actually attached (issue #2)
+    /// — keyed by internal name so several rapid creates each launch
+    /// correctly. The value carries the one-shot launch-mode override
+    /// and the attach-wait deadline; see `PendingLaunch`. The run loop
+    /// fires `Command::LaunchAgent` once the embed reports
+    /// `attach_confirmed` (or the deadline lapses).
+    pub pending_agent_launch: std::collections::HashMap<String, PendingLaunch>,
     /// Last session name we told the tmux actor to prioritize for preview
     /// capture. Used to debounce FocusPreview commands.
     pub focus_sent: Option<String>,
@@ -231,6 +237,27 @@ const DOUBLE_CLICK_MS: u128 = 400;
 /// window then absorbs the agent TUI's redraw, which lands a beat after
 /// the resize at the new width and would otherwise read as new output.
 const REFLOW_SETTLE_TICKS: u8 = 2;
+
+/// Hard cap on how long a deferred agent launch (issue #2) waits for
+/// its embed's `tmux attach` to actually connect before launching
+/// anyway. A normal attach lands in well under a second; this only
+/// trips when the attach is pathologically slow (a contended tmux
+/// server has been seen taking ~15s) or never lands. Launching a hair
+/// early there — risking one dark-background probe — beats leaving the
+/// session stuck as a bare shell with no agent.
+const PENDING_LAUNCH_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A deferred agent launch (issue #2) waiting for its embed to attach.
+/// `resume` is the one-shot launch-mode override threaded to
+/// `Command::LaunchAgent` (`None` = persisted mode for a fresh create,
+/// `Some(b)` = an in-place restart's choice). `deadline` is the
+/// fall-back instant past which we launch even if the attach hasn't
+/// confirmed.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingLaunch {
+    pub resume: Option<bool>,
+    pub deadline: std::time::Instant,
+}
 
 impl AppState {
     /// Resolve a dead session's internal name into the friendliest
@@ -980,6 +1007,11 @@ impl AppState {
             }
             AppMsg::Shutdown => self.quit = true,
             AppMsg::Resume => { /* redraw happens unconditionally below */ }
+            AppMsg::DeferRelaunch { .. } => {
+                // Handled in `App::run` (it needs a wall-clock `now` for
+                // the attach-wait deadline, which the reducer doesn't
+                // have). Marked pending there before this reducer runs.
+            }
             AppMsg::FocusGained | AppMsg::FocusLost => { /* handled at the App level — see App::run */
             }
             AppMsg::AttachStarted { .. } | AppMsg::AttachEnded { .. } => {
@@ -1808,20 +1840,18 @@ impl AppState {
     /// prunes pending entries whose session has vanished, so a create
     /// that never landed (or was killed first) can't leave a stuck
     /// entry behind.
-    fn take_pending_launch(&mut self) -> Option<String> {
+    fn peek_pending_launch(&mut self) -> Option<(String, PendingLaunch)> {
         if self.pending_agent_launch.is_empty() {
             return None;
         }
         let sel = self.selected_session().map(|v| v.name().to_string());
         let live: std::collections::HashSet<String> =
             self.sessions.iter().map(|v| v.name().to_string()).collect();
-        self.pending_agent_launch.retain(|n| live.contains(n));
+        self.pending_agent_launch.retain(|n, _| live.contains(n));
         let sel = sel?;
-        if self.pending_agent_launch.remove(&sel) {
-            Some(sel)
-        } else {
-            None
-        }
+        self.pending_agent_launch
+            .get(&sel)
+            .map(|p| (sel.clone(), *p))
     }
 
     /// Accumulate one wheel tick in the given direction (+1 = down,
@@ -2531,6 +2561,12 @@ impl App {
                 for m in preserved {
                     let _ = self.evt_tx.send(m);
                 }
+                // Bytes just arrived → the embed's `tmux attach` is now
+                // live and relaying, so its OSC responder can answer.
+                // This is the primary trigger for a deferred agent
+                // launch (issue #2): fire it now that the attach is
+                // confirmed, not merely because `spawn` returned.
+                self.fire_ready_pending_launch();
                 terminal
                     .draw(|f| {
                         ui::draw(
@@ -2576,9 +2612,40 @@ impl App {
             } else {
                 None
             };
+            // An in-place restart (`R`) whose old agent the actor just
+            // stopped, leaving a bare shell. Like a create, its relaunch
+            // is deferred until the embed attaches — captured here so we
+            // can stamp the attach-wait deadline with a wall-clock `now`
+            // the reducer doesn't have. Carries the restart's one-shot
+            // resume choice (the modal's plain/`r` action).
+            let deferred_relaunch = match &msg {
+                AppMsg::DeferRelaunch { internal, resume } => Some((internal.clone(), *resume)),
+                _ => None,
+            };
             let mut queue: Vec<Command> = self.state.apply(msg);
-            if let Some(name) = created_session {
-                self.state.pending_agent_launch.insert(name);
+            if created_session.is_some() || deferred_relaunch.is_some() {
+                let now = std::time::Instant::now();
+                let deadline = now + PENDING_LAUNCH_ATTACH_TIMEOUT;
+                if let Some(name) = created_session {
+                    // Fresh create → no resume override; the actor uses
+                    // the session's persisted launch mode.
+                    self.state.pending_agent_launch.insert(
+                        name,
+                        PendingLaunch {
+                            resume: None,
+                            deadline,
+                        },
+                    );
+                }
+                if let Some((internal, resume)) = deferred_relaunch {
+                    self.state.pending_agent_launch.insert(
+                        internal,
+                        PendingLaunch {
+                            resume: Some(resume),
+                            deadline,
+                        },
+                    );
+                }
             }
             if should_reload_recents {
                 self.state.recents = self.store.list_recents(200).unwrap_or_default();
@@ -2875,16 +2942,16 @@ impl App {
             // synchronous capture-pane snapshot.
             self.sync_embed().await;
 
-            // Deferred agent launch (issue #2): the embed for the
-            // just-created session is now attached, so its OSC
-            // background-color responder is live. Type the agent
-            // command into the shell we created. Fired after
-            // `sync_embed` so the responder exists before the agent
-            // probes; the actor's `restart_in_place` adds its own
-            // shell-settle delay on top.
-            if let Some(internal) = self.state.take_pending_launch() {
-                let _ = self.cmd_tx.send(Command::LaunchAgent { internal });
-            }
+            // Deferred agent launch (issue #2): fire once the embed for
+            // the pending session has actually attached (or the wait
+            // deadline lapses). `sync_embed` above has just (re)spawned
+            // the embed if the selection changed; the launch itself
+            // waits for `attach_confirmed`, since a freshly-spawned
+            // embed hasn't connected yet — so on this turn this is
+            // usually a no-op and the real trigger is the first
+            // `EmbedBytes`. For an in-place restart of the already-shown
+            // session the embed is already attached, so it fires here.
+            self.fire_ready_pending_launch();
 
             // Force-redraw requested (Ctrl+L in sidebar mode). Recover
             // every terminal mode and invalidate ratatui's cached
@@ -3031,6 +3098,33 @@ impl App {
     /// but is non-fatal — the preview falls back to the v0.4 polled
     /// snapshot path automatically (it's still drawn from
     /// `SessionView.preview`, which the fast-tick keeps populated).
+    /// Fire a deferred agent launch (issue #2) for the selected session
+    /// once it's safe: either the embed's `tmux attach` has confirmed
+    /// it's relaying (so the OSC background responder will be reached),
+    /// or the attach-wait deadline has lapsed, or embeds are off (no
+    /// responder to wait for). Removes the entry first so it can't
+    /// double-launch. No-op when nothing is pending for the current
+    /// selection or the embed hasn't attached yet — in which case the
+    /// next `EmbedBytes` (or a periodic tick, for the timeout) retries.
+    fn fire_ready_pending_launch(&mut self) {
+        let Some((internal, pending)) = self.state.peek_pending_launch() else {
+            return;
+        };
+        let attached = self
+            .embed
+            .as_ref()
+            .map(|e| e.session() == internal && e.attach_confirmed())
+            .unwrap_or(false);
+        let timed_out = std::time::Instant::now() >= pending.deadline;
+        if attached || timed_out || !self.embed_enabled {
+            self.state.pending_agent_launch.remove(&internal);
+            let _ = self.cmd_tx.send(Command::LaunchAgent {
+                internal,
+                resume: pending.resume,
+            });
+        }
+    }
+
     async fn sync_embed(&mut self) {
         if !self.embed_enabled {
             if self.embed.is_some() {
@@ -3453,28 +3547,56 @@ mod tests {
         }
     }
 
+    fn pending(resume: Option<bool>) -> PendingLaunch {
+        PendingLaunch {
+            resume,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+        }
+    }
+
     #[test]
-    fn pending_launch_fires_for_selected_session() {
+    fn pending_launch_peeks_selected_session() {
+        // `peek_pending_launch` returns the selected session's entry
+        // without removing it — the App-level gate removes it only once
+        // the embed has attached (or the deadline lapses).
         let mut s = state_with(vec![ses("a"), ses("b")], 1);
-        s.pending_agent_launch.insert("b".into());
-        assert_eq!(s.take_pending_launch().as_deref(), Some("b"));
+        s.pending_agent_launch.insert("b".into(), pending(None));
+        let got = s.peek_pending_launch();
+        assert_eq!(
+            got.map(|(n, p)| (n, p.resume)),
+            Some(("b".to_string(), None))
+        );
         assert!(
-            s.pending_agent_launch.is_empty(),
-            "taken entry is removed so it can't double-launch"
+            s.pending_agent_launch.contains_key("b"),
+            "peek leaves the entry; removal is the fire step's job"
+        );
+    }
+
+    #[test]
+    fn pending_launch_carries_resume_override() {
+        // Restart-with-resume marks the entry with `Some(true)`; the
+        // override must survive the peek so `LaunchAgent` relaunches
+        // into the agent's resume invocation.
+        let mut s = state_with(vec![ses("a"), ses("b")], 1);
+        s.pending_agent_launch
+            .insert("b".into(), pending(Some(true)));
+        let got = s.peek_pending_launch();
+        assert_eq!(
+            got.map(|(n, p)| (n, p.resume)),
+            Some(("b".to_string(), Some(true)))
         );
     }
 
     #[test]
     fn pending_launch_skips_when_selection_elsewhere() {
         let mut s = state_with(vec![ses("a"), ses("b")], 0);
-        s.pending_agent_launch.insert("b".into());
-        assert_eq!(
-            s.take_pending_launch(),
-            None,
+        s.pending_agent_launch.insert("b".into(), pending(None));
+        assert!(
+            s.peek_pending_launch().is_none(),
             "selection is on 'a', not 'b'"
         );
         assert!(
-            s.pending_agent_launch.contains("b"),
+            s.pending_agent_launch.contains_key("b"),
             "still pending until its own embed lands"
         );
     }
@@ -3484,15 +3606,15 @@ mod tests {
         // 'b' was queued for launch but never made it into the list
         // (killed first / create failed). It must not linger.
         let mut s = state_with(vec![ses("a")], 0);
-        s.pending_agent_launch.insert("b".into());
-        assert_eq!(s.take_pending_launch(), None);
+        s.pending_agent_launch.insert("b".into(), pending(None));
+        assert!(s.peek_pending_launch().is_none());
         assert!(s.pending_agent_launch.is_empty(), "stale entry pruned");
     }
 
     #[test]
     fn pending_launch_empty_is_noop() {
         let mut s = state_with(vec![ses("a")], 0);
-        assert_eq!(s.take_pending_launch(), None);
+        assert!(s.peek_pending_launch().is_none());
     }
 
     #[test]
