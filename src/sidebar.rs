@@ -277,6 +277,21 @@ impl SidebarModel {
         self.len() == 0
     }
 
+    /// Name of the section that owns the container holding the tmux
+    /// session `internal`, if any. Walks sections in order and returns
+    /// the first whose container `members` contains `internal`.
+    /// `None` for ungrouped sessions and unknown names.
+    pub fn section_of(&self, internal: &str) -> Option<&str> {
+        self.sections
+            .iter()
+            .find(|s| {
+                s.members
+                    .iter()
+                    .any(|c| c.members.iter().any(|m| m == internal))
+            })
+            .map(|s| s.name.as_str())
+    }
+
     /// Flatten the model into an ordered list of visible entries.
     /// Members of collapsed sections are skipped — only the header row
     /// is emitted for those.
@@ -885,5 +900,25 @@ members = ["bosun-gamma"]
             "expected table form, got:\n{}",
             re_emitted
         );
+    }
+
+    #[test]
+    fn section_of_finds_grouped_member_and_ignores_others() {
+        let mut model = SidebarModel::default();
+        // Ungrouped container: must NOT resolve to a section.
+        model
+            .ungrouped
+            .push(Container::single("bosun-loose-aaaa".into(), "loose".into()));
+        // Section with one container holding two tabs.
+        let mut sec = Section::new("proj");
+        let mut con = Container::single("bosun-alpha-bbbb".into(), "alpha".into());
+        con.add_tab("bosun-beta-cccc".into());
+        sec.members.push(con);
+        model.sections.push(sec);
+
+        assert_eq!(model.section_of("bosun-alpha-bbbb"), Some("proj"));
+        assert_eq!(model.section_of("bosun-beta-cccc"), Some("proj"));
+        assert_eq!(model.section_of("bosun-loose-aaaa"), None);
+        assert_eq!(model.section_of("bosun-missing-zzzz"), None);
     }
 }

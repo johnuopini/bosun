@@ -45,6 +45,17 @@ fn set_terminal_title(title: &str) {
     print!("\x1b]0;{title}\x07");
 }
 
+/// Build the OSC terminal title for an attached session. When
+/// `show_group` is true and the session belongs to a section, prefixes
+/// the display name with `group/`. Pure so it can be unit-tested
+/// without touching the terminal.
+fn attach_title(display: &str, group: Option<&str>, show_group: bool) -> String {
+    match (show_group, group) {
+        (true, Some(g)) => format!("bosun — {g}/{display}"),
+        _ => format!("bosun — {display}"),
+    }
+}
+
 /// Everything the UI renders from. Pure data; no locks.
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -200,6 +211,10 @@ pub struct AppState {
     /// `SessionsRefreshed`. Rendered as the left-gutter notification
     /// dot in `session_list`.
     pub seen_content: std::collections::HashMap<String, SeenState>,
+    /// Startup snapshot of `Config::show_group_in_title`. When true,
+    /// the tab strip and OSC title prefix grouped sessions with
+    /// `group/`. Read by `ui::preview` and the attach-title path.
+    pub show_group_in_title: bool,
 }
 
 /// What the user has "seen" for one session — the baseline the unread
@@ -2019,6 +2034,7 @@ impl App {
             recents,
             single_window_mode: config.single_window_mode,
             sidebar_hidden: config.sidebar_hidden,
+            show_group_in_title: config.show_group_in_title,
             ..Default::default()
         };
 
@@ -2892,7 +2908,12 @@ impl App {
                     .find(|s| s.name() == name)
                     .map(|s| s.display().to_string())
                     .unwrap_or_else(|| name.clone());
-                set_terminal_title(&format!("bosun — {display}"));
+                let group = self.state.sidebar.section_of(&name);
+                set_terminal_title(&attach_title(
+                    &display,
+                    group,
+                    self.state.show_group_in_title,
+                ));
 
                 let attach_result = self.perform_attach(terminal, &name);
 
@@ -3538,6 +3559,16 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn attach_title_prefixes_group_when_enabled() {
+        assert_eq!(
+            attach_title("alpha", Some("proj"), true),
+            "bosun — proj/alpha"
+        );
+        assert_eq!(attach_title("alpha", Some("proj"), false), "bosun — alpha");
+        assert_eq!(attach_title("alpha", None, true), "bosun — alpha");
     }
 
     fn refreshed(sessions: Vec<SessionView>) -> AppMsg {
