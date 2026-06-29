@@ -360,13 +360,18 @@ impl Config {
         let sidebar_hidden = file.sidebar_hidden.unwrap_or(false);
 
         // Group-in-title opt-in. Same enable/disable idiom as
-        // BOSUN_EMBED. Env beats file beats default.
+        // BOSUN_EMBED, except an empty value (`BOSUN_SHOW_GROUP_IN_TITLE=`)
+        // disables here rather than enabling: this flag is off by
+        // default, so a bare/empty set value should not silently flip it
+        // on. Env beats file beats default.
         let show_group_in_title = match env::var("BOSUN_SHOW_GROUP_IN_TITLE") {
             Ok(s) => !matches!(
                 s.trim().to_ascii_lowercase().as_str(),
                 "" | "0" | "false" | "off" | "no"
             ),
-            Err(_) => file.show_group_in_title.unwrap_or(DEFAULT_SHOW_GROUP_IN_TITLE),
+            Err(_) => file
+                .show_group_in_title
+                .unwrap_or(DEFAULT_SHOW_GROUP_IN_TITLE),
         };
 
         Self {

@@ -465,6 +465,7 @@ divider_x        = 50           # saved automatically when you drag the list/pre
 preview_tick_ms  = 200          # fast-preview / live-status cadence; 0 disables the fast tick
 single_window    = true         # `s` key persists this; Enter focuses in-place instead of full-screen attach
 embed_enabled    = true         # set false to fall back to the polled-snapshot preview
+show_group_in_title = false      # prefix grouped sessions as "group/session" in tab pills and terminal title
 editor           = "zed"        # set via `bosun editor <cmd>`; used by the `e` key
 banner_font      = "newsx"      # section banner font; cycled with `f` on a header
 ```
@@ -484,6 +485,7 @@ Environment overrides:
 | `BOSUN_PREVIEW_TICK_MS` | `preview_tick_ms` |
 | `BOSUN_SINGLE_WINDOW` | `single_window` (`1` / `true` to enable) |
 | `BOSUN_EMBED` | `embed_enabled` (`0` / `false` to disable) |
+| `BOSUN_SHOW_GROUP_IN_TITLE` | `show_group_in_title` (`1` / `true` / `yes` / `on` to enable) |
 | `BOSUN_LOG` | Tracing filter, e.g. `BOSUN_LOG=info` |
 
 ## How `Ctrl+Q` detach works
