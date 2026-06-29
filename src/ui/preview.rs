@@ -71,7 +71,7 @@ pub fn render(
                 .iter()
                 .map(|m| state.session_by_name(m))
                 .collect();
-            tab_strip::render(frame.buffer_mut(), strip_area, container, &tab_views, theme);
+            tab_strip::render(frame.buffer_mut(), strip_area, container, &tab_views, theme, None);
             working_area = Rect::new(
                 area.x,
                 area.y + 1,

@@ -175,6 +175,7 @@ pub fn render(
     container: &Container,
     tab_views: &[Option<&SessionView>],
     theme: &Theme,
+    group: Option<&str>,
 ) -> Layout {
     // Resolve display label + status for each tab, then compute
     // the geometric layout in one shot. The labels are owned
@@ -184,9 +185,18 @@ pub fn render(
         .members
         .iter()
         .enumerate()
-        .map(|(i, internal)| match tab_views.get(i).and_then(|v| *v) {
-            Some(v) => (v.display().to_string(), v.status),
-            None => (internal.clone(), Status::Unknown),
+        .map(|(i, internal)| {
+            let view = tab_views.get(i).and_then(|v| *v);
+            let base = match view {
+                Some(v) => v.display().to_string(),
+                None => internal.clone(),
+            };
+            let label = match group {
+                Some(g) => format!("{g}/{base}"),
+                None => base,
+            };
+            let status = view.map(|v| v.status).unwrap_or(Status::Unknown);
+            (label, status)
         })
         .collect();
     let label_refs: Vec<&str> = resolved.iter().map(|(l, _)| l.as_str()).collect();
@@ -299,6 +309,38 @@ mod tests {
         assert_eq!(layout.first_visible, 2);
         assert_eq!(layout.last_visible, 5);
         assert_eq!(layout.tabs.len(), 3);
+    }
+
+    #[test]
+    fn render_prefixes_group_when_some() {
+        use crate::ui::Theme;
+        let theme = Theme::default_opencode();
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        let con = Container::single("bosun-alpha-bbbb".into(), "alpha".into());
+        // No live SessionView -> label falls back to the internal name,
+        // which is fine for asserting the prefix is applied.
+        let views: Vec<Option<&SessionView>> = vec![None];
+        render(&mut buf, area, &con, &views, &theme, Some("proj"));
+        let row: String = (0..40)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(row.contains("proj/"), "expected group prefix, got: {row:?}");
+    }
+
+    #[test]
+    fn render_no_prefix_when_none() {
+        use crate::ui::Theme;
+        let theme = Theme::default_opencode();
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        let con = Container::single("bosun-alpha-bbbb".into(), "alpha".into());
+        let views: Vec<Option<&SessionView>> = vec![None];
+        render(&mut buf, area, &con, &views, &theme, None);
+        let row: String = (0..40)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(!row.contains('/'), "expected no group prefix, got: {row:?}");
     }
 
     #[test]
