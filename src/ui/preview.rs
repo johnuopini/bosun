@@ -58,26 +58,41 @@ pub fn render(
     // above the focus border, so embed-area math (focus-border
     // inset) operates on the *remaining* rect.
     let mut working_area = area;
-    if let Some(container) = state
-        .sidebar
-        .visible()
-        .get(state.selected)
-        .and_then(|e| e.container())
-    {
-        if area.height > 0 && area.width > 0 {
-            let strip_area = Rect::new(area.x, area.y, area.width, 1);
-            let tab_views: Vec<Option<&crate::tmux::session::SessionView>> = container
-                .members
-                .iter()
-                .map(|m| state.session_by_name(m))
-                .collect();
-            tab_strip::render(frame.buffer_mut(), strip_area, container, &tab_views, theme, None);
-            working_area = Rect::new(
-                area.x,
-                area.y + 1,
-                area.width,
-                area.height.saturating_sub(1),
-            );
+    if let Some(entry) = state.sidebar.visible().get(state.selected) {
+        if let Some(container) = entry.container() {
+            if area.height > 0 && area.width > 0 {
+                let strip_area = Rect::new(area.x, area.y, area.width, 1);
+                let tab_views: Vec<Option<&crate::tmux::session::SessionView>> = container
+                    .members
+                    .iter()
+                    .map(|m| state.session_by_name(m))
+                    .collect();
+                // Prefix the pills with the section name only when the
+                // user opted in and the container actually lives in a
+                // section (ungrouped rows stay bare).
+                let group = match entry {
+                    crate::sidebar::VisibleEntry::Member { section, .. }
+                        if state.show_group_in_title =>
+                    {
+                        Some(section.name.as_str())
+                    }
+                    _ => None,
+                };
+                tab_strip::render(
+                    frame.buffer_mut(),
+                    strip_area,
+                    container,
+                    &tab_views,
+                    theme,
+                    group,
+                );
+                working_area = Rect::new(
+                    area.x,
+                    area.y + 1,
+                    area.width,
+                    area.height.saturating_sub(1),
+                );
+            }
         }
     }
     let area = working_area;
