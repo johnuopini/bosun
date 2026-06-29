@@ -4,6 +4,17 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.12] — 2026-06-29
+
+### Added
+- **Opt-in group name in the tab strip and terminal title (issue #4).**
+  When `show_group_in_title = true` (or `BOSUN_SHOW_GROUP_IN_TITLE=1`),
+  sessions that belong to a section render as `group/session` in both
+  the tab pills above the embedded terminal and the OSC window title
+  (`bosun — group/session`). Ungrouped sessions stay bare. Off by
+  default, display only — no persistence or new session state. Thanks
+  to @johnuopini for the contribution (PR #6).
+
 ## [2.0.11] — 2026-06-20
 
 ### Fixed
