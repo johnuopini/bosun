@@ -200,6 +200,10 @@ pub struct AppState {
     /// `SessionsRefreshed`. Rendered as the left-gutter notification
     /// dot in `session_list`.
     pub seen_content: std::collections::HashMap<String, SeenState>,
+    /// Startup snapshot of `Config::show_group_in_title`. When true,
+    /// the tab strip and OSC title prefix grouped sessions with
+    /// `group/`. Read by `ui::preview` and the attach-title path.
+    pub show_group_in_title: bool,
 }
 
 /// What the user has "seen" for one session — the baseline the unread
@@ -2019,6 +2023,7 @@ impl App {
             recents,
             single_window_mode: config.single_window_mode,
             sidebar_hidden: config.sidebar_hidden,
+            show_group_in_title: config.show_group_in_title,
             ..Default::default()
         };
 
