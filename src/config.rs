@@ -158,6 +158,12 @@ pub struct Config {
     /// Only takes effect while focused — detaching always brings the
     /// sidebar back so the session list is reachable. Default false.
     pub sidebar_hidden: bool,
+    /// When true, sessions that belong to a section render as
+    /// `group/session` in the tab strip pills and the OSC terminal
+    /// window title; ungrouped sessions stay bare. Display only — no
+    /// persistence. Default false. Set `show_group_in_title = true` in
+    /// `config.toml` or `BOSUN_SHOW_GROUP_IN_TITLE=1|true|yes|on`.
+    pub show_group_in_title: bool,
 }
 
 impl Default for Config {
@@ -180,6 +186,7 @@ impl Default for Config {
             // persisted.
             single_window_mode: true,
             sidebar_hidden: false,
+            show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
         }
     }
 }
@@ -192,6 +199,11 @@ pub const DEFAULT_PREVIEW_TICK_MS: u64 = 200;
 /// embedded-terminal preview on; set to false here to invert the
 /// default if early adopters report regressions.
 pub const DEFAULT_EMBED_ENABLED: bool = true;
+
+/// Default for `Config::show_group_in_title`. Off by default so the
+/// tab pills and OSC title look unchanged for existing users until they
+/// opt in via `show_group_in_title = true` or `BOSUN_SHOW_GROUP_IN_TITLE=1`.
+pub const DEFAULT_SHOW_GROUP_IN_TITLE: bool = false;
 
 /// Shape of `config.toml` on disk. All fields are optional and
 /// defaulted independently so a half-written file still loads.
@@ -242,6 +254,9 @@ struct ConfigFile {
     /// `Config::sidebar_hidden`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sidebar_hidden: Option<bool>,
+    /// Group-in-title opt-in. See `Config::show_group_in_title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_group_in_title: Option<bool>,
 }
 
 impl Config {
@@ -344,6 +359,16 @@ impl Config {
         // runtime via Ctrl+B and read back on next launch.
         let sidebar_hidden = file.sidebar_hidden.unwrap_or(false);
 
+        // Group-in-title opt-in. Same enable/disable idiom as
+        // BOSUN_EMBED. Env beats file beats default.
+        let show_group_in_title = match env::var("BOSUN_SHOW_GROUP_IN_TITLE") {
+            Ok(s) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            ),
+            Err(_) => file.show_group_in_title.unwrap_or(DEFAULT_SHOW_GROUP_IN_TITLE),
+        };
+
         Self {
             session_prefix,
             tmux_socket,
@@ -358,6 +383,7 @@ impl Config {
             embed_enabled,
             single_window_mode,
             sidebar_hidden,
+            show_group_in_title,
         }
     }
 
@@ -687,6 +713,7 @@ mod tests {
             embed_enabled: DEFAULT_EMBED_ENABLED,
             single_window_mode: false,
             sidebar_hidden: false,
+            show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
         }
     }
 
@@ -729,6 +756,7 @@ mod tests {
             embed_enabled: DEFAULT_EMBED_ENABLED,
             single_window_mode: false,
             sidebar_hidden: false,
+            show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
@@ -759,5 +787,10 @@ mod tests {
     fn editor_field_parses() {
         let parsed: ConfigFile = toml::from_str(r#"editor = "zed""#).unwrap();
         assert_eq!(parsed.editor.as_deref(), Some("zed"));
+    }
+
+    #[test]
+    fn show_group_in_title_defaults_off() {
+        assert!(!Config::default().show_group_in_title);
     }
 }
