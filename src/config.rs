@@ -79,6 +79,17 @@ pub const DEFAULT_TMUX_SOCKET: &str = "bosun";
 /// Default theme name — must match a built-in in `ui::theme`.
 pub const DEFAULT_THEME: &str = "opencode";
 
+/// Where a new git worktree is placed relative to its repo root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeLocation {
+    /// `<repo>/.worktrees/<branch>` — self-contained inside the repo.
+    #[default]
+    Subdir,
+    /// `<repo>-<branch>` — a sibling directory next to the repo.
+    Sibling,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Only sessions whose name starts with this prefix are shown in
@@ -164,6 +175,8 @@ pub struct Config {
     /// persistence. Default false. Set `show_group_in_title = true` in
     /// `config.toml` or `BOSUN_SHOW_GROUP_IN_TITLE=1|true|yes|on`.
     pub show_group_in_title: bool,
+    /// Where `git worktree add` places new worktrees. See `WorktreeLocation`.
+    pub worktree_location: WorktreeLocation,
 }
 
 impl Default for Config {
@@ -187,6 +200,7 @@ impl Default for Config {
             single_window_mode: true,
             sidebar_hidden: false,
             show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
+            worktree_location: WorktreeLocation::default(),
         }
     }
 }
@@ -257,6 +271,9 @@ struct ConfigFile {
     /// Group-in-title opt-in. See `Config::show_group_in_title`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     show_group_in_title: Option<bool>,
+    /// Worktree placement scheme. See `Config::worktree_location`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_location: Option<WorktreeLocation>,
 }
 
 impl Config {
@@ -374,6 +391,8 @@ impl Config {
                 .unwrap_or(DEFAULT_SHOW_GROUP_IN_TITLE),
         };
 
+        let worktree_location = file.worktree_location.unwrap_or_default();
+
         Self {
             session_prefix,
             tmux_socket,
@@ -389,6 +408,7 @@ impl Config {
             single_window_mode,
             sidebar_hidden,
             show_group_in_title,
+            worktree_location,
         }
     }
 
@@ -719,6 +739,7 @@ mod tests {
             single_window_mode: false,
             sidebar_hidden: false,
             show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
+            worktree_location: WorktreeLocation::default(),
         }
     }
 
@@ -762,6 +783,7 @@ mod tests {
             single_window_mode: false,
             sidebar_hidden: false,
             show_group_in_title: DEFAULT_SHOW_GROUP_IN_TITLE,
+            worktree_location: WorktreeLocation::default(),
         };
         assert!(!c.manages("bosun-mine-abc"));
         assert!(c.manages("bosun-other-xyz"));
@@ -797,5 +819,15 @@ mod tests {
     #[test]
     fn show_group_in_title_defaults_off() {
         assert!(!Config::default().show_group_in_title);
+    }
+
+    #[test]
+    fn worktree_location_parses_and_defaults() {
+        let parsed: ConfigFile = toml::from_str(r#"worktree_location = "sibling""#).unwrap();
+        assert_eq!(parsed.worktree_location, Some(WorktreeLocation::Sibling));
+        let empty: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(empty.worktree_location, None);
+        // Default when unset.
+        assert_eq!(WorktreeLocation::default(), WorktreeLocation::Subdir);
     }
 }
