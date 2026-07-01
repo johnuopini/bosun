@@ -31,6 +31,20 @@ pub struct SessionSpec {
     /// recreated session's saved spec; the next plain restart goes back
     /// to the stored mode.
     pub resume: bool,
+    /// When `Some`, the actor creates the session inside a fresh git
+    /// worktree instead of opening the user-picked path directly. See
+    /// `WorktreeSpec`. `None` (the default) is a normal path-based
+    /// session.
+    pub worktree: Option<WorktreeSpec>,
+}
+
+/// Request to create the session inside a fresh git worktree. The
+/// worktree location comes from `Config::worktree_location`; only the
+/// branch is user-chosen. `None` on `SessionSpec` means a normal
+/// path-based session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSpec {
+    pub branch: String,
 }
 
 /// Agent-specific flags the user toggled in the new-session modal.

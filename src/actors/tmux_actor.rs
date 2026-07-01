@@ -972,6 +972,18 @@ async fn create_session(
     defer_launch: bool,
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
+    // If a worktree was requested, create it and repoint the path.
+    // `spec` is taken by value (see the fn signature), so rebinding as
+    // mut is valid and later shared reads/clones of `spec` still compile.
+    let mut spec = spec;
+    if let Some(wt) = spec.worktree.clone() {
+        let repo = client.repo_root(&spec.path).await?; // errors if not a git repo
+        let worktree_path = resolve_worktree_path(&repo, &wt.branch, config.worktree_location);
+        client
+            .worktree_add(&repo, &wt.branch, &worktree_path)
+            .await?; // aborts create on failure
+        spec.path = worktree_path; // spec_to_metadata reads spec.path + spec.worktree below
+    }
     // `defer_launch` creates the pane as a bare shell and leaves the
     // agent command for a later `Command::LaunchAgent` — fired by the
     // app once the OSC-answering embed has attached (issue #2). The
@@ -1009,10 +1021,27 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         claude_skip_permissions: spec.options.claude.skip_permissions,
         codex_yolo: spec.options.codex.yolo,
         container_id: spec.container_id.clone(),
-        // Task 4 populates these from the worktree spec; None keeps the
-        // non-worktree create path unchanged for now.
-        worktree_path: None,
-        branch: None,
+        // By the time this runs inside `create_session`, `spec.path` has
+        // already been repointed to the resolved worktree path (see the
+        // worktree branch there), so persist both from the spec.
+        worktree_path: spec.worktree.as_ref().map(|_| spec.path.clone()),
+        branch: spec.worktree.as_ref().map(|w| w.branch.clone()),
+    }
+}
+
+/// Compute where a new git worktree for `branch` should live, given the
+/// repo root and the configured placement scheme. Pure — the actual
+/// `git worktree add` happens in `create_session`.
+fn resolve_worktree_path(
+    repo_root: &str,
+    branch: &str,
+    loc: crate::config::WorktreeLocation,
+) -> String {
+    use crate::config::WorktreeLocation::*;
+    let repo = repo_root.trim_end_matches('/');
+    match loc {
+        Subdir => format!("{}/.worktrees/{}", repo, branch),
+        Sibling => format!("{}-{}", repo, branch),
     }
 }
 
@@ -1040,6 +1069,9 @@ fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
         },
         container_id: meta.container_id,
         resume: false,
+        // Restart/modify never re-create the worktree — it already
+        // exists on disk from the original create.
+        worktree: None,
     }
 }
 
@@ -1464,5 +1496,53 @@ mod build_cmd_tests {
         assert_eq!(slug_from_internal("bosun-foo-abc", "bosun-"), None);
         // No prefix match.
         assert_eq!(slug_from_internal("other-foo-12345678", "bosun-"), None);
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+    use crate::config::WorktreeLocation;
+
+    fn minimal_spec() -> SessionSpec {
+        SessionSpec {
+            name: "api".into(),
+            path: "/srv/api".into(),
+            agent: "claude".into(),
+            args: String::new(),
+            options: SpecOptions::default(),
+            container_id: None,
+            resume: false,
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn spec_to_metadata_carries_worktree() {
+        let mut spec = minimal_spec();
+        spec.worktree = Some(crate::events::WorktreeSpec {
+            branch: "feat".into(),
+        });
+        // path is set by the actor to the resolved worktree path before
+        // persist, so here we assert branch round-trips into metadata.branch.
+        let meta = spec_to_metadata(&spec);
+        assert_eq!(meta.branch.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn resolve_worktree_path_subdir_and_sibling() {
+        assert_eq!(
+            resolve_worktree_path("/srv/proj", "feat", WorktreeLocation::Subdir),
+            "/srv/proj/.worktrees/feat"
+        );
+        assert_eq!(
+            resolve_worktree_path("/srv/proj", "feat", WorktreeLocation::Sibling),
+            "/srv/proj-feat"
+        );
+        // A trailing slash on the repo root is normalized away.
+        assert_eq!(
+            resolve_worktree_path("/srv/proj/", "feat", WorktreeLocation::Subdir),
+            "/srv/proj/.worktrees/feat"
+        );
     }
 }

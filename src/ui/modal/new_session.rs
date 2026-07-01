@@ -434,6 +434,9 @@ impl NewSessionModal {
             },
             container_id: self.add_tab_to.clone(),
             resume: false,
+            // Task 5 wires the modal's worktree toggle into this; for
+            // now every modal-built spec is a plain path-based session.
+            worktree: None,
         })
     }
 }
@@ -1416,6 +1419,7 @@ mod tests {
             },
             container_id: None,
             resume: false,
+            worktree: None,
         };
         m.on_child_closed(ModalData::FillSessionSpec(spec));
         assert_eq!(m.name, "api");
