@@ -39,6 +39,13 @@ pub struct TmuxSession {
     /// sessions from before the container feature shipped; those
     /// reconcile into their own fresh single-tab containers.
     pub container_id: Option<String>,
+    /// Absolute path of the git worktree backing this session, stored
+    /// in `@bosun_worktree_path` at create time. `None` for sessions
+    /// not created in a worktree.
+    pub worktree_path: Option<String>,
+    /// Git branch checked out in the worktree, stored in `@bosun_branch`.
+    /// `None` for non-worktree sessions.
+    pub branch: Option<String>,
     /// Width (columns) of the session's active pane on this poll, from
     /// `#{pane_width}`. Used by the unread tracker to distinguish a real
     /// content change from a reflow: a different width means the pane

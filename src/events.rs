@@ -31,6 +31,20 @@ pub struct SessionSpec {
     /// recreated session's saved spec; the next plain restart goes back
     /// to the stored mode.
     pub resume: bool,
+    /// When `Some`, the actor creates the session inside a fresh git
+    /// worktree instead of opening the user-picked path directly. See
+    /// `WorktreeSpec`. `None` (the default) is a normal path-based
+    /// session.
+    pub worktree: Option<WorktreeSpec>,
+}
+
+/// Request to create the session inside a fresh git worktree. The
+/// worktree location comes from `Config::worktree_location`; only the
+/// branch is user-chosen. `None` on `SessionSpec` means a normal
+/// path-based session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSpec {
+    pub branch: String,
 }
 
 /// Agent-specific flags the user toggled in the new-session modal.
@@ -103,6 +117,18 @@ pub enum Command {
     CreateSession(SessionSpec),
     /// Kill a session by its internal tmux name. `tmux kill-session -t`.
     KillSession(String),
+    /// Kill a worktree-backed session and clean up its git worktree.
+    /// The actor resolves the main repo root from `worktree_path` via
+    /// `main_repo_root`. `merge` merges the branch into the repo's
+    /// current branch and deletes it after removing the worktree;
+    /// `false` removes the worktree but keeps the branch. Refuses on a
+    /// dirty tree.
+    KillSessionRemoveWorktree {
+        internal: String,
+        worktree_path: String,
+        branch: String,
+        merge: bool,
+    },
     /// Kill every tmux session named in `tabs` in one batch — used
     /// by `Shift+D` to tear down all tabs in a container at once.
     /// The actor iterates `KillSession` for each name; sidebar

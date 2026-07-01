@@ -111,6 +111,8 @@ you can click into and drive without leaving bosun.
 - Create new bosun-managed sessions from a modal form: name, path, agent
   choice, and agent-specific options (Claude `--continue` / `--resume` /
   skip-permissions, Codex `--yolo`)
+- Optional git worktree sessions — create a session in a fresh worktree
+  on a new branch, then on kill choose to merge, remove, or keep it
 - Filesystem tab-completion in the path field (shell-style LCP matching
   against live directory contents)
 - Recent sessions picker (`Ctrl+R` from the new-session modal) backed by
@@ -213,6 +215,11 @@ The full list is available at any time inside bosun with `?` or `h`.
 | `e` | Open the session's path in your configured editor |
 | `Ctrl+R` | Force immediate refresh |
 
+Killing a session that lives in a git worktree opens a dialog with three
+choices: `m` merges the branch and removes the worktree, `x` removes the
+worktree but keeps the branch, and `Enter` (keep) leaves the worktree in
+place. A dirty (uncommitted) worktree is never removed.
+
 ### Main list — tabs
 
 | Key | Action |
@@ -278,6 +285,11 @@ The full list is available at any time inside bosun with `?` or `h`.
 | `Space` (on a checkbox) | Toggle option |
 | `Enter` | Create session |
 | `Esc` | Cancel |
+
+The modal has a **Create in git worktree** checkbox (`Space` toggles it).
+When on, it reveals an editable branch field (prefilled from the session
+name, no `/` or spaces) and the session is created in a fresh worktree on
+that branch instead of the plain path.
 
 ### Recents picker
 
@@ -458,9 +470,10 @@ Bosun reads (in order of precedence):
 Example `config.toml`:
 
 ```toml
-theme            = "tokyonight"
-session_prefix   = "bosun-"     # bosun only manages sessions with this prefix
-tmux_socket      = "bosun"      # dedicated tmux -L socket; "default" uses your shared socket
+theme             = "tokyonight"
+session_prefix    = "bosun-"     # bosun only manages sessions with this prefix
+worktree_location = "subdir"     # where "create in worktree" puts new worktrees: "subdir" (<repo>/.worktrees/<branch>) or "sibling" (<repo>-<branch>)
+tmux_socket       = "bosun"      # dedicated tmux -L socket; "default" uses your shared socket
 divider_x        = 50           # saved automatically when you drag the list/preview divider
 preview_tick_ms  = 200          # fast-preview / live-status cadence; 0 disables the fast tick
 single_window    = true         # `s` key persists this; Enter focuses in-place instead of full-screen attach

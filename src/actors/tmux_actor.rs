@@ -307,6 +307,41 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::KillSessionRemoveWorktree {
+                    internal,
+                    worktree_path,
+                    branch,
+                    merge,
+                } => {
+                    handle_kill_remove_worktree(
+                        &*client,
+                        &internal,
+                        &worktree_path,
+                        &branch,
+                        merge,
+                        &evt_tx,
+                    )
+                    .await;
+                    // Mirror the KillSession post-kill refresh: drop the
+                    // focus if we just tore down the focused session, then
+                    // force a refresh so the row disappears without a 1s wait.
+                    if focused.as_deref() == Some(internal.as_str()) {
+                        focused = None;
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::KillContainer { tabs } => {
                     // Multi-kill: iterate each tab serially so a
                     // failure on one doesn't abort the rest. The
@@ -816,6 +851,92 @@ pub fn spawn(
     })
 }
 
+/// Kill a worktree-backed session and clean up its git worktree.
+///
+/// Extracted from the command loop so it's testable against the real
+/// git client without spinning up the whole actor. Every failure is
+/// surfaced as a `Warn` toast and leaves the worktree intact — we
+/// never force-remove a dirty tree and never auto-merge past a
+/// conflict.
+async fn handle_kill_remove_worktree(
+    client: &dyn TmuxClient,
+    internal: &str,
+    worktree_path: &str,
+    branch: &str,
+    merge: bool,
+    evt_tx: &mpsc::UnboundedSender<AppMsg>,
+) {
+    // 1. Kill the tmux session (idempotent — fine if already gone).
+    let _ = client.kill_session(internal).await;
+    // 2. Resolve the main repo root from the worktree path.
+    let repo = match client.main_repo_root(worktree_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx.send(AppMsg::Warn(format!("worktree cleanup: {}", e)));
+            return;
+        }
+    };
+    // 3. Dirty guard — never force-remove a dirty tree.
+    match client.is_dirty(worktree_path).await {
+        Ok(true) => {
+            let _ = evt_tx.send(AppMsg::Warn(
+                "worktree has uncommitted changes; not removed".into(),
+            ));
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            let _ = evt_tx.send(AppMsg::Warn(format!("worktree status: {}", e)));
+            return;
+        }
+    }
+    // 4. Optional merge into the repo's current branch.
+    if merge {
+        if let Err(e) = client.branch_merge(&repo, branch).await {
+            // A conflicted `git merge` exits non-zero but leaves the main
+            // repo mid-merge (conflict markers + MERGE_HEAD). Abort so the
+            // repo is restored to exactly its pre-merge state — otherwise
+            // the user would have to run `git merge --abort` by hand.
+            if let Err(abort_err) = client.merge_abort(&repo).await {
+                let _ = evt_tx.send(AppMsg::Warn(format!(
+                    "merge {}: {} (also failed to abort: {})",
+                    branch, e, abort_err
+                )));
+            } else {
+                let _ = evt_tx.send(AppMsg::Warn(format!(
+                    "merge {} conflicted; aborted, worktree kept",
+                    branch
+                )));
+            }
+            return; // leave the worktree intact on a failed/conflicted merge
+        }
+    }
+    // 5. Remove the worktree (force=false; the dirty guard above already passed).
+    // Note: cleanup is not atomic. If `merge` already succeeded above and this
+    // removal fails, the merge stays committed on the repo's current branch
+    // while the worktree (and branch) survive — surfaced as a Warn, no rollback
+    // (rolling back a git merge is riskier than leaving the stray worktree).
+    if let Err(e) = client.worktree_remove(&repo, worktree_path, false).await {
+        // Tell the user if the merge already landed, so they know the branch
+        // was integrated even though the worktree couldn't be removed.
+        let prefix = if merge {
+            "merged, but worktree remove failed"
+        } else {
+            "worktree remove"
+        };
+        let _ = evt_tx.send(AppMsg::Warn(format!("{}: {}", prefix, e)));
+        return;
+    }
+    // 6. Delete the branch only on the merge path. Surface a failure as a Warn
+    // for consistency with the rest of the handler (in practice `branch -d`
+    // after a successful merge, with the worktree now removed, always succeeds).
+    if merge {
+        if let Err(e) = client.branch_delete(&repo, branch).await {
+            let _ = evt_tx.send(AppMsg::Warn(format!("branch delete {}: {}", branch, e)));
+        }
+    }
+}
+
 /// Assemble the internal tmux session name from the user's typed
 /// display name. Internal format: `<prefix><slug>-<hex-suffix>`,
 /// e.g. `bosun-my-rocket-fox-a1b2c3d4`. The display name can contain
@@ -844,6 +965,10 @@ fn build_internal_name(prefix: &str, display: &str) -> String {
 /// Lowercase slug: alphanumeric and underscores are kept (underscore
 /// is valid in tmux session names); everything else collapses to
 /// single dashes; leading/trailing dashes are trimmed.
+///
+/// Distinct on purpose from `ui::modal::new_session::slug` (which slugs
+/// the git *branch* name and drops `_`). This one feeds the internal
+/// tmux *session* name — don't unify them.
 pub(crate) fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_dash = false;
@@ -972,6 +1097,34 @@ async fn create_session(
     defer_launch: bool,
 ) -> crate::error::Result<String> {
     let internal = build_internal_name(&config.session_prefix, &spec.name);
+    // If a worktree was requested, create it and repoint the path.
+    // `spec` is taken by value (see the fn signature), so rebinding as
+    // mut is valid and later shared reads/clones of `spec` still compile.
+    let mut spec = spec;
+    // When we create a worktree below, remember (repo, worktree_path, branch)
+    // so we can roll it back if a later step (the tmux `create_session`)
+    // fails — otherwise the worktree + its new branch would be orphaned with
+    // no session attached to them.
+    let mut created_worktree: Option<(String, String, String)> = None;
+    if let Some(wt) = spec.worktree.clone() {
+        let repo = client.repo_root(&spec.path).await?; // errors if not a git repo
+                                                        // The `Subdir` scheme drops the worktree inside the repo's own
+                                                        // working tree (`<repo>/.worktrees/`). Git doesn't auto-ignore a
+                                                        // nested linked worktree, so without this it shows as untracked in
+                                                        // `git status` and `git add -A` would try to embed it as a gitlink.
+                                                        // Exclude it locally (best-effort — never block create on this).
+        if config.worktree_location == crate::config::WorktreeLocation::Subdir {
+            if let Err(e) = client.ensure_excluded(&repo, "/.worktrees/").await {
+                tracing::warn!("failed to exclude .worktrees/ in {}: {}", repo, e);
+            }
+        }
+        let worktree_path = resolve_worktree_path(&repo, &wt.branch, config.worktree_location);
+        client
+            .worktree_add(&repo, &wt.branch, &worktree_path)
+            .await?; // aborts create on failure
+        created_worktree = Some((repo, worktree_path.clone(), wt.branch));
+        spec.path = worktree_path; // spec_to_metadata reads spec.path + spec.worktree below
+    }
     // `defer_launch` creates the pane as a bare shell and leaves the
     // agent command for a later `Command::LaunchAgent` — fired by the
     // app once the OSC-answering embed has attached (issue #2). The
@@ -991,7 +1144,38 @@ async fn create_session(
         command,
         metadata,
     };
-    client.create_session(&create).await.map(|_| internal)
+    match client.create_session(&create).await {
+        Ok(_) => Ok(internal),
+        Err(e) => {
+            // Roll back a just-created worktree so a failed tmux create
+            // doesn't leave an orphaned worktree + branch behind. The
+            // worktree is pristine (no commits of its own), so force-remove
+            // is safe. `git worktree remove` does NOT delete the branch that
+            // `worktree_add -b` created, so delete it explicitly afterwards —
+            // otherwise a retry with the same name hits "branch already
+            // exists". Both steps are best-effort (log on failure).
+            if let Some((repo, worktree_path, branch)) = created_worktree {
+                if let Err(cleanup_err) = client.worktree_remove(&repo, &worktree_path, true).await
+                {
+                    tracing::warn!(
+                        "failed to roll back worktree {} after create error: {}",
+                        worktree_path,
+                        cleanup_err
+                    );
+                } else if let Err(branch_err) = client.branch_delete(&repo, &branch).await {
+                    // Only attempt the branch delete once the worktree is
+                    // gone — `branch -d` is refused while the branch is
+                    // checked out in a worktree.
+                    tracing::warn!(
+                        "failed to roll back branch {} after create error: {}",
+                        branch,
+                        branch_err
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Project a `SessionSpec` into the persisted tmux-options shape.
@@ -1009,6 +1193,27 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         claude_skip_permissions: spec.options.claude.skip_permissions,
         codex_yolo: spec.options.codex.yolo,
         container_id: spec.container_id.clone(),
+        // By the time this runs inside `create_session`, `spec.path` has
+        // already been repointed to the resolved worktree path (see the
+        // worktree branch there), so persist both from the spec.
+        worktree_path: spec.worktree.is_some().then(|| spec.path.clone()),
+        branch: spec.worktree.as_ref().map(|w| w.branch.clone()),
+    }
+}
+
+/// Compute where a new git worktree for `branch` should live, given the
+/// repo root and the configured placement scheme. Pure — the actual
+/// `git worktree add` happens in `create_session`.
+fn resolve_worktree_path(
+    repo_root: &str,
+    branch: &str,
+    loc: crate::config::WorktreeLocation,
+) -> String {
+    use crate::config::WorktreeLocation::*;
+    let repo = repo_root.trim_end_matches('/');
+    match loc {
+        Subdir => format!("{}/.worktrees/{}", repo, branch),
+        Sibling => format!("{}-{}", repo, branch),
     }
 }
 
@@ -1036,6 +1241,9 @@ fn metadata_to_spec(meta: SessionMetadata) -> SessionSpec {
         },
         container_id: meta.container_id,
         resume: false,
+        // Restart/modify never re-create the worktree — it already
+        // exists on disk from the original create.
+        worktree: None,
     }
 }
 
@@ -1460,5 +1668,244 @@ mod build_cmd_tests {
         assert_eq!(slug_from_internal("bosun-foo-abc", "bosun-"), None);
         // No prefix match.
         assert_eq!(slug_from_internal("other-foo-12345678", "bosun-"), None);
+    }
+}
+
+#[cfg(test)]
+mod kill_remove_worktree_tests {
+    use super::*;
+    use crate::tmux::client::TokioTmuxClient;
+
+    /// Spawn `git -C <dir> <args>`, asserting the command succeeds.
+    /// Local copy — `client.rs`'s git_tests helper is private to that
+    /// module.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create an initialised repo with one empty commit at `dir/repo`.
+    fn init_repo(dir: &std::path::Path) -> std::path::PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_merge_path_removes_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Commit a file on `feat` inside the worktree.
+        std::fs::write(wt.join("f.txt"), "data").unwrap();
+        run_git(&wt, &["add", "f.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "add f"]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // `internal` names a tmux session that doesn't exist —
+        // kill_session is idempotent, so no tmux server is needed.
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            true,
+            &tx,
+        )
+        .await;
+
+        // Worktree dir gone.
+        assert!(!wt.exists(), "worktree dir should be removed");
+        // Branch `feat` gone (merge path deletes it).
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "feat"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "branch feat should be deleted"
+        );
+        // The feat commit's file is present on the repo's checked-out
+        // branch (i.e. it was merged in).
+        assert!(repo.join("f.txt").exists(), "feat commit should be merged");
+        // No warnings on the happy path.
+        assert!(rx.try_recv().is_err(), "no warning expected on success");
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_conflicted_merge_aborts_and_leaves_repo_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        // Branch `feat` from the initial (empty) commit BEFORE either side
+        // touches x.txt, so the two sides diverge from a common base that
+        // lacks the file → a real content conflict on merge.
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Main side commits x.txt one way...
+        std::fs::write(repo.join("x.txt"), "main-side\n").unwrap();
+        run_git(&repo, &["add", "x.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "main x"]);
+        // ...and the feat worktree commits the same path differently.
+        std::fs::write(wt.join("x.txt"), "feat-side\n").unwrap();
+        run_git(&wt, &["add", "x.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "feat x"]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            true,
+            &tx,
+        )
+        .await;
+
+        // A Warn about the merge was surfaced.
+        match rx.try_recv() {
+            Ok(AppMsg::Warn(msg)) => {
+                assert!(
+                    msg.contains("merge"),
+                    "warning should mention the merge: {msg}"
+                );
+            }
+            other => panic!("expected a merge Warn, got {other:?}"),
+        }
+        // The worktree is left intact — a failed merge must not remove it.
+        assert!(wt.exists(), "worktree must survive a conflicted merge");
+        // The main repo must NOT be stuck mid-merge: no MERGE_HEAD and a
+        // clean working tree (the abort restored the pre-merge state).
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "MERGE_HEAD must be gone — merge should have been aborted"
+        );
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "main repo working tree must be clean after abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_dirty_tree_is_left_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Dirty the worktree with an untracked file → is_dirty true.
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            false,
+            &tx,
+        )
+        .await;
+
+        // Removal refused → worktree dir still exists.
+        assert!(wt.exists(), "dirty worktree must be left intact");
+        // A Warn was surfaced.
+        match rx.try_recv() {
+            Ok(AppMsg::Warn(msg)) => {
+                assert!(
+                    msg.contains("uncommitted"),
+                    "warning should mention uncommitted changes: {msg}"
+                );
+            }
+            other => panic!("expected a Warn, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+    use crate::config::WorktreeLocation;
+
+    fn minimal_spec() -> SessionSpec {
+        SessionSpec {
+            name: "api".into(),
+            path: "/srv/api".into(),
+            agent: "claude".into(),
+            args: String::new(),
+            options: SpecOptions::default(),
+            container_id: None,
+            resume: false,
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn spec_to_metadata_carries_worktree() {
+        let mut spec = minimal_spec();
+        spec.worktree = Some(crate::events::WorktreeSpec {
+            branch: "feat".into(),
+        });
+        // path is set by the actor to the resolved worktree path before
+        // persist; here it's the spec's path. Both halves of the derivation
+        // must round-trip: branch from the WorktreeSpec, worktree_path from
+        // spec.path (only when a worktree was requested).
+        let meta = spec_to_metadata(&spec);
+        assert_eq!(meta.branch.as_deref(), Some("feat"));
+        assert_eq!(meta.worktree_path.as_deref(), Some("/srv/api"));
+    }
+
+    #[test]
+    fn resolve_worktree_path_subdir_and_sibling() {
+        assert_eq!(
+            resolve_worktree_path("/srv/proj", "feat", WorktreeLocation::Subdir),
+            "/srv/proj/.worktrees/feat"
+        );
+        assert_eq!(
+            resolve_worktree_path("/srv/proj", "feat", WorktreeLocation::Sibling),
+            "/srv/proj-feat"
+        );
+        // A trailing slash on the repo root is normalized away.
+        assert_eq!(
+            resolve_worktree_path("/srv/proj/", "feat", WorktreeLocation::Subdir),
+            "/srv/proj/.worktrees/feat"
+        );
     }
 }

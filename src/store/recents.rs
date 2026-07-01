@@ -42,6 +42,9 @@ impl Recent {
             },
             container_id: None,
             resume: false,
+            // Recents never re-create a worktree — recreating from a
+            // recent opens the (already existing) path directly.
+            worktree: None,
         }
     }
 }
@@ -208,6 +211,7 @@ mod tests {
             options: SpecOptions::default(),
             container_id: None,
             resume: false,
+            worktree: None,
         }
     }
 

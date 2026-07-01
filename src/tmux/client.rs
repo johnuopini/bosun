@@ -52,6 +52,11 @@ pub struct SessionMetadata {
     /// Sidebar container this session belongs to (tabs feature).
     /// `None` when this session is its own row.
     pub container_id: Option<String>,
+    /// Git worktree path backing this session (worktree feature).
+    /// `None` when the session isn't in a worktree.
+    pub worktree_path: Option<String>,
+    /// Branch checked out in the worktree. `None` for non-worktree sessions.
+    pub branch: Option<String>,
 }
 
 /// Abstraction over the tmux CLI. Real impl shells out; mocks record calls.
@@ -109,6 +114,31 @@ pub trait TmuxClient: Send + Sync {
     /// (`prep_line = true`), so the cleanup — whose `Enter` re-runs the
     /// shell prompt's precmd hooks — happens once, at launch, not twice.
     async fn restart_in_place(&self, session: &str, command: &str, prep_line: bool) -> Result<()>;
+
+    /// Resolve the git work-tree root for `path`. Errors if `path` is
+    /// not inside a git repo.
+    async fn repo_root(&self, path: &str) -> Result<String>;
+    /// `git -C <repo> worktree add -b <branch> <worktree_path> HEAD`.
+    async fn worktree_add(&self, repo: &str, branch: &str, worktree_path: &str) -> Result<()>;
+    /// `git -C <repo> worktree remove [--force] <worktree_path>`.
+    async fn worktree_remove(&self, repo: &str, worktree_path: &str, force: bool) -> Result<()>;
+    /// True if `worktree_path` has uncommitted changes.
+    async fn is_dirty(&self, worktree_path: &str) -> Result<bool>;
+    /// `git -C <repo> merge <branch>` into the repo's current branch.
+    async fn branch_merge(&self, repo: &str, branch: &str) -> Result<()>;
+    /// `git -C <repo> merge --abort` — restore the pre-merge state after a
+    /// failed/conflicted `branch_merge` so the repo isn't left half-merged.
+    async fn merge_abort(&self, repo: &str) -> Result<()>;
+    /// `git -C <repo> branch -d <branch>`.
+    async fn branch_delete(&self, repo: &str, branch: &str) -> Result<()>;
+    /// Given a path INSIDE a linked worktree, resolve the MAIN repo
+    /// root (the directory the worktree branches from). Used on kill to
+    /// find the repo for merge/remove/delete. See implementation note.
+    async fn main_repo_root(&self, worktree_path: &str) -> Result<String>;
+    /// Idempotently add `pattern` to `<repo>/.git/info/exclude` so a
+    /// worktree placed inside the repo's working tree stays out of
+    /// `git status`. Local-only (never committed); a no-op if already present.
+    async fn ensure_excluded(&self, repo: &str, pattern: &str) -> Result<()>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -408,8 +438,8 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>> {
-        // Single display-message call returns all 7 fields separated
-        // by `|||`. We can't use a control character (the old `\x1f`
+        // Single display-message call returns all metadata fields
+        // separated by `|||`. We can't use a control character (the old `\x1f`
         // unit separator) because tmux 3.4+ escapes control chars in
         // format output as octal sequences (`\037`), which the parser
         // would never see as a real separator — that was breaking the
@@ -418,7 +448,7 @@ impl TmuxClient for TokioTmuxClient {
         // `tmux::parse::LIST_SESSIONS_FORMAT`.
         const SEP: &str = "|||";
         let fmt = format!(
-            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}{SEP}#{{@bosun_container_id}}",
+            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}{SEP}#{{@bosun_container_id}}{SEP}#{{@bosun_worktree_path}}{SEP}#{{@bosun_branch}}",
             SEP = SEP
         );
         let mut cmd = self.cmd();
@@ -439,36 +469,7 @@ impl TmuxClient for TokioTmuxClient {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         let line = raw.trim_end_matches('\n');
-        let parts: Vec<&str> = line.split(SEP).collect();
-        // Accept the legacy 7-field shape (pre-container_id sessions)
-        // as well as the new 8-field shape — keeps sessions created
-        // by an older bosun usable after upgrade.
-        if parts.len() != 7 && parts.len() != 8 {
-            return Ok(None);
-        }
-        // Agent is the required anchor — if it's empty, this session
-        // wasn't created by a metadata-aware bosun.
-        if parts[2].is_empty() {
-            return Ok(None);
-        }
-        let container_id = parts
-            .get(7)
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
-        Ok(Some(SessionMetadata {
-            display_name: parts[0].to_string(),
-            path: parts[1].to_string(),
-            agent: parts[2].to_string(),
-            args: parts[3].to_string(),
-            claude_session_mode: if parts[4].is_empty() {
-                "New".to_string()
-            } else {
-                parts[4].to_string()
-            },
-            claude_skip_permissions: parts[5] == "1",
-            codex_yolo: parts[6] == "1",
-            container_id,
-        }))
+        Ok(parse_metadata_line(line, SEP))
     }
 
     async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()> {
@@ -659,6 +660,133 @@ impl TmuxClient for TokioTmuxClient {
 
         Ok(())
     }
+
+    async fn repo_root(&self, path: &str) -> Result<String> {
+        let out = run_git(&["-C", path, "rev-parse", "--show-toplevel"]).await?;
+        Ok(out.trim().to_string())
+    }
+
+    async fn worktree_add(&self, repo: &str, branch: &str, worktree_path: &str) -> Result<()> {
+        run_git(&[
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            worktree_path,
+            "HEAD",
+        ])
+        .await?;
+        Ok(())
+    }
+
+    async fn worktree_remove(&self, repo: &str, worktree_path: &str, force: bool) -> Result<()> {
+        // `--` terminates option parsing so a path that happens to start
+        // with `-` is treated as an operand, not a flag.
+        let mut args = vec!["-C", repo, "worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push("--");
+        args.push(worktree_path);
+        run_git(&args).await?;
+        Ok(())
+    }
+
+    async fn is_dirty(&self, worktree_path: &str) -> Result<bool> {
+        let out = run_git(&["-C", worktree_path, "status", "--porcelain"]).await?;
+        Ok(!out.trim().is_empty())
+    }
+
+    async fn branch_merge(&self, repo: &str, branch: &str) -> Result<()> {
+        // `--` so a branch name starting with `-` can't be read as a flag.
+        run_git(&["-C", repo, "merge", "--", branch]).await?;
+        Ok(())
+    }
+
+    async fn merge_abort(&self, repo: &str) -> Result<()> {
+        run_git(&["-C", repo, "merge", "--abort"]).await?;
+        Ok(())
+    }
+
+    async fn branch_delete(&self, repo: &str, branch: &str) -> Result<()> {
+        // `--` so a branch name starting with `-` can't be read as a flag.
+        run_git(&["-C", repo, "branch", "-d", "--", branch]).await?;
+        Ok(())
+    }
+
+    async fn main_repo_root(&self, worktree_path: &str) -> Result<String> {
+        // From INSIDE a linked worktree, `rev-parse --show-toplevel`
+        // returns the *worktree* path, not the main repo — so we can't
+        // use it directly. `--git-common-dir` points at the main repo's
+        // git dir (shared across all worktrees); `--path-format=absolute`
+        // is required because older git returns it relative otherwise.
+        let common = run_git(&[
+            "-C",
+            worktree_path,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .await?;
+        let common = common.trim();
+        // The git dir's parent is the main repo's work tree. Take the
+        // parent via Path::parent() rather than string-stripping a
+        // literal `/.git`, which would break on non-standard git-dir
+        // names or bare repos.
+        let parent = std::path::Path::new(common).parent().ok_or_else(|| {
+            BosunError::Git(format!("git-common-dir {common} has no parent directory"))
+        })?;
+        let parent = parent.to_str().ok_or_else(|| {
+            BosunError::Git(format!(
+                "git-common-dir parent {parent:?} is not valid UTF-8"
+            ))
+        })?;
+        // Confirm by resolving the toplevel from the parent directory.
+        let root = run_git(&["-C", parent, "rev-parse", "--show-toplevel"]).await?;
+        Ok(root.trim().to_string())
+    }
+
+    async fn ensure_excluded(&self, repo: &str, pattern: &str) -> Result<()> {
+        // Resolve the repo's git dir rather than assuming `<repo>/.git` is a
+        // directory — it's a file for linked worktrees and submodules. The
+        // common dir is shared across worktrees, which is exactly where a
+        // repo-wide `info/exclude` belongs.
+        let git_dir = run_git(&[
+            "-C",
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .await?;
+        let git_dir = git_dir.trim();
+        let info = std::path::Path::new(git_dir).join("info");
+        let exclude = info.join("exclude");
+
+        // Already excluded? Match the pattern on its own line so we don't
+        // re-append (and don't match it as a substring of another rule).
+        if let Ok(existing) = std::fs::read_to_string(&exclude) {
+            if existing.lines().any(|l| l.trim() == pattern) {
+                return Ok(());
+            }
+        }
+
+        std::fs::create_dir_all(&info)
+            .map_err(|e| BosunError::Git(format!("create {}: {e}", info.display())))?;
+        // Read-modify-append, ensuring the new rule lands on its own line
+        // even if the file didn't end in a newline.
+        let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(pattern);
+        contents.push('\n');
+        std::fs::write(&exclude, contents)
+            .map_err(|e| BosunError::Git(format!("write {}: {e}", exclude.display())))?;
+        Ok(())
+    }
 }
 
 /// Map a `SessionMetadata` into the `(key, value)` pairs that should
@@ -685,7 +813,96 @@ fn metadata_options(m: &SessionMetadata) -> Vec<(&'static str, String)> {
     if let Some(id) = &m.container_id {
         out.push(("@bosun_container_id", id.clone()));
     }
+    // Same "only when Some" treatment for the worktree options — keeps
+    // non-worktree sessions clean and lets reads distinguish "no option"
+    // from an empty value.
+    if let Some(p) = &m.worktree_path {
+        out.push(("@bosun_worktree_path", p.clone()));
+    }
+    if let Some(b) = &m.branch {
+        out.push(("@bosun_branch", b.clone()));
+    }
     out
+}
+
+/// Parse a `display-message` metadata line (fields separated by `sep`)
+/// into a `SessionMetadata`, or `None` when the line doesn't come from a
+/// metadata-aware bosun session.
+///
+/// Field order mirrors the read format string in `get_session_metadata`:
+/// `display | path | agent | args | claude_session_mode |
+/// claude_skip_permissions | codex_yolo | container_id | worktree_path |
+/// branch`.
+fn parse_metadata_line(line: &str, sep: &str) -> Option<SessionMetadata> {
+    let parts: Vec<&str> = line.split(sep).collect();
+    // Accept the legacy 7-field shape (pre-container_id sessions),
+    // the 8-field shape (container_id added), and the 9/10-field
+    // shapes (worktree_path + branch added) — keeps sessions
+    // created by an older bosun usable after upgrade. Widening this
+    // matters: after appending the two worktree fields to the read
+    // format, metadata-aware sessions emit 9 or 10 fields, so the
+    // old `!= 7 && != 8` guard would reject every session and
+    // silently disable restart/modify.
+    if !matches!(parts.len(), 7..=10) {
+        return None;
+    }
+    // Agent is the required anchor — if it's empty, this session
+    // wasn't created by a metadata-aware bosun.
+    if parts[2].is_empty() {
+        return None;
+    }
+    let container_id = parts
+        .get(7)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    Some(SessionMetadata {
+        display_name: parts[0].to_string(),
+        path: parts[1].to_string(),
+        agent: parts[2].to_string(),
+        args: parts[3].to_string(),
+        claude_session_mode: if parts[4].is_empty() {
+            "New".to_string()
+        } else {
+            parts[4].to_string()
+        },
+        claude_skip_permissions: parts[5] == "1",
+        codex_yolo: parts[6] == "1",
+        container_id,
+        worktree_path: parts
+            .get(8)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        branch: parts
+            .get(9)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+/// Shell out to `git` with the given args, returning raw (untrimmed)
+/// stdout as a `String` on success — callers trim as needed. Mirrors
+/// the tmux shell-out idiom:
+/// build the command, collect output, and map a non-zero exit to a
+/// `BosunError::Git` carrying the trimmed stderr. A missing `git`
+/// binary maps to the same error variant so the caller gets a single,
+/// user-facing message rather than a raw io panic.
+async fn run_git(args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| BosunError::Git(format!("failed to spawn git: {e}")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(BosunError::Git(format!(
+        "git {} failed ({}): {}",
+        args.join(" "),
+        output.status,
+        stderr.trim()
+    )))
 }
 
 /// Build a synchronous `std::process::Command` for tmux with the given args.
@@ -704,4 +921,390 @@ where
         c.arg(a);
     }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEP: &str = "|||";
+
+    #[test]
+    fn parse_metadata_full_10_field_line_round_trips() {
+        // display|path|agent|args|mode|skip|yolo|container|worktree|branch
+        let line = "My Session|||/tmp/my|||claude|||--model=opus|||Resume|||1|||0|||cont1|||/srv/.worktrees/feat|||feat";
+        let m = parse_metadata_line(line, SEP).expect("metadata parses");
+        assert_eq!(m.display_name, "My Session");
+        assert_eq!(m.path, "/tmp/my");
+        assert_eq!(m.agent, "claude");
+        assert_eq!(m.args, "--model=opus");
+        assert_eq!(m.claude_session_mode, "Resume");
+        assert!(m.claude_skip_permissions);
+        assert!(!m.codex_yolo);
+        assert_eq!(m.container_id.as_deref(), Some("cont1"));
+        assert_eq!(m.worktree_path.as_deref(), Some("/srv/.worktrees/feat"));
+        assert_eq!(m.branch.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn parse_metadata_legacy_8_field_line_still_parses() {
+        // Pre-worktree session: container_id present, no worktree fields.
+        let line = "Old|||/tmp/old|||codex|||args|||New|||0|||1|||cont2";
+        let m = parse_metadata_line(line, SEP).expect("legacy metadata parses");
+        assert_eq!(m.agent, "codex");
+        assert_eq!(m.container_id.as_deref(), Some("cont2"));
+        assert!(m.worktree_path.is_none());
+        assert!(m.branch.is_none());
+    }
+
+    #[test]
+    fn parse_metadata_empty_worktree_fields_are_none() {
+        // Metadata-aware session with container_id and the two new
+        // options unset → trailing empty fields parse to None. Built
+        // by joining so the field count is unambiguous (10 fields).
+        let line = ["S", "/p", "claude", "a", "New", "0", "0", "", "", ""].join(SEP);
+        let m = parse_metadata_line(&line, SEP).expect("parses");
+        assert!(m.worktree_path.is_none());
+        assert!(m.branch.is_none());
+    }
+
+    #[test]
+    fn parse_metadata_none_when_agent_empty() {
+        let line = "S|||/p||||||a|||New|||0|||0|||c|||/wt|||b";
+        assert!(parse_metadata_line(line, SEP).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_none_on_wrong_field_count() {
+        let line = "too|||few";
+        assert!(parse_metadata_line(line, SEP).is_none());
+    }
+}
+
+/// Git shell-out tests. These spawn a real `git` in a tempdir — no
+/// tmux, no network — so they run unconditionally (not gated behind
+/// `tmux-it`). They exercise the actual git behaviour these methods
+/// depend on: worktree/branch bookkeeping and the linked-worktree
+/// `--git-common-dir` resolution that `main_repo_root` relies on.
+#[cfg(test)]
+mod git_tests {
+    use super::*;
+
+    /// Spawn `git -C <dir> <args>`, asserting the command succeeds.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create an initialised repo with one empty commit at `dir/repo`.
+    fn init_repo(dir: &std::path::Path) -> std::path::PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    #[tokio::test]
+    async fn worktree_add_creates_dir_and_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(wt.join(".git").exists());
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "feat"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("feat"));
+    }
+
+    #[tokio::test]
+    async fn repo_root_resolves_toplevel() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let sub = repo.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let client = TokioTmuxClient::new();
+        // From a subdirectory, repo_root should still resolve to the repo top.
+        let root = client.repo_root(sub.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&root).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_root_errors_outside_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // dir.path() itself is not a git repo.
+        let client = TokioTmuxClient::new();
+        assert!(client
+            .repo_root(dir.path().to_str().unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_deletes_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(wt.exists());
+
+        client
+            .worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_force_removes_dirty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+        // Dirty the worktree: a plain remove would refuse.
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+
+        // Non-force remove should fail on a dirty worktree.
+        assert!(client
+            .worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), false)
+            .await
+            .is_err());
+        // Force remove should succeed.
+        client
+            .worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), true)
+            .await
+            .unwrap();
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn is_dirty_reflects_working_tree_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Freshly added worktree is clean.
+        assert!(!client.is_dirty(wt.to_str().unwrap()).await.unwrap());
+        // Add an untracked file → dirty.
+        std::fs::write(wt.join("new.txt"), "hi").unwrap();
+        assert!(client.is_dirty(wt.to_str().unwrap()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_brings_in_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Commit something on the worktree's `feat` branch.
+        std::fs::write(wt.join("f.txt"), "data").unwrap();
+        run_git(&wt, &["add", "f.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "add f"]);
+
+        // Merge feat into the main repo's checked-out branch.
+        client
+            .branch_merge(repo.to_str().unwrap(), "feat")
+            .await
+            .unwrap();
+        assert!(repo.join("f.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_abort_restores_pre_merge_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        // feat branches from the empty init commit, before either side
+        // touches x.txt → the merge below conflicts on that path.
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("x.txt"), "main-side\n").unwrap();
+        run_git(&repo, &["add", "x.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "main x"]);
+        std::fs::write(wt.join("x.txt"), "feat-side\n").unwrap();
+        run_git(&wt, &["add", "x.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "feat x"]);
+
+        // The merge conflicts and leaves MERGE_HEAD behind.
+        assert!(client
+            .branch_merge(repo.to_str().unwrap(), "feat")
+            .await
+            .is_err());
+        assert!(repo.join(".git").join("MERGE_HEAD").exists());
+
+        // Abort clears MERGE_HEAD and restores a clean working tree.
+        client.merge_abort(repo.to_str().unwrap()).await.unwrap();
+        assert!(!repo.join(".git").join("MERGE_HEAD").exists());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn branch_delete_removes_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+        // Merge feat (no new commits) so `branch -d` sees it as merged,
+        // then remove the worktree so the branch is free to delete.
+        client
+            .branch_merge(repo.to_str().unwrap(), "feat")
+            .await
+            .unwrap();
+        client
+            .worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), false)
+            .await
+            .unwrap();
+
+        client
+            .branch_delete(repo.to_str().unwrap(), "feat")
+            .await
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "feat"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_excluded_appends_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let client = TokioTmuxClient::new();
+
+        // First call adds the rule; a nested worktree dir is then untracked-
+        // ignored so it won't show in `git status`.
+        client
+            .ensure_excluded(repo.to_str().unwrap(), "/.worktrees/")
+            .await
+            .unwrap();
+        let exclude = repo.join(".git").join("info").join("exclude");
+        let after_first = std::fs::read_to_string(&exclude).unwrap();
+        assert_eq!(
+            after_first
+                .lines()
+                .filter(|l| l.trim() == "/.worktrees/")
+                .count(),
+            1,
+            "rule should be present exactly once"
+        );
+
+        // Second call is a no-op — no duplicate line.
+        client
+            .ensure_excluded(repo.to_str().unwrap(), "/.worktrees/")
+            .await
+            .unwrap();
+        let after_second = std::fs::read_to_string(&exclude).unwrap();
+        assert_eq!(
+            after_second
+                .lines()
+                .filter(|l| l.trim() == "/.worktrees/")
+                .count(),
+            1,
+            "second call must not duplicate the rule"
+        );
+
+        // Prove the effect: a `.worktrees/` dir stays out of git status.
+        std::fs::create_dir(repo.join(".worktrees")).unwrap();
+        std::fs::write(repo.join(".worktrees").join("x"), "y").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status.stdout).contains(".worktrees"),
+            "excluded worktree dir must not appear in git status"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_repo_root_resolves_from_inside_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // From INSIDE the linked worktree, main_repo_root must resolve to
+        // the MAIN repo root, not the worktree path itself.
+        let main = client.main_repo_root(wt.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&main).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        // Sanity: it must NOT be the worktree path.
+        assert_ne!(
+            std::fs::canonicalize(&main).unwrap(),
+            std::fs::canonicalize(&wt).unwrap()
+        );
+    }
 }

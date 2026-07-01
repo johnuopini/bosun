@@ -215,6 +215,11 @@ pub struct AppState {
     /// the tab strip and OSC title prefix grouped sessions with
     /// `group/`. Read by `ui::preview` and the attach-title path.
     pub show_group_in_title: bool,
+    /// Where `git worktree add` places new worktrees. Snapshot of
+    /// `Config::worktree_location` at startup, passed into the
+    /// new-session modal so its worktree preview line shows the same
+    /// scheme the tmux actor resolves downstream.
+    pub worktree_location: crate::config::WorktreeLocation,
 }
 
 /// What the user has "seen" for one session — the baseline the unread
@@ -1232,14 +1237,53 @@ impl AppState {
                 }
                 Some(_) => {
                     if let Some(sel) = self.selected_session() {
-                        let internal = sel.name().to_string();
-                        let display = sel.display().to_string();
-                        let title = "Kill session?";
-                        let msg = format!("This will kill '{}' and its pane.", display);
-                        self.modals.push(Box::new(
-                            ConfirmModal::new(title, msg, Command::KillSession(internal))
-                                .destructive(),
-                        ));
+                        if let (Some(wt_path), Some(branch)) = (
+                            sel.session.worktree_path.clone(),
+                            sel.session.branch.clone(),
+                        ) {
+                            let internal = sel.name().to_string();
+                            let display = sel.display().to_string();
+                            let title = "Kill worktree session?";
+                            let msg = format!(
+                                "'{}' lives in a git worktree (branch {}).",
+                                display, branch
+                            );
+                            // Primary / Enter = keep the worktree (plain kill).
+                            let keep = Command::KillSession(internal.clone());
+                            self.modals.push(Box::new(
+                                ConfirmModal::new(title, msg, keep)
+                                    .destructive()
+                                    .with_alt(
+                                        'm',
+                                        "merge & remove",
+                                        Command::KillSessionRemoveWorktree {
+                                            internal: internal.clone(),
+                                            worktree_path: wt_path.clone(),
+                                            branch: branch.clone(),
+                                            merge: true,
+                                        },
+                                    )
+                                    .with_alt(
+                                        'x',
+                                        "remove, keep branch",
+                                        Command::KillSessionRemoveWorktree {
+                                            internal,
+                                            worktree_path: wt_path,
+                                            branch,
+                                            merge: false,
+                                        },
+                                    ),
+                            ));
+                        } else {
+                            let internal = sel.name().to_string();
+                            let display = sel.display().to_string();
+                            let title = "Kill session?";
+                            let msg = format!("This will kill '{}' and its pane.", display);
+                            self.modals.push(Box::new(
+                                ConfirmModal::new(title, msg, Command::KillSession(internal))
+                                    .destructive(),
+                            ));
+                        }
                     } else if let Some(internal) = self.selected_session_name() {
                         // Dead/missing entry — the underlying tmux session
                         // is gone (e.g. server restarted), but the sidebar
@@ -2035,6 +2079,7 @@ impl App {
             single_window_mode: config.single_window_mode,
             sidebar_hidden: config.sidebar_hidden,
             show_group_in_title: config.show_group_in_title,
+            worktree_location: config.worktree_location,
             ..Default::default()
         };
 
@@ -2746,9 +2791,10 @@ impl App {
                 match req {
                     ModalRequest::NewSession => {
                         let recents = self.store.list_recents(50).unwrap_or_default();
-                        self.state
-                            .modals
-                            .push(Box::new(NewSessionModal::new(recents)));
+                        self.state.modals.push(Box::new(NewSessionModal::new(
+                            recents,
+                            self.state.worktree_location,
+                        )));
                     }
                     ModalRequest::Theme => {
                         let names = Theme::available(crate::config::user_themes_dir().as_deref());
@@ -3536,6 +3582,8 @@ mod tests {
                 agent: None,
                 spec_path: None,
                 container_id: None,
+                worktree_path: None,
+                branch: None,
                 // Stable default so the unread tests exercise pure
                 // content change; width-change tests use `ses_hw`.
                 pane_width: 80,

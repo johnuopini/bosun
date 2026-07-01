@@ -18,14 +18,16 @@ use crate::tmux::session::TmuxSession;
 /// name, display name, or filesystem path.
 ///
 /// The trailing `@bosun_*` fields read user options we set at create time:
-/// - `@bosun_display`      — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
-/// - `@bosun_agent`        — agent kind (claude / codex / terminal)
-/// - `@bosun_path`         — spec path the user typed into the new-session modal
-/// - `@bosun_container_id` — sidebar container this session belongs to (tabs feature)
+/// - `@bosun_display`       — pretty UI name (e.g. "rasterfox" for internal `bosun-rasterfox-a1b2c3d4`)
+/// - `@bosun_agent`         — agent kind (claude / codex / terminal)
+/// - `@bosun_path`          — spec path the user typed into the new-session modal
+/// - `@bosun_container_id`  — sidebar container this session belongs to (tabs feature)
+/// - `@bosun_worktree_path` — git worktree backing this session (worktree feature)
+/// - `@bosun_branch`        — branch checked out in that worktree (worktree feature)
 ///
-/// All four are empty strings for non-bosun sessions and get parsed as
+/// All six are empty strings for non-bosun sessions and get parsed as
 /// `None` so the UI renders them only when available.
-pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}|||#{@bosun_container_id}|||#{pane_width}";
+pub const LIST_SESSIONS_FORMAT: &str = "#{session_name}|||#{session_windows}|||#{session_attached}|||#{session_created}|||#{session_activity}|||#{session_path}|||#{@bosun_display}|||#{@bosun_agent}|||#{@bosun_path}|||#{@bosun_container_id}|||#{@bosun_worktree_path}|||#{@bosun_branch}|||#{pane_width}";
 
 const FIELD_SEP: &str = "|||";
 
@@ -77,6 +79,11 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
     let agent_raw = parts.next().map(|s| s.to_string());
     let spec_path_raw = parts.next().map(|s| s.to_string());
     let container_id_raw = parts.next().map(|s| s.to_string());
+    // Worktree path and branch (worktree feature). Optional trailing
+    // fields for the same back-compat reasons as the other `@bosun_*`
+    // options above — older outputs and terse fixtures omit them.
+    let worktree_path_raw = parts.next().map(|s| s.to_string());
+    let branch_raw = parts.next().map(|s| s.to_string());
     // Current pane width. Used to tell a genuine content change from a
     // mere reflow (resize / embed / a second bosun instance attaching),
     // so a layout change doesn't read as unread. Optional trailing
@@ -113,6 +120,8 @@ fn parse_session_line(line: &str) -> std::result::Result<TmuxSession, String> {
         agent: agent_raw.filter(|s| !s.is_empty()),
         spec_path: spec_path_raw.filter(|s| !s.is_empty()),
         container_id: container_id_raw.filter(|s| !s.is_empty()),
+        worktree_path: worktree_path_raw.filter(|s| !s.is_empty()),
+        branch: branch_raw.filter(|s| !s.is_empty()),
         pane_width,
     })
 }
@@ -150,9 +159,10 @@ mod tests {
 
     #[test]
     fn parses_pane_width() {
-        // Full format including the trailing pane_width field.
+        // Full format including the two worktree fields and the trailing
+        // pane_width field (pane_width stays last after the insert).
         let line =
-            "main|||1|||1|||1712000000|||1712003600|||/tmp|||Main|||claude|||/tmp|||cid|||128";
+            "main|||1|||1|||1712000000|||1712003600|||/tmp|||Main|||claude|||/tmp|||cid|||/wt|||br|||128";
         let s = &parse_list_sessions(line).unwrap()[0];
         assert_eq!(s.pane_width, 128);
     }
@@ -241,6 +251,24 @@ mod tests {
         assert_eq!(sessions[0].display_name.as_deref(), Some("foo"));
         assert_eq!(sessions[0].agent.as_deref(), Some("claude"));
         assert_eq!(sessions[0].spec_path.as_deref(), Some("~/proj"));
+    }
+
+    #[test]
+    fn parses_worktree_fields() {
+        // Full format: ...|@bosun_container_id|@bosun_worktree_path|@bosun_branch|pane_width
+        let line = "bosun-foo|||1|||0|||1700000000|||1700000100|||/srv|||foo|||claude|||~/proj|||cid|||/srv/.worktrees/feat|||feat|||120";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert_eq!(s.worktree_path.as_deref(), Some("/srv/.worktrees/feat"));
+        assert_eq!(s.branch.as_deref(), Some("feat"));
+        assert_eq!(s.pane_width, 120);
+    }
+
+    #[test]
+    fn missing_worktree_fields_are_none() {
+        let line = "plain|||1|||0|||1700000000|||1700000100|||/srv";
+        let s = &parse_list_sessions(line).unwrap()[0];
+        assert!(s.worktree_path.is_none());
+        assert!(s.branch.is_none());
     }
 
     #[test]

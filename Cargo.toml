@@ -55,6 +55,7 @@ libc = "0.2"
 
 [dev-dependencies]
 insta = "1.47"
+tempfile = "3"
 
 [features]
 default = []

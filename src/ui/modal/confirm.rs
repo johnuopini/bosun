@@ -1,9 +1,10 @@
 //! Generic yes/no confirmation modal. Takes a message and a Command
 //! that fires if the user confirms (Enter or 'y'). Esc or 'n' cancels.
 //!
-//! An optional third action (`with_alt`) binds another key to its own
-//! Command — used by the restart modal to offer `r · resume` alongside
-//! the plain restart, mirroring the existing `y`/`n` keys.
+//! Up to two extra actions (`with_alt`) bind more keys to their own
+//! Commands — used by the restart modal to offer `r · resume` alongside
+//! the plain restart, and by the kill-cleanup flow to offer `m` / `x`
+//! alongside the default keep, mirroring the existing `y`/`n` keys.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -18,9 +19,15 @@ use crate::ui::Theme;
 use super::{center_rect, Modal, ModalResult};
 
 const MODAL_WIDTH: u16 = 54;
-/// Wider when an alt action is present so the three-action footer
+/// Wider when one alt action is present so the three-action footer
 /// (`enter / y · … r · … esc / n · …`) fits on one line.
 const MODAL_WIDTH_ALT: u16 = 64;
+/// Wider still when two alt actions are present so the four-action
+/// footer fits on one line. Budget: the kill-cleanup footer
+/// (` enter / y · confirm   m · merge & remove   x · remove, keep
+/// branch   esc / n · cancel`) is 86 display columns; the usable text
+/// column is `width - H_PAD`, so 86 + 4 = 90.
+const MODAL_WIDTH_ALT2: u16 = 90;
 /// Horizontal padding consumed by the accent bar + insets, subtracted
 /// from the modal width to get the usable text column for the message.
 const H_PAD: u16 = 4;
@@ -56,8 +63,8 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// An optional third action bound to a single key, rendered in the
-/// footer between the confirm and cancel hints.
+/// An extra action bound to a single key, rendered in the footer
+/// between the confirm and cancel hints. Up to two may be present.
 struct AltAction {
     key: char,
     label: String,
@@ -74,8 +81,8 @@ pub struct ConfirmModal {
     /// If true, the accent color shifts to red to signal a destructive
     /// action (kill, delete).
     destructive: bool,
-    /// Optional extra key-bound action (e.g. `r · resume`).
-    alt: Option<AltAction>,
+    /// Extra key-bound actions (e.g. `r · resume`), up to two.
+    alts: Vec<AltAction>,
 }
 
 impl ConfirmModal {
@@ -85,7 +92,7 @@ impl ConfirmModal {
             message: message.into(),
             on_yes: Some(on_yes),
             destructive: false,
-            alt: None,
+            alts: Vec::new(),
         }
     }
 
@@ -94,29 +101,54 @@ impl ConfirmModal {
         self
     }
 
-    /// Bind a third action to `key` (matched case-insensitively),
+    /// Bind an extra action to `key` (matched case-insensitively),
     /// labelled `label`, firing `command` on press. The footer shows
-    /// it as `{key} · {label}`.
+    /// it as `{key} · {label}`. At most two alts are supported.
     pub fn with_alt(mut self, key: char, label: impl Into<String>, command: Command) -> Self {
-        self.alt = Some(AltAction {
+        self.alts.push(AltAction {
             key: key.to_ascii_lowercase(),
             label: label.into(),
             command: Some(command),
         });
+        debug_assert!(self.alts.len() <= 2);
         self
     }
 
+    /// Number of extra key-bound actions currently registered. Test-only
+    /// accessor — the modal's behavior is otherwise observed through `handle`.
+    #[cfg(test)]
+    pub fn alt_count(&self) -> usize {
+        self.alts.len()
+    }
+
     fn width(&self) -> u16 {
-        if self.alt.is_some() {
-            MODAL_WIDTH_ALT
-        } else {
-            MODAL_WIDTH
+        match self.alts.len() {
+            0 => MODAL_WIDTH,
+            1 => MODAL_WIDTH_ALT,
+            _ => MODAL_WIDTH_ALT2,
         }
     }
 
     /// The message wrapped to the usable text width.
     fn message_lines(&self) -> Vec<String> {
         wrap_text(&self.message, self.width().saturating_sub(H_PAD) as usize)
+    }
+
+    /// The single-line footer hint string, rendered between the modal
+    /// body and its bottom edge: the primary confirm hint, then one
+    /// `{key} · {label}` per alt, then the cancel hint. `width()` is
+    /// sized so this stays within the usable text column (`width - H_PAD`).
+    fn footer(&self) -> String {
+        if self.alts.is_empty() {
+            " enter / y · confirm      esc / n · cancel".to_string()
+        } else {
+            let mut footer = String::from(" enter / y · confirm");
+            for alt in &self.alts {
+                footer.push_str(&format!("   {} · {}", alt.key, alt.label));
+            }
+            footer.push_str("   esc / n · cancel");
+            footer
+        }
     }
 
     /// Total modal height. The body is title + blank + N message lines +
@@ -137,9 +169,10 @@ impl Modal for ConfirmModal {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ModalResult::Close(None);
         }
-        if let Some(alt) = self.alt.as_mut() {
-            if let KeyCode::Char(c) = key.code {
-                if c.to_ascii_lowercase() == alt.key {
+        if let KeyCode::Char(c) = key.code {
+            let c = c.to_ascii_lowercase();
+            for alt in self.alts.iter_mut() {
+                if c == alt.key {
                     return ModalResult::Close(alt.command.take());
                 }
             }
@@ -206,13 +239,7 @@ impl Modal for ConfirmModal {
             .bg(body_bg)
             .add_modifier(Modifier::BOLD);
 
-        let footer = match &self.alt {
-            Some(alt) => format!(
-                " enter / y · confirm   {} · {}   esc / n · cancel",
-                alt.key, alt.label
-            ),
-            None => " enter / y · confirm      esc / n · cancel".to_string(),
-        };
+        let footer = self.footer();
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(self.title.clone(), title_style)));
@@ -374,5 +401,47 @@ mod tests {
             })) => assert!(!continue_session),
             _ => panic!("expected primary RestartSession on Enter"),
         }
+    }
+
+    #[test]
+    fn two_alts_bind_three_keys() {
+        let m = ConfirmModal::new("Kill?", "msg", Command::KillSession("x".into()))
+            .with_alt('m', "merge & remove", Command::KillSession("m".into()))
+            .with_alt('x', "remove", Command::KillSession("r".into()));
+        assert_eq!(m.alt_count(), 2);
+    }
+
+    #[test]
+    fn pressing_second_alt_fires_its_command() {
+        let mut m = ConfirmModal::new("Kill?", "msg", Command::KillSession("x".into()))
+            .with_alt('m', "merge", Command::KillSession("MERGE".into()))
+            .with_alt('x', "remove", Command::KillSession("REMOVE".into()));
+        match m.handle(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)) {
+            ModalResult::Close(Some(Command::KillSession(n))) => assert_eq!(n, "REMOVE"),
+            _ => panic!("expected the x-alt command"),
+        }
+    }
+
+    #[test]
+    fn two_alt_footer_fits_within_width() {
+        // Locks down MODAL_WIDTH_ALT2 against Task 7's kill-cleanup labels:
+        // the rendered footer must fit the usable text column (width - H_PAD)
+        // since the footer Paragraph does not wrap and would otherwise clip.
+        let m = ConfirmModal::new("Kill?", "msg", Command::KillSession("keep".into()))
+            .with_alt('m', "merge & remove", Command::KillSession("merge".into()))
+            .with_alt(
+                'x',
+                "remove, keep branch",
+                Command::KillSession("remove".into()),
+            );
+        assert_eq!(m.width(), MODAL_WIDTH_ALT2);
+        assert_eq!(MODAL_WIDTH_ALT2, 90);
+        let usable = m.width().saturating_sub(H_PAD) as usize;
+        let footer_cols = m.footer().chars().count();
+        assert!(
+            footer_cols <= usable,
+            "footer is {footer_cols} cols but only {usable} are usable at width {}",
+            m.width()
+        );
     }
 }

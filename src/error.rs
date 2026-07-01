@@ -7,6 +7,9 @@ pub enum BosunError {
     #[error("tmux command failed: {0}")]
     Tmux(String),
 
+    #[error("git command failed: {0}")]
+    Git(String),
+
     #[error("tmux not found on PATH")]
     TmuxNotInstalled,
 
