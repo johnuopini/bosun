@@ -898,13 +898,21 @@ async fn handle_kill_remove_worktree(
         }
     }
     // 5. Remove the worktree (force=false; the dirty guard above already passed).
+    // Note: cleanup is not atomic. If `merge` already succeeded above and this
+    // removal fails, the merge stays committed on the repo's current branch
+    // while the worktree (and branch) survive — surfaced as a Warn, no rollback
+    // (rolling back a git merge is riskier than leaving the stray worktree).
     if let Err(e) = client.worktree_remove(&repo, worktree_path, false).await {
         let _ = evt_tx.send(AppMsg::Warn(format!("worktree remove: {}", e)));
         return;
     }
-    // 6. Delete the branch only on the merge path.
+    // 6. Delete the branch only on the merge path. Surface a failure as a Warn
+    // for consistency with the rest of the handler (in practice `branch -d`
+    // after a successful merge, with the worktree now removed, always succeeds).
     if merge {
-        let _ = client.branch_delete(&repo, branch).await;
+        if let Err(e) = client.branch_delete(&repo, branch).await {
+            let _ = evt_tx.send(AppMsg::Warn(format!("branch delete {}: {}", branch, e)));
+        }
     }
 }
 
