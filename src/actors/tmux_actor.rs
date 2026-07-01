@@ -1049,7 +1049,7 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         // By the time this runs inside `create_session`, `spec.path` has
         // already been repointed to the resolved worktree path (see the
         // worktree branch there), so persist both from the spec.
-        worktree_path: spec.worktree.as_ref().map(|_| spec.path.clone()),
+        worktree_path: spec.worktree.is_some().then(|| spec.path.clone()),
         branch: spec.worktree.as_ref().map(|w| w.branch.clone()),
     }
 }
@@ -1549,9 +1549,12 @@ mod worktree_tests {
             branch: "feat".into(),
         });
         // path is set by the actor to the resolved worktree path before
-        // persist, so here we assert branch round-trips into metadata.branch.
+        // persist; here it's the spec's path. Both halves of the derivation
+        // must round-trip: branch from the WorktreeSpec, worktree_path from
+        // spec.path (only when a worktree was requested).
         let meta = spec_to_metadata(&spec);
         assert_eq!(meta.branch.as_deref(), Some("feat"));
+        assert_eq!(meta.worktree_path.as_deref(), Some("/srv/api"));
     }
 
     #[test]
