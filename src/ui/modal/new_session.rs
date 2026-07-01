@@ -14,7 +14,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
 use crate::events::{
-    ClaudeOptions, ClaudeSessionMode, CodexOptions, Command, SessionSpec, SpecOptions,
+    ClaudeOptions, ClaudeSessionMode, CodexOptions, Command, SessionSpec, SpecOptions, WorktreeSpec,
 };
 use crate::store::Recent;
 use crate::ui::Theme;
@@ -41,6 +41,8 @@ pub const AGENTS: &[&str] = &["claude", "codex", "terminal"];
 enum Field {
     Name,
     Path,
+    Worktree,
+    Branch,
     Agent,
     Args,
     // Claude-only
@@ -54,11 +56,19 @@ impl Field {
     /// Ordered list of fields the user can tab between for the
     /// currently-selected agent. `lock_path` drops `Field::Path`
     /// from the list — used in add-tab mode where the path is
-    /// inherited from the container and isn't editable.
-    fn visible_for(agent: &str, lock_path: bool) -> Vec<Field> {
+    /// inherited from the container and isn't editable. `worktree`
+    /// reveals `Field::Branch` after the worktree checkbox. Add-tab
+    /// mode (`lock_path`) never shows the worktree fields: a tab
+    /// inherits its container's path, so worktree is mutually
+    /// exclusive with add-tab.
+    fn visible_for(agent: &str, lock_path: bool, worktree: bool) -> Vec<Field> {
         let mut v = vec![Field::Name];
         if !lock_path {
             v.push(Field::Path);
+            v.push(Field::Worktree);
+            if worktree {
+                v.push(Field::Branch);
+            }
         }
         v.push(Field::Agent);
         v.push(Field::Args);
@@ -79,6 +89,17 @@ impl Field {
 pub struct NewSessionModal {
     name: String,
     path: String,
+    /// When true, the actor creates the session inside a fresh git
+    /// worktree (see `WorktreeSpec`) instead of using `path`
+    /// directly. Reveals the branch field.
+    worktree: bool,
+    /// Branch name for the worktree. Empty until the user edits it,
+    /// in which case `branch_edited` sticks and this overrides the
+    /// name-derived slug.
+    branch: String,
+    /// True once the user manually edits `branch`. After that the
+    /// branch no longer tracks the session name slug.
+    branch_edited: bool,
     agent_idx: usize,
     args: String,
     claude: ClaudeOptions,
@@ -142,6 +163,9 @@ impl NewSessionModal {
         let mut modal = Self {
             name: String::new(),
             path,
+            worktree: false,
+            branch: String::new(),
+            branch_edited: false,
             agent_idx: 0,
             args: String::new(),
             claude: ClaudeOptions::default(),
@@ -169,6 +193,9 @@ impl NewSessionModal {
         let mut modal = Self {
             name: String::new(),
             path: String::new(),
+            worktree: false,
+            branch: String::new(),
+            branch_edited: false,
             agent_idx: 0,
             args: String::new(),
             claude: ClaudeOptions::default(),
@@ -198,6 +225,9 @@ impl NewSessionModal {
         let mut modal = Self {
             name: String::new(),
             path: container_path,
+            worktree: false,
+            branch: String::new(),
+            branch_edited: false,
             agent_idx: 0,
             args: String::new(),
             claude: ClaudeOptions::default(),
@@ -321,8 +351,19 @@ impl NewSessionModal {
         AGENTS[self.agent_idx]
     }
 
+    /// The branch name that will be used for the worktree: the
+    /// manually-edited `branch` once the user has touched it,
+    /// otherwise a slug derived live from the session name.
+    fn branch_effective(&self) -> String {
+        if self.branch_edited {
+            self.branch.clone()
+        } else {
+            slug(&self.name)
+        }
+    }
+
     fn next_field(&mut self) {
-        let visible = Field::visible_for(self.agent(), self.is_add_tab());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab(), self.worktree);
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + 1) % visible.len()];
         if self.field == Field::Path {
@@ -331,7 +372,7 @@ impl NewSessionModal {
     }
 
     fn prev_field(&mut self) {
-        let visible = Field::visible_for(self.agent(), self.is_add_tab());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab(), self.worktree);
         let idx = visible.iter().position(|f| *f == self.field).unwrap_or(0);
         self.field = visible[(idx + visible.len() - 1) % visible.len()];
         if self.field == Field::Path {
@@ -346,7 +387,7 @@ impl NewSessionModal {
     /// (agent can only change while on Field::Agent) — but the clamp
     /// is cheap and keeps the invariant obvious.
     fn clamp_field_for_agent(&mut self) {
-        let visible = Field::visible_for(self.agent(), self.is_add_tab());
+        let visible = Field::visible_for(self.agent(), self.is_add_tab(), self.worktree);
         if !visible.contains(&self.field) {
             self.field = Field::Agent;
         }
@@ -387,6 +428,17 @@ impl NewSessionModal {
         //       blank, agent label+line, blank, args label+input = 13
         let mut h: u16 = 13;
 
+        // Worktree checkbox (blank + checkbox line) — shown in every
+        // mode except add-tab, which locks the path to its container.
+        // The branch label + input + preview lines appear only when
+        // the worktree toggle is on.
+        if !self.is_add_tab() {
+            h += 2; // blank + checkbox
+            if self.worktree {
+                h += 3; // branch label + branch input + preview line
+            }
+        }
+
         // Agent-specific options.
         match self.agent() {
             "claude" => h += 4, // blank + header + radio + checkbox
@@ -423,6 +475,24 @@ impl NewSessionModal {
             return Err("path is required".into());
         }
 
+        // When creating in a worktree, validate the branch. A slash
+        // breaks the sibling worktree-path scheme downstream
+        // (`<repo>-feat/foo` makes a nested `repo-feat/` dir), so it's
+        // rejected. The auto-slug never contains `/`, so this only
+        // guards a manual edit.
+        let worktree = if self.worktree {
+            let branch = self.branch_effective();
+            if !branch.chars().any(|c| c.is_alphanumeric()) {
+                return Err("branch must contain at least one letter or digit".into());
+            }
+            if branch.contains('/') {
+                return Err("branch cannot contain '/'".into());
+            }
+            Some(WorktreeSpec { branch })
+        } else {
+            None
+        };
+
         Ok(SessionSpec {
             name: name.to_string(),
             path: path.to_string(),
@@ -434,9 +504,7 @@ impl NewSessionModal {
             },
             container_id: self.add_tab_to.clone(),
             resume: false,
-            // Task 5 wires the modal's worktree toggle into this; for
-            // now every modal-built spec is a plain path-based session.
-            worktree: None,
+            worktree,
         })
     }
 }
@@ -596,6 +664,10 @@ impl Modal for NewSessionModal {
                     Field::Args => {
                         self.args.pop();
                     }
+                    Field::Branch => {
+                        self.branch.pop();
+                        self.branch_edited = true;
+                    }
                     _ => {}
                 }
                 ModalResult::Consumed
@@ -612,6 +684,13 @@ impl Modal for NewSessionModal {
                         self.reset_path_dropdown();
                     }
                     Field::Args => self.args.push(' '),
+                    Field::Branch => {
+                        self.branch.push(' ');
+                        self.branch_edited = true;
+                    }
+                    Field::Worktree => {
+                        self.worktree = !self.worktree;
+                    }
                     Field::Agent => {
                         self.agent_idx = (self.agent_idx + 1) % AGENTS.len();
                         self.on_agent_changed();
@@ -638,6 +717,10 @@ impl Modal for NewSessionModal {
                         self.reset_path_dropdown();
                     }
                     Field::Args => self.args.push(c),
+                    Field::Branch => {
+                        self.branch.push(c);
+                        self.branch_edited = true;
+                    }
                     _ => {}
                 }
                 ModalResult::Consumed
@@ -728,6 +811,38 @@ impl Modal for NewSessionModal {
             label_line(path_label, self.field == Field::Path, theme),
             input_line(&self.path, self.field == Field::Path, inner.width, theme),
         ];
+
+        // Worktree checkbox goes AFTER the path block so the path
+        // dropdown overlay's magic `inner.y + 7` offset stays anchored
+        // to the path input. Add-tab mode locks the path to the
+        // container, so the worktree option is hidden there.
+        if !self.is_add_tab() {
+            lines.push(Line::from(""));
+            lines.push(checkbox_line(
+                "Create in git worktree",
+                self.worktree,
+                self.field == Field::Worktree,
+                theme,
+            ));
+            if self.worktree {
+                let branch = self.branch_effective();
+                lines.push(label_line("branch", self.field == Field::Branch, theme));
+                lines.push(input_line(
+                    &branch,
+                    self.field == Field::Branch,
+                    inner.width,
+                    theme,
+                ));
+                // Read-only preview of where the worktree lands.
+                // Uses the short `.worktrees/<branch>` form (the real
+                // repo root is resolved downstream, not here) so it
+                // always fits the modal width.
+                lines.push(Line::from(Span::styled(
+                    format!("   worktree: .worktrees/{}", branch),
+                    Style::default().fg(theme.text_muted).bg(body_bg),
+                )));
+            }
+        }
 
         lines.extend([
             Line::from(""),
@@ -887,6 +1002,27 @@ fn label_line(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
         Span::styled(format!(" {} ", marker), label_style),
         Span::styled(label.to_string(), label_style),
     ])
+}
+
+/// Slugify a display name into a git-branch-safe token: lowercase,
+/// each run of non-alphanumeric characters collapsed to a single `-`,
+/// with leading/trailing `-` trimmed. Never produces a `/`, so the
+/// auto-derived branch always passes `build_spec` validation.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.extend(c.to_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
 }
 
 // --- Filesystem helpers ---------------------------------------------
@@ -1160,6 +1296,10 @@ mod tests {
         assert_eq!(m.field, Field::Name);
         m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Path);
+        // Worktree checkbox is always in the tab order (off by default);
+        // the Branch field only appears once it's toggled on.
+        m.handle(key(KeyCode::Tab));
+        assert_eq!(m.field, Field::Worktree);
         m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Agent);
         m.handle(key(KeyCode::Tab));
@@ -1180,7 +1320,8 @@ mod tests {
         m.agent_idx = 1;
         assert_eq!(m.agent(), "codex");
         m.handle(key(KeyCode::Tab)); // Name -> Path
-        m.handle(key(KeyCode::Tab)); // Path -> Agent
+        m.handle(key(KeyCode::Tab)); // Path -> Worktree
+        m.handle(key(KeyCode::Tab)); // Worktree -> Agent
         m.handle(key(KeyCode::Tab)); // Agent -> Args
         m.handle(key(KeyCode::Tab)); // Args -> CodexYolo
         assert_eq!(m.field, Field::CodexYolo);
@@ -1194,11 +1335,84 @@ mod tests {
         m.agent_idx = 2;
         assert_eq!(m.agent(), "terminal");
         m.handle(key(KeyCode::Tab)); // Name -> Path
-        m.handle(key(KeyCode::Tab)); // Path -> Agent
+        m.handle(key(KeyCode::Tab)); // Path -> Worktree
+        m.handle(key(KeyCode::Tab)); // Worktree -> Agent
         m.handle(key(KeyCode::Tab)); // Agent -> Args
         assert_eq!(m.field, Field::Args);
         m.handle(key(KeyCode::Tab));
         assert_eq!(m.field, Field::Name);
+    }
+
+    #[test]
+    fn worktree_checkbox_reveals_branch_field() {
+        let mut m = modal_for_field_tests();
+        // Off by default: Branch not in tab order.
+        assert!(!Field::visible_for(m.agent(), false, false).contains(&Field::Branch));
+        m.worktree = true;
+        assert!(Field::visible_for(m.agent(), false, true).contains(&Field::Branch));
+    }
+
+    #[test]
+    fn branch_slug_tracks_name_until_edited() {
+        let mut m = NewSessionModal::new(Vec::new());
+        m.worktree = true;
+        // Field starts on Name; type the name.
+        for c in "My Feature".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(m.branch_effective(), "my-feature"); // slug of the name
+        // Manually edit the branch — this sets branch_edited.
+        m.field = Field::Branch;
+        for c in "custom".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        assert!(m.branch_edited);
+        let edited = m.branch_effective();
+        // Now change the name again; the manual branch edit must STICK.
+        m.field = Field::Name;
+        m.handle(key(KeyCode::Char('X')));
+        assert_eq!(
+            m.branch_effective(),
+            edited,
+            "manual branch edit must survive a name change"
+        );
+    }
+
+    #[test]
+    fn build_spec_carries_worktree() {
+        let mut m = NewSessionModal::new(Vec::new());
+        for c in "feat".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        m.worktree = true;
+        let r = m.handle(key(KeyCode::Enter));
+        match r {
+            ModalResult::Close(Some(Command::CreateSession(spec))) => {
+                assert!(spec.worktree.is_some());
+                assert_eq!(spec.worktree.unwrap().branch, "feat");
+            }
+            _ => panic!("expected CreateSession with worktree"),
+        }
+    }
+
+    #[test]
+    fn build_spec_rejects_slash_in_branch() {
+        let mut m = NewSessionModal::new(Vec::new());
+        for c in "feat".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        m.worktree = true;
+        m.field = Field::Branch;
+        for c in "foo/bar".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        let r = m.handle(key(KeyCode::Enter));
+        // Slash in branch must be rejected with an error, not submitted.
+        assert!(matches!(r, ModalResult::Consumed));
+        assert!(
+            m.error.as_deref().unwrap().contains('/')
+                || m.error.as_deref().unwrap().to_lowercase().contains("branch")
+        );
     }
 
     #[test]
