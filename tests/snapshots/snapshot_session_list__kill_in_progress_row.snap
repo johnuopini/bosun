@@ -2,13 +2,11 @@
 source: tests/snapshot_session_list.rs
 expression: frame
 ---
-   ○  alpha  1w               │ ○ beta  +                                       
+ ▌ ⟳  alpha  1w  killing…     │ ○ alpha  +                                      
        claude · /tmp/work     │                                                 
- ▌ ○  beta  1w  •attached     │  preview: capturing…                            
-       claude · /tmp/work     │                                                 
-   ○  gamma  1w               │                                                 
+   ○  beta  1w                │  preview: capturing…                            
        claude · /tmp/work     │                                                 
                               │                                                 
                               │                                                 
                               │                                                 
- bosun  v2.0.13 3 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren
+ bosun  v2.0.13 2 sessions↵ attach · n new · e edit · g group · 1-9 move · r ren

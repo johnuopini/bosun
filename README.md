@@ -121,6 +121,10 @@ you can click into and drive without leaving bosun.
   path
 - Session lifecycle: attach (`Enter`), rename (`r`), restart (`R`),
   modify (`m`), kill (`d`), open in editor (`e`)
+- In-progress feedback while a session operation is in flight — the
+  affected row shows a `⟳` marker and a `killing…` / `restarting…`
+  label; a create (which has no row yet) shows `⟳ creating <name>…` in
+  the status bar. Clears the moment the operation lands
 - Fifteen built-in themes (10 dark + 5 light) plus user themes from
   `$XDG_CONFIG_HOME/bosun/themes/*.toml`; live preview picker on `t`
 - Two-way mouse navigation: click rows to jump, click the embed to focus,

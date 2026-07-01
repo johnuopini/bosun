@@ -133,6 +133,38 @@ fn mixed_statuses_render_glyphs() {
 }
 
 #[test]
+fn kill_in_progress_marks_the_row() {
+    // Issue #7: a dispatched-but-not-landed kill swaps the row's status
+    // glyph for the working marker and trails a "killing…" label, while
+    // the untouched row keeps its normal idle glyph.
+    use bosun::app::{OpKind, PendingOp};
+    let mut state = state_with(vec![ses("alpha", false), ses("beta", false)]);
+    state.pending_ops.insert(
+        "alpha".into(),
+        PendingOp {
+            kind: OpKind::Killing,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+        },
+    );
+    let frame = render(&state, 80, 8);
+    insta::assert_snapshot!("kill_in_progress_row", frame);
+}
+
+#[test]
+fn create_in_progress_shows_in_statusbar() {
+    // Issue #7: a create has no row yet, so its feedback lands in the
+    // status bar's left segment instead of on a row.
+    use bosun::app::PendingCreate;
+    let mut state = state_with(vec![ses("alpha", false)]);
+    state.pending_create = Some(PendingCreate {
+        display: "rocket-fox".into(),
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+    });
+    let frame = render(&state, 80, 6);
+    insta::assert_snapshot!("create_in_progress_statusbar", frame);
+}
+
+#[test]
 fn sections_group_sessions() {
     let mut state = AppState {
         sessions: vec![ses("alpha", false), ses("beta", false), ses("gamma", true)],

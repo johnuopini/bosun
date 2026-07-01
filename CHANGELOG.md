@@ -4,6 +4,33 @@ All notable changes to bosun are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.13] — 2026-07-01
+
+### Added
+- **Optional git worktree sessions (issue #3).** Create a session
+  inside a fresh git worktree on a new branch. The new-session modal
+  gets a **Create in git worktree** checkbox (`Space` toggles) that
+  reveals a branch field, prefilled from the session name and
+  validated. Placement follows a new `worktree_location` config key —
+  `subdir` (`<repo>/.worktrees/<branch>`, the default) or `sibling`
+  (`<repo>-<branch>`). On kill, a worktree session offers `m` merge &
+  remove, `x` remove (keep the branch), or `Enter` keep; a dirty
+  worktree is never removed, and a conflicted merge is aborted rather
+  than left half-applied. The worktree path and branch persist as
+  `@bosun_worktree_path` / `@bosun_branch`, so they survive a tmux
+  server restart. Thanks to @johnuopini for the contribution (PR #8).
+- **In-progress feedback for session operations (issue #7).** When a
+  create, kill, or restart is dispatched, the UI now shows it
+  immediately instead of looking frozen until the next refresh lands.
+  Kill and restart swap the affected row's status glyph for a `⟳`
+  marker and trail a `killing…` / `restarting…` label; a create — which
+  has no row yet — shows `⟳ creating <name>…` in the status bar. Each
+  marker clears the instant its result lands (the row vanishes, the
+  create-completion refresh arrives, or a warning reports back), with a
+  10s backstop so a wedged operation can't leave a spinner stuck. The
+  gap was most noticeable for git worktree creates, which also shell out
+  to `git` before the session appears.
+
 ## [2.0.12] — 2026-06-29
 
 ### Added

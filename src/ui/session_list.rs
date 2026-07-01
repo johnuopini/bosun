@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use crate::app::AppState;
+use crate::app::{AppState, OpKind};
 use crate::sidebar::{Container, Section, VisibleEntry};
 use crate::tmux::detector::Status;
 use crate::tmux::session::SessionView;
@@ -60,8 +60,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 let unread = container_unread(state, c);
                 match state.session_by_name(&c.active) {
                     Some(v) => {
+                        let op = state.pending_ops.get(v.name()).map(|o| o.kind);
                         out.push(render_primary_line(
-                            v, selected, false, tabs, bg_busy, unread, area.width, theme,
+                            v, selected, false, tabs, bg_busy, unread, op, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, false, area.width, theme));
                         if narrow && tabs > 1 {
@@ -95,8 +96,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
                 let unread = container_unread(state, container);
                 match state.session_by_name(&container.active) {
                     Some(v) => {
+                        let op = state.pending_ops.get(v.name()).map(|o| o.kind);
                         out.push(render_primary_line(
-                            v, selected, true, tabs, bg_busy, unread, area.width, theme,
+                            v, selected, true, tabs, bg_busy, unread, op, area.width, theme,
                         ));
                         out.push(render_meta_line(v, selected, true, area.width, theme));
                         if narrow && tabs > 1 {
@@ -325,6 +327,7 @@ fn render_primary_line(
     tabs: u16,
     bg_busy: bool,
     unread: bool,
+    op: Option<OpKind>,
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -354,9 +357,22 @@ fn render_primary_line(
     } else {
         Style::default().fg(theme.text).bg(bg)
     };
-    let status_style = Style::default().fg(status_color(view.status, theme)).bg(bg);
+    // An in-progress op (issue #7) takes over the status column: a
+    // working marker in the waiting color replaces the detector glyph,
+    // and a present-progressive label ("killing…") trails the row.
+    let status_style = match op {
+        Some(_) => Style::default().fg(theme.status_waiting).bg(bg),
+        None => Style::default().fg(status_color(view.status, theme)).bg(bg),
+    };
 
-    let glyph = view.status.glyph().to_string();
+    let glyph = match op {
+        Some(_) => "⟳".to_string(),
+        None => view.status.glyph().to_string(),
+    };
+    let op_label = match op {
+        Some(k) => format!("  {}…", k.label()),
+        None => String::new(),
+    };
     let name = view.display().to_string();
     // `(N)` tab-count badge for multi-tab containers. Hidden when
     // tabs <= 1 so single-tab rows render identically to the
@@ -386,7 +402,8 @@ fn render_primary_line(
         + tab_label.chars().count()
         + activity_label.chars().count()
         + windows_label.chars().count()
-        + attached_label.chars().count();
+        + attached_label.chars().count()
+        + op_label.chars().count();
     let pad = (width as usize).saturating_sub(used);
 
     let mut spans = vec![
@@ -416,6 +433,12 @@ fn render_primary_line(
         spans.push(Span::styled(
             attached_label,
             Style::default().fg(theme.status_running).bg(bg),
+        ));
+    }
+    if !op_label.is_empty() {
+        spans.push(Span::styled(
+            op_label,
+            Style::default().fg(theme.status_waiting).bg(bg),
         ));
     }
     spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));

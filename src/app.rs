@@ -81,6 +81,14 @@ pub struct AppState {
     /// fires `Command::LaunchAgent` once the embed reports
     /// `attach_confirmed` (or the deadline lapses).
     pub pending_agent_launch: std::collections::HashMap<String, PendingLaunch>,
+    /// Row-anchored operations dispatched to the tmux actor but not yet
+    /// landed (issue #7), keyed by internal session name. Drives the
+    /// per-row in-progress marker; set on dispatch, cleared in the
+    /// `SessionsRefreshed` / `Warn` reducers (or on deadline).
+    pub pending_ops: std::collections::HashMap<String, PendingOp>,
+    /// In-flight `CreateSession` (issue #7). No row exists yet, so this
+    /// drives a status-bar line instead of a row marker.
+    pub pending_create: Option<PendingCreate>,
     /// Last session name we told the tmux actor to prioritize for preview
     /// capture. Used to debounce FocusPreview commands.
     pub focus_sent: Option<String>,
@@ -276,6 +284,51 @@ const PENDING_LAUNCH_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::
 #[derive(Clone, Copy, Debug)]
 pub struct PendingLaunch {
     pub resume: Option<bool>,
+    pub deadline: std::time::Instant,
+}
+
+/// Backstop lifetime for an in-progress op marker (issue #7). Ops
+/// normally clear the instant their result lands (well under a
+/// second); this only trips if the actor never reports back, so a
+/// wedged op can't leave a spinner stuck on a row forever.
+const PENDING_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A row-anchored mutating op (issue #7) dispatched to the tmux actor
+/// but not yet landed — drives the per-row in-progress marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    /// `KillSession` / a `KillContainer` tab — the row disappears when done.
+    Killing,
+    /// In-place `RestartSession` — the row survives, so this clears on
+    /// the next refresh rather than on the row vanishing.
+    Restarting,
+}
+
+impl OpKind {
+    /// Present-progressive label shown next to the row's working marker.
+    pub fn label(self) -> &'static str {
+        match self {
+            OpKind::Killing => "killing",
+            OpKind::Restarting => "restarting",
+        }
+    }
+}
+
+/// In-flight row-anchored op, keyed by internal session name in
+/// `AppState::pending_ops`. `deadline` is the backstop past which the
+/// marker is dropped even if no result ever arrives.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingOp {
+    pub kind: OpKind,
+    pub deadline: std::time::Instant,
+}
+
+/// In-flight `CreateSession` (issue #7). Unlike the row-anchored ops
+/// there's no row yet, so this drives a status-bar line instead.
+/// `display` is the user-facing name shown on that line.
+#[derive(Clone, Debug)]
+pub struct PendingCreate {
+    pub display: String,
     pub deadline: std::time::Instant,
 }
 
@@ -727,6 +780,34 @@ impl AppState {
 
                 self.sessions = sessions;
 
+                // Clear in-progress op markers (issue #7) this refresh
+                // resolves. A kill is done once its row is gone from the
+                // live list (a stale pre-kill refresh still lists it, so
+                // the marker holds until the row actually vanishes). A
+                // restart keeps its row, so any refresh landing after it
+                // was dispatched marks it done. `select_after` is set
+                // only on the create-completion refresh. A deadline
+                // backstop drops anything the actor never reported on.
+                if !self.pending_ops.is_empty() {
+                    let now = std::time::Instant::now();
+                    let live: std::collections::HashSet<&str> =
+                        self.sessions.iter().map(|v| v.name()).collect();
+                    self.pending_ops.retain(|name, op| {
+                        now < op.deadline
+                            && match op.kind {
+                                OpKind::Killing => live.contains(name.as_str()),
+                                OpKind::Restarting => false,
+                            }
+                    });
+                }
+                if select_after.is_some() {
+                    self.pending_create = None;
+                } else if let Some(p) = &self.pending_create {
+                    if std::time::Instant::now() >= p.deadline {
+                        self.pending_create = None;
+                    }
+                }
+
                 // Unread tracking, keyed on (content, pane width).
                 //
                 // Baseline a row the first time we see it (a fresh row
@@ -1020,7 +1101,15 @@ impl AppState {
                 self.term_size = (w, h);
                 // ratatui auto-redraws next frame, no command to emit.
             }
-            AppMsg::Warn(w) => self.warning = Some(w),
+            AppMsg::Warn(w) => {
+                self.warning = Some(w);
+                // A warning means an op reported back (with an error) —
+                // end the in-progress state (issue #7) so a failed
+                // kill/create/restart doesn't leave a spinner stuck on
+                // the row or in the status bar.
+                self.pending_ops.clear();
+                self.pending_create = None;
+            }
             AppMsg::Fatal(w) => {
                 self.warning = Some(w);
                 self.quit = true;
@@ -2775,6 +2864,12 @@ impl App {
                         }
                     }
                     other => {
+                        // Record the in-progress marker (issue #7)
+                        // before the command leaves for the actor, so
+                        // the row / status bar shows feedback on the
+                        // very next redraw instead of waiting out the
+                        // (git-slowed, for worktrees) actor round-trip.
+                        self.note_pending_op(&other);
                         // Sync send: unbounded, never blocks, never
                         // parks a task. The only failure is "tmux
                         // actor has exited" which we ignore — the
@@ -3173,6 +3268,53 @@ impl App {
     /// double-launch. No-op when nothing is pending for the current
     /// selection or the embed hasn't attached yet — in which case the
     /// next `EmbedBytes` (or a periodic tick, for the timeout) retries.
+    /// Record the transient in-progress marker (issue #7) for a
+    /// mutating command about to be handed to the tmux actor. Only the
+    /// ops with a user-visible gap are tracked (create / kill / restart);
+    /// everything else is a no-op. Markers are cleared when their result
+    /// lands in the `SessionsRefreshed` / `Warn` reducers.
+    fn note_pending_op(&mut self, cmd: &Command) {
+        let deadline = std::time::Instant::now() + PENDING_OP_TIMEOUT;
+        match cmd {
+            Command::CreateSession(spec) => {
+                self.state.pending_create = Some(PendingCreate {
+                    display: spec.name.clone(),
+                    deadline,
+                });
+            }
+            Command::KillSession(internal) => {
+                self.state.pending_ops.insert(
+                    internal.clone(),
+                    PendingOp {
+                        kind: OpKind::Killing,
+                        deadline,
+                    },
+                );
+            }
+            Command::KillContainer { tabs } => {
+                for t in tabs {
+                    self.state.pending_ops.insert(
+                        t.clone(),
+                        PendingOp {
+                            kind: OpKind::Killing,
+                            deadline,
+                        },
+                    );
+                }
+            }
+            Command::RestartSession { internal, .. } => {
+                self.state.pending_ops.insert(
+                    internal.clone(),
+                    PendingOp {
+                        kind: OpKind::Restarting,
+                        deadline,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn fire_ready_pending_launch(&mut self) {
         let Some((internal, pending)) = self.state.peek_pending_launch() else {
             return;
@@ -3631,6 +3773,117 @@ mod tests {
             resume,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
         }
+    }
+
+    // --- issue #7: in-progress op markers ---------------------------
+
+    fn op(kind: OpKind) -> PendingOp {
+        PendingOp {
+            kind,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+        }
+    }
+
+    fn refreshed_selecting(sessions: Vec<SessionView>, select: &str) -> AppMsg {
+        AppMsg::SessionsRefreshed {
+            sessions,
+            select_after: Some(select.to_string()),
+        }
+    }
+
+    #[test]
+    fn kill_marker_clears_once_the_row_is_gone() {
+        // A kill is done when its row vanishes from the live list.
+        let mut s = state_with(vec![ses("a"), ses("b")], 0);
+        s.pending_ops.insert("a".into(), op(OpKind::Killing));
+        s.apply(refreshed(vec![ses("b")]));
+        assert!(!s.pending_ops.contains_key("a"), "killed row → marker gone");
+    }
+
+    #[test]
+    fn kill_marker_holds_while_the_row_is_still_listed() {
+        // A stale pre-kill refresh still lists the session — the marker
+        // must survive it so the row keeps showing "killing…" until the
+        // kill actually lands.
+        let mut s = state_with(vec![ses("a"), ses("b")], 0);
+        s.pending_ops.insert("a".into(), op(OpKind::Killing));
+        s.apply(refreshed(vec![ses("a"), ses("b")]));
+        assert!(
+            s.pending_ops.contains_key("a"),
+            "row still present → marker held"
+        );
+    }
+
+    #[test]
+    fn restart_marker_clears_on_the_next_refresh() {
+        // A restart keeps its row, so it can't clear on the row
+        // vanishing — the first refresh after dispatch marks it done.
+        let mut s = state_with(vec![ses("a")], 0);
+        s.pending_ops.insert("a".into(), op(OpKind::Restarting));
+        s.apply(refreshed(vec![ses("a")]));
+        assert!(
+            !s.pending_ops.contains_key("a"),
+            "restart marker clears on next refresh even though the row stays"
+        );
+    }
+
+    #[test]
+    fn create_marker_clears_only_on_the_completion_refresh() {
+        let mut s = state_with(vec![ses("a")], 0);
+        s.pending_create = Some(PendingCreate {
+            display: "rocket-fox".into(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+        });
+        // A plain (periodic) refresh has no `select_after` — must NOT
+        // clear the still-in-flight create.
+        s.apply(refreshed(vec![ses("a")]));
+        assert!(
+            s.pending_create.is_some(),
+            "periodic refresh must not clear"
+        );
+        // The create-completion refresh carries `select_after`.
+        s.apply(refreshed_selecting(
+            vec![ses("a"), ses("bosun-x")],
+            "bosun-x",
+        ));
+        assert!(s.pending_create.is_none(), "completion refresh clears it");
+    }
+
+    #[test]
+    fn warn_clears_every_in_progress_marker() {
+        let mut s = state_with(vec![ses("a")], 0);
+        s.pending_ops.insert("a".into(), op(OpKind::Killing));
+        s.pending_create = Some(PendingCreate {
+            display: "x".into(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+        });
+        s.apply(AppMsg::Warn("kill: boom".into()));
+        assert!(s.pending_ops.is_empty(), "failed op drops the row marker");
+        assert!(
+            s.pending_create.is_none(),
+            "failed op drops the create line"
+        );
+        assert_eq!(s.warning.as_deref(), Some("kill: boom"));
+    }
+
+    #[test]
+    fn op_marker_expires_on_its_deadline() {
+        // Backstop: even if the row is still listed (a kill the actor
+        // never reported on), a lapsed deadline drops the marker so it
+        // can't linger forever.
+        let mut s = state_with(vec![ses("a")], 0);
+        s.pending_ops.insert(
+            "a".into(),
+            PendingOp {
+                kind: OpKind::Killing,
+                deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            },
+        );
+        s.apply(refreshed(vec![ses("a")]));
+        assert!(
+            !s.pending_ops.contains_key("a"),
+            "expired marker is dropped even though the row is still present"
+        );
     }
 
     #[test]

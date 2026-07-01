@@ -23,6 +23,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme
     ];
     left_spans.push(if let Some(w) = &state.warning {
         Span::styled(w.clone(), Style::default().fg(theme.status_waiting).bg(bg))
+    } else if let Some(p) = &state.pending_create {
+        // A create has no sidebar row yet (issue #7), so its in-progress
+        // feedback lives here instead of on a row.
+        Span::styled(
+            format!("⟳ creating {}…", p.display),
+            Style::default().fg(theme.status_waiting).bg(bg),
+        )
     } else {
         Span::styled(
             format!("{} sessions", state.sessions.len()),
