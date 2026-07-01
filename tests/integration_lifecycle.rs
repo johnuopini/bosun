@@ -143,6 +143,8 @@ async fn metadata_round_trips_through_tmux_options() {
         claude_skip_permissions: true,
         codex_yolo: false,
         container_id: None,
+        worktree_path: Some("/tmp/.worktrees/feat".into()),
+        branch: Some("feat".into()),
     };
     client
         .create_session(&CreateSpec {
@@ -167,6 +169,9 @@ async fn metadata_round_trips_through_tmux_options() {
     assert_eq!(got.claude_session_mode, "Resume");
     assert!(got.claude_skip_permissions);
     assert!(!got.codex_yolo);
+    // Worktree fields round-trip through the widened read format/guard.
+    assert_eq!(got.worktree_path.as_deref(), Some("/tmp/.worktrees/feat"));
+    assert_eq!(got.branch.as_deref(), Some("feat"));
 
     kill_server(&sock);
 }

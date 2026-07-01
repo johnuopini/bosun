@@ -1009,6 +1009,10 @@ fn spec_to_metadata(spec: &SessionSpec) -> SessionMetadata {
         claude_skip_permissions: spec.options.claude.skip_permissions,
         codex_yolo: spec.options.codex.yolo,
         container_id: spec.container_id.clone(),
+        // Task 4 populates these from the worktree spec; None keeps the
+        // non-worktree create path unchanged for now.
+        worktree_path: None,
+        branch: None,
     }
 }
 

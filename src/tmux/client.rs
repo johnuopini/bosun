@@ -52,6 +52,11 @@ pub struct SessionMetadata {
     /// Sidebar container this session belongs to (tabs feature).
     /// `None` when this session is its own row.
     pub container_id: Option<String>,
+    /// Git worktree path backing this session (worktree feature).
+    /// `None` when the session isn't in a worktree.
+    pub worktree_path: Option<String>,
+    /// Branch checked out in the worktree. `None` for non-worktree sessions.
+    pub branch: Option<String>,
 }
 
 /// Abstraction over the tmux CLI. Real impl shells out; mocks record calls.
@@ -408,8 +413,8 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn get_session_metadata(&self, session: &str) -> Result<Option<SessionMetadata>> {
-        // Single display-message call returns all 7 fields separated
-        // by `|||`. We can't use a control character (the old `\x1f`
+        // Single display-message call returns all metadata fields
+        // separated by `|||`. We can't use a control character (the old `\x1f`
         // unit separator) because tmux 3.4+ escapes control chars in
         // format output as octal sequences (`\037`), which the parser
         // would never see as a real separator — that was breaking the
@@ -418,7 +423,7 @@ impl TmuxClient for TokioTmuxClient {
         // `tmux::parse::LIST_SESSIONS_FORMAT`.
         const SEP: &str = "|||";
         let fmt = format!(
-            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}{SEP}#{{@bosun_container_id}}",
+            "#{{@bosun_display}}{SEP}#{{@bosun_path}}{SEP}#{{@bosun_agent}}{SEP}#{{@bosun_args}}{SEP}#{{@bosun_claude_session_mode}}{SEP}#{{@bosun_claude_skip_permissions}}{SEP}#{{@bosun_codex_yolo}}{SEP}#{{@bosun_container_id}}{SEP}#{{@bosun_worktree_path}}{SEP}#{{@bosun_branch}}",
             SEP = SEP
         );
         let mut cmd = self.cmd();
@@ -439,36 +444,7 @@ impl TmuxClient for TokioTmuxClient {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         let line = raw.trim_end_matches('\n');
-        let parts: Vec<&str> = line.split(SEP).collect();
-        // Accept the legacy 7-field shape (pre-container_id sessions)
-        // as well as the new 8-field shape — keeps sessions created
-        // by an older bosun usable after upgrade.
-        if parts.len() != 7 && parts.len() != 8 {
-            return Ok(None);
-        }
-        // Agent is the required anchor — if it's empty, this session
-        // wasn't created by a metadata-aware bosun.
-        if parts[2].is_empty() {
-            return Ok(None);
-        }
-        let container_id = parts
-            .get(7)
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
-        Ok(Some(SessionMetadata {
-            display_name: parts[0].to_string(),
-            path: parts[1].to_string(),
-            agent: parts[2].to_string(),
-            args: parts[3].to_string(),
-            claude_session_mode: if parts[4].is_empty() {
-                "New".to_string()
-            } else {
-                parts[4].to_string()
-            },
-            claude_skip_permissions: parts[5] == "1",
-            codex_yolo: parts[6] == "1",
-            container_id,
-        }))
+        Ok(parse_metadata_line(line, SEP))
     }
 
     async fn set_session_metadata(&self, session: &str, metadata: &SessionMetadata) -> Result<()> {
@@ -685,7 +661,64 @@ fn metadata_options(m: &SessionMetadata) -> Vec<(&'static str, String)> {
     if let Some(id) = &m.container_id {
         out.push(("@bosun_container_id", id.clone()));
     }
+    // Same "only when Some" treatment for the worktree options — keeps
+    // non-worktree sessions clean and lets reads distinguish "no option"
+    // from an empty value.
+    if let Some(p) = &m.worktree_path {
+        out.push(("@bosun_worktree_path", p.clone()));
+    }
+    if let Some(b) = &m.branch {
+        out.push(("@bosun_branch", b.clone()));
+    }
     out
+}
+
+/// Parse a `display-message` metadata line (fields separated by `sep`)
+/// into a `SessionMetadata`, or `None` when the line doesn't come from a
+/// metadata-aware bosun session.
+///
+/// Field order mirrors the read format string in `get_session_metadata`:
+/// `display | path | agent | args | claude_session_mode |
+/// claude_skip_permissions | codex_yolo | container_id | worktree_path |
+/// branch`.
+fn parse_metadata_line(line: &str, sep: &str) -> Option<SessionMetadata> {
+    let parts: Vec<&str> = line.split(sep).collect();
+    // Accept the legacy 7-field shape (pre-container_id sessions),
+    // the 8-field shape (container_id added), and the 9/10-field
+    // shapes (worktree_path + branch added) — keeps sessions
+    // created by an older bosun usable after upgrade. Widening this
+    // matters: after appending the two worktree fields to the read
+    // format, metadata-aware sessions emit 9 or 10 fields, so the
+    // old `!= 7 && != 8` guard would reject every session and
+    // silently disable restart/modify.
+    if !matches!(parts.len(), 7..=10) {
+        return None;
+    }
+    // Agent is the required anchor — if it's empty, this session
+    // wasn't created by a metadata-aware bosun.
+    if parts[2].is_empty() {
+        return None;
+    }
+    let container_id = parts
+        .get(7)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    Some(SessionMetadata {
+        display_name: parts[0].to_string(),
+        path: parts[1].to_string(),
+        agent: parts[2].to_string(),
+        args: parts[3].to_string(),
+        claude_session_mode: if parts[4].is_empty() {
+            "New".to_string()
+        } else {
+            parts[4].to_string()
+        },
+        claude_skip_permissions: parts[5] == "1",
+        codex_yolo: parts[6] == "1",
+        container_id,
+        worktree_path: parts.get(8).map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        branch: parts.get(9).map(|s| s.to_string()).filter(|s| !s.is_empty()),
+    })
 }
 
 /// Build a synchronous `std::process::Command` for tmux with the given args.
@@ -704,4 +737,62 @@ where
         c.arg(a);
     }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEP: &str = "|||";
+
+    #[test]
+    fn parse_metadata_full_10_field_line_round_trips() {
+        // display|path|agent|args|mode|skip|yolo|container|worktree|branch
+        let line = "My Session|||/tmp/my|||claude|||--model=opus|||Resume|||1|||0|||cont1|||/srv/.worktrees/feat|||feat";
+        let m = parse_metadata_line(line, SEP).expect("metadata parses");
+        assert_eq!(m.display_name, "My Session");
+        assert_eq!(m.path, "/tmp/my");
+        assert_eq!(m.agent, "claude");
+        assert_eq!(m.args, "--model=opus");
+        assert_eq!(m.claude_session_mode, "Resume");
+        assert!(m.claude_skip_permissions);
+        assert!(!m.codex_yolo);
+        assert_eq!(m.container_id.as_deref(), Some("cont1"));
+        assert_eq!(m.worktree_path.as_deref(), Some("/srv/.worktrees/feat"));
+        assert_eq!(m.branch.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn parse_metadata_legacy_8_field_line_still_parses() {
+        // Pre-worktree session: container_id present, no worktree fields.
+        let line = "Old|||/tmp/old|||codex|||args|||New|||0|||1|||cont2";
+        let m = parse_metadata_line(line, SEP).expect("legacy metadata parses");
+        assert_eq!(m.agent, "codex");
+        assert_eq!(m.container_id.as_deref(), Some("cont2"));
+        assert!(m.worktree_path.is_none());
+        assert!(m.branch.is_none());
+    }
+
+    #[test]
+    fn parse_metadata_empty_worktree_fields_are_none() {
+        // Metadata-aware session with container_id and the two new
+        // options unset → trailing empty fields parse to None. Built
+        // by joining so the field count is unambiguous (10 fields).
+        let line = ["S", "/p", "claude", "a", "New", "0", "0", "", "", ""].join(SEP);
+        let m = parse_metadata_line(&line, SEP).expect("parses");
+        assert!(m.worktree_path.is_none());
+        assert!(m.branch.is_none());
+    }
+
+    #[test]
+    fn parse_metadata_none_when_agent_empty() {
+        let line = "S|||/p||||||a|||New|||0|||0|||c|||/wt|||b";
+        assert!(parse_metadata_line(line, SEP).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_none_on_wrong_field_count() {
+        let line = "too|||few";
+        assert!(parse_metadata_line(line, SEP).is_none());
+    }
 }

@@ -3536,6 +3536,8 @@ mod tests {
                 agent: None,
                 spec_path: None,
                 container_id: None,
+                worktree_path: None,
+                branch: None,
                 // Stable default so the unread tests exercise pure
                 // content change; width-change tests use `ses_hw`.
                 pane_width: 80,
