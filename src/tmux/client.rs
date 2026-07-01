@@ -126,12 +126,19 @@ pub trait TmuxClient: Send + Sync {
     async fn is_dirty(&self, worktree_path: &str) -> Result<bool>;
     /// `git -C <repo> merge <branch>` into the repo's current branch.
     async fn branch_merge(&self, repo: &str, branch: &str) -> Result<()>;
+    /// `git -C <repo> merge --abort` — restore the pre-merge state after a
+    /// failed/conflicted `branch_merge` so the repo isn't left half-merged.
+    async fn merge_abort(&self, repo: &str) -> Result<()>;
     /// `git -C <repo> branch -d <branch>`.
     async fn branch_delete(&self, repo: &str, branch: &str) -> Result<()>;
     /// Given a path INSIDE a linked worktree, resolve the MAIN repo
     /// root (the directory the worktree branches from). Used on kill to
     /// find the repo for merge/remove/delete. See implementation note.
     async fn main_repo_root(&self, worktree_path: &str) -> Result<String>;
+    /// Idempotently add `pattern` to `<repo>/.git/info/exclude` so a
+    /// worktree placed inside the repo's working tree stays out of
+    /// `git status`. Local-only (never committed); a no-op if already present.
+    async fn ensure_excluded(&self, repo: &str, pattern: &str) -> Result<()>;
 }
 
 /// Production implementation backed by `tokio::process::Command`.
@@ -698,6 +705,11 @@ impl TmuxClient for TokioTmuxClient {
         Ok(())
     }
 
+    async fn merge_abort(&self, repo: &str) -> Result<()> {
+        run_git(&["-C", repo, "merge", "--abort"]).await?;
+        Ok(())
+    }
+
     async fn branch_delete(&self, repo: &str, branch: &str) -> Result<()> {
         // `--` so a branch name starting with `-` can't be read as a flag.
         run_git(&["-C", repo, "branch", "-d", "--", branch]).await?;
@@ -734,6 +746,46 @@ impl TmuxClient for TokioTmuxClient {
         // Confirm by resolving the toplevel from the parent directory.
         let root = run_git(&["-C", parent, "rev-parse", "--show-toplevel"]).await?;
         Ok(root.trim().to_string())
+    }
+
+    async fn ensure_excluded(&self, repo: &str, pattern: &str) -> Result<()> {
+        // Resolve the repo's git dir rather than assuming `<repo>/.git` is a
+        // directory — it's a file for linked worktrees and submodules. The
+        // common dir is shared across worktrees, which is exactly where a
+        // repo-wide `info/exclude` belongs.
+        let git_dir = run_git(&[
+            "-C",
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .await?;
+        let git_dir = git_dir.trim();
+        let info = std::path::Path::new(git_dir).join("info");
+        let exclude = info.join("exclude");
+
+        // Already excluded? Match the pattern on its own line so we don't
+        // re-append (and don't match it as a substring of another rule).
+        if let Ok(existing) = std::fs::read_to_string(&exclude) {
+            if existing.lines().any(|l| l.trim() == pattern) {
+                return Ok(());
+            }
+        }
+
+        std::fs::create_dir_all(&info)
+            .map_err(|e| BosunError::Git(format!("create {}: {e}", info.display())))?;
+        // Read-modify-append, ensuring the new rule lands on its own line
+        // even if the file didn't end in a newline.
+        let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(pattern);
+        contents.push('\n');
+        std::fs::write(&exclude, contents)
+            .map_err(|e| BosunError::Git(format!("write {}: {e}", exclude.display())))?;
+        Ok(())
     }
 }
 
@@ -1106,6 +1158,45 @@ mod git_tests {
     }
 
     #[tokio::test]
+    async fn merge_abort_restores_pre_merge_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        // feat branches from the empty init commit, before either side
+        // touches x.txt → the merge below conflicts on that path.
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("x.txt"), "main-side\n").unwrap();
+        run_git(&repo, &["add", "x.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "main x"]);
+        std::fs::write(wt.join("x.txt"), "feat-side\n").unwrap();
+        run_git(&wt, &["add", "x.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "feat x"]);
+
+        // The merge conflicts and leaves MERGE_HEAD behind.
+        assert!(client
+            .branch_merge(repo.to_str().unwrap(), "feat")
+            .await
+            .is_err());
+        assert!(repo.join(".git").join("MERGE_HEAD").exists());
+
+        // Abort clears MERGE_HEAD and restores a clean working tree.
+        client.merge_abort(repo.to_str().unwrap()).await.unwrap();
+        assert!(!repo.join(".git").join("MERGE_HEAD").exists());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
     async fn branch_delete_removes_branch() {
         let dir = tempfile::tempdir().unwrap();
         let repo = init_repo(dir.path());
@@ -1137,6 +1228,59 @@ mod git_tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_excluded_appends_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let client = TokioTmuxClient::new();
+
+        // First call adds the rule; a nested worktree dir is then untracked-
+        // ignored so it won't show in `git status`.
+        client
+            .ensure_excluded(repo.to_str().unwrap(), "/.worktrees/")
+            .await
+            .unwrap();
+        let exclude = repo.join(".git").join("info").join("exclude");
+        let after_first = std::fs::read_to_string(&exclude).unwrap();
+        assert_eq!(
+            after_first
+                .lines()
+                .filter(|l| l.trim() == "/.worktrees/")
+                .count(),
+            1,
+            "rule should be present exactly once"
+        );
+
+        // Second call is a no-op — no duplicate line.
+        client
+            .ensure_excluded(repo.to_str().unwrap(), "/.worktrees/")
+            .await
+            .unwrap();
+        let after_second = std::fs::read_to_string(&exclude).unwrap();
+        assert_eq!(
+            after_second
+                .lines()
+                .filter(|l| l.trim() == "/.worktrees/")
+                .count(),
+            1,
+            "second call must not duplicate the rule"
+        );
+
+        // Prove the effect: a `.worktrees/` dir stays out of git status.
+        std::fs::create_dir(repo.join(".worktrees")).unwrap();
+        std::fs::write(repo.join(".worktrees").join("x"), "y").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status.stdout).contains(".worktrees"),
+            "excluded worktree dir must not appear in git status"
+        );
     }
 
     #[tokio::test]

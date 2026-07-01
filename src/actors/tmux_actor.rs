@@ -893,7 +893,21 @@ async fn handle_kill_remove_worktree(
     // 4. Optional merge into the repo's current branch.
     if merge {
         if let Err(e) = client.branch_merge(&repo, branch).await {
-            let _ = evt_tx.send(AppMsg::Warn(format!("merge {}: {}", branch, e)));
+            // A conflicted `git merge` exits non-zero but leaves the main
+            // repo mid-merge (conflict markers + MERGE_HEAD). Abort so the
+            // repo is restored to exactly its pre-merge state — otherwise
+            // the user would have to run `git merge --abort` by hand.
+            if let Err(abort_err) = client.merge_abort(&repo).await {
+                let _ = evt_tx.send(AppMsg::Warn(format!(
+                    "merge {}: {} (also failed to abort: {})",
+                    branch, e, abort_err
+                )));
+            } else {
+                let _ = evt_tx.send(AppMsg::Warn(format!(
+                    "merge {} conflicted; aborted, worktree kept",
+                    branch
+                )));
+            }
             return; // leave the worktree intact on a failed/conflicted merge
         }
     }
@@ -1094,6 +1108,16 @@ async fn create_session(
     let mut created_worktree: Option<(String, String, String)> = None;
     if let Some(wt) = spec.worktree.clone() {
         let repo = client.repo_root(&spec.path).await?; // errors if not a git repo
+                                                        // The `Subdir` scheme drops the worktree inside the repo's own
+                                                        // working tree (`<repo>/.worktrees/`). Git doesn't auto-ignore a
+                                                        // nested linked worktree, so without this it shows as untracked in
+                                                        // `git status` and `git add -A` would try to embed it as a gitlink.
+                                                        // Exclude it locally (best-effort — never block create on this).
+        if config.worktree_location == crate::config::WorktreeLocation::Subdir {
+            if let Err(e) = client.ensure_excluded(&repo, "/.worktrees/").await {
+                tracing::warn!("failed to exclude .worktrees/ in {}: {}", repo, e);
+            }
+        }
         let worktree_path = resolve_worktree_path(&repo, &wt.branch, config.worktree_location);
         client
             .worktree_add(&repo, &wt.branch, &worktree_path)
@@ -1728,6 +1752,71 @@ mod kill_remove_worktree_tests {
         assert!(repo.join("f.txt").exists(), "feat commit should be merged");
         // No warnings on the happy path.
         assert!(rx.try_recv().is_err(), "no warning expected on success");
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_conflicted_merge_aborts_and_leaves_repo_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        // Branch `feat` from the initial (empty) commit BEFORE either side
+        // touches x.txt, so the two sides diverge from a common base that
+        // lacks the file → a real content conflict on merge.
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Main side commits x.txt one way...
+        std::fs::write(repo.join("x.txt"), "main-side\n").unwrap();
+        run_git(&repo, &["add", "x.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "main x"]);
+        // ...and the feat worktree commits the same path differently.
+        std::fs::write(wt.join("x.txt"), "feat-side\n").unwrap();
+        run_git(&wt, &["add", "x.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "feat x"]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            true,
+            &tx,
+        )
+        .await;
+
+        // A Warn about the merge was surfaced.
+        match rx.try_recv() {
+            Ok(AppMsg::Warn(msg)) => {
+                assert!(
+                    msg.contains("merge"),
+                    "warning should mention the merge: {msg}"
+                );
+            }
+            other => panic!("expected a merge Warn, got {other:?}"),
+        }
+        // The worktree is left intact — a failed merge must not remove it.
+        assert!(wt.exists(), "worktree must survive a conflicted merge");
+        // The main repo must NOT be stuck mid-merge: no MERGE_HEAD and a
+        // clean working tree (the abort restored the pre-merge state).
+        assert!(
+            !repo.join(".git").join("MERGE_HEAD").exists(),
+            "MERGE_HEAD must be gone — merge should have been aborted"
+        );
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "main repo working tree must be clean after abort"
+        );
     }
 
     #[tokio::test]
