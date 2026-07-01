@@ -976,12 +976,18 @@ async fn create_session(
     // `spec` is taken by value (see the fn signature), so rebinding as
     // mut is valid and later shared reads/clones of `spec` still compile.
     let mut spec = spec;
+    // When we create a worktree below, remember (repo, worktree_path) so
+    // we can roll it back if a later step (the tmux `create_session`)
+    // fails — otherwise the worktree would be orphaned on disk with no
+    // session attached to it.
+    let mut created_worktree: Option<(String, String)> = None;
     if let Some(wt) = spec.worktree.clone() {
         let repo = client.repo_root(&spec.path).await?; // errors if not a git repo
         let worktree_path = resolve_worktree_path(&repo, &wt.branch, config.worktree_location);
         client
             .worktree_add(&repo, &wt.branch, &worktree_path)
             .await?; // aborts create on failure
+        created_worktree = Some((repo, worktree_path.clone()));
         spec.path = worktree_path; // spec_to_metadata reads spec.path + spec.worktree below
     }
     // `defer_launch` creates the pane as a bare shell and leaves the
@@ -1003,7 +1009,26 @@ async fn create_session(
         command,
         metadata,
     };
-    client.create_session(&create).await.map(|_| internal)
+    match client.create_session(&create).await {
+        Ok(_) => Ok(internal),
+        Err(e) => {
+            // Roll back a just-created worktree so a failed tmux create
+            // doesn't leave an orphaned worktree + branch behind. This
+            // is the newly-created branch with no commits of its own, so
+            // force-remove is safe (the tree is pristine).
+            if let Some((repo, worktree_path)) = created_worktree {
+                if let Err(cleanup_err) = client.worktree_remove(&repo, &worktree_path, true).await
+                {
+                    tracing::warn!(
+                        "failed to roll back worktree {} after create error: {}",
+                        worktree_path,
+                        cleanup_err
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Project a `SessionSpec` into the persisted tmux-options shape.
