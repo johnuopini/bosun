@@ -1237,14 +1237,51 @@ impl AppState {
                 }
                 Some(_) => {
                     if let Some(sel) = self.selected_session() {
-                        let internal = sel.name().to_string();
-                        let display = sel.display().to_string();
-                        let title = "Kill session?";
-                        let msg = format!("This will kill '{}' and its pane.", display);
-                        self.modals.push(Box::new(
-                            ConfirmModal::new(title, msg, Command::KillSession(internal))
-                                .destructive(),
-                        ));
+                        if let (Some(wt_path), Some(branch)) = (
+                            sel.session.worktree_path.clone(),
+                            sel.session.branch.clone(),
+                        ) {
+                            let internal = sel.name().to_string();
+                            let display = sel.display().to_string();
+                            let title = "Kill worktree session?";
+                            let msg =
+                                format!("'{}' lives in a git worktree (branch {}).", display, branch);
+                            // Primary / Enter = keep the worktree (plain kill).
+                            let keep = Command::KillSession(internal.clone());
+                            self.modals.push(Box::new(
+                                ConfirmModal::new(title, msg, keep)
+                                    .destructive()
+                                    .with_alt(
+                                        'm',
+                                        "merge & remove",
+                                        Command::KillSessionRemoveWorktree {
+                                            internal: internal.clone(),
+                                            worktree_path: wt_path.clone(),
+                                            branch: branch.clone(),
+                                            merge: true,
+                                        },
+                                    )
+                                    .with_alt(
+                                        'x',
+                                        "remove, keep branch",
+                                        Command::KillSessionRemoveWorktree {
+                                            internal,
+                                            worktree_path: wt_path,
+                                            branch,
+                                            merge: false,
+                                        },
+                                    ),
+                            ));
+                        } else {
+                            let internal = sel.name().to_string();
+                            let display = sel.display().to_string();
+                            let title = "Kill session?";
+                            let msg = format!("This will kill '{}' and its pane.", display);
+                            self.modals.push(Box::new(
+                                ConfirmModal::new(title, msg, Command::KillSession(internal))
+                                    .destructive(),
+                            ));
+                        }
                     } else if let Some(internal) = self.selected_session_name() {
                         // Dead/missing entry — the underlying tmux session
                         // is gone (e.g. server restarted), but the sidebar

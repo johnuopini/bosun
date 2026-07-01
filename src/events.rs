@@ -117,6 +117,18 @@ pub enum Command {
     CreateSession(SessionSpec),
     /// Kill a session by its internal tmux name. `tmux kill-session -t`.
     KillSession(String),
+    /// Kill a worktree-backed session and clean up its git worktree.
+    /// The actor resolves the main repo root from `worktree_path` via
+    /// `main_repo_root`. `merge` merges the branch into the repo's
+    /// current branch and deletes it after removing the worktree;
+    /// `false` removes the worktree but keeps the branch. Refuses on a
+    /// dirty tree.
+    KillSessionRemoveWorktree {
+        internal: String,
+        worktree_path: String,
+        branch: String,
+        merge: bool,
+    },
     /// Kill every tmux session named in `tabs` in one batch — used
     /// by `Shift+D` to tear down all tabs in a container at once.
     /// The actor iterates `KillSession` for each name; sidebar

@@ -307,6 +307,41 @@ pub fn spawn(
                         }
                     }
                 }
+                Command::KillSessionRemoveWorktree {
+                    internal,
+                    worktree_path,
+                    branch,
+                    merge,
+                } => {
+                    handle_kill_remove_worktree(
+                        &*client,
+                        &internal,
+                        &worktree_path,
+                        &branch,
+                        merge,
+                        &evt_tx,
+                    )
+                    .await;
+                    // Mirror the KillSession post-kill refresh: drop the
+                    // focus if we just tore down the focused session, then
+                    // force a refresh so the row disappears without a 1s wait.
+                    if focused.as_deref() == Some(internal.as_str()) {
+                        focused = None;
+                    }
+                    let _ = do_refresh(
+                        &*client,
+                        &config,
+                        &registry,
+                        &mut smoothers,
+                        focused.as_deref(),
+                        socket.as_deref(),
+                        &mut last_bar_state,
+                        &mut globals,
+                        &evt_tx,
+                        None,
+                    )
+                    .await;
+                }
                 Command::KillContainer { tabs } => {
                     // Multi-kill: iterate each tab serially so a
                     // failure on one doesn't abort the rest. The
@@ -814,6 +849,63 @@ pub fn spawn(
         // `globals` drops here → uninstall_globals runs.
         drop(globals);
     })
+}
+
+/// Kill a worktree-backed session and clean up its git worktree.
+///
+/// Extracted from the command loop so it's testable against the real
+/// git client without spinning up the whole actor. Every failure is
+/// surfaced as a `Warn` toast and leaves the worktree intact — we
+/// never force-remove a dirty tree and never auto-merge past a
+/// conflict.
+async fn handle_kill_remove_worktree(
+    client: &dyn TmuxClient,
+    internal: &str,
+    worktree_path: &str,
+    branch: &str,
+    merge: bool,
+    evt_tx: &mpsc::UnboundedSender<AppMsg>,
+) {
+    // 1. Kill the tmux session (idempotent — fine if already gone).
+    let _ = client.kill_session(internal).await;
+    // 2. Resolve the main repo root from the worktree path.
+    let repo = match client.main_repo_root(worktree_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = evt_tx.send(AppMsg::Warn(format!("worktree cleanup: {}", e)));
+            return;
+        }
+    };
+    // 3. Dirty guard — never force-remove a dirty tree.
+    match client.is_dirty(worktree_path).await {
+        Ok(true) => {
+            let _ = evt_tx.send(AppMsg::Warn(
+                "worktree has uncommitted changes; not removed".into(),
+            ));
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            let _ = evt_tx.send(AppMsg::Warn(format!("worktree status: {}", e)));
+            return;
+        }
+    }
+    // 4. Optional merge into the repo's current branch.
+    if merge {
+        if let Err(e) = client.branch_merge(&repo, branch).await {
+            let _ = evt_tx.send(AppMsg::Warn(format!("merge {}: {}", branch, e)));
+            return; // leave the worktree intact on a failed/conflicted merge
+        }
+    }
+    // 5. Remove the worktree (force=false; the dirty guard above already passed).
+    if let Err(e) = client.worktree_remove(&repo, worktree_path, false).await {
+        let _ = evt_tx.send(AppMsg::Warn(format!("worktree remove: {}", e)));
+        return;
+    }
+    // 6. Delete the branch only on the merge path.
+    if merge {
+        let _ = client.branch_delete(&repo, branch).await;
+    }
 }
 
 /// Assemble the internal tmux session name from the user's typed
@@ -1521,6 +1613,129 @@ mod build_cmd_tests {
         assert_eq!(slug_from_internal("bosun-foo-abc", "bosun-"), None);
         // No prefix match.
         assert_eq!(slug_from_internal("other-foo-12345678", "bosun-"), None);
+    }
+}
+
+#[cfg(test)]
+mod kill_remove_worktree_tests {
+    use super::*;
+    use crate::tmux::client::TokioTmuxClient;
+
+    /// Spawn `git -C <dir> <args>`, asserting the command succeeds.
+    /// Local copy — `client.rs`'s git_tests helper is private to that
+    /// module.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create an initialised repo with one empty commit at `dir/repo`.
+    fn init_repo(dir: &std::path::Path) -> std::path::PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_merge_path_removes_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Commit a file on `feat` inside the worktree.
+        std::fs::write(wt.join("f.txt"), "data").unwrap();
+        run_git(&wt, &["add", "f.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "add f"]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // `internal` names a tmux session that doesn't exist —
+        // kill_session is idempotent, so no tmux server is needed.
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            true,
+            &tx,
+        )
+        .await;
+
+        // Worktree dir gone.
+        assert!(!wt.exists(), "worktree dir should be removed");
+        // Branch `feat` gone (merge path deletes it).
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "feat"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "branch feat should be deleted"
+        );
+        // The feat commit's file is present on the repo's checked-out
+        // branch (i.e. it was merged in).
+        assert!(repo.join("f.txt").exists(), "feat commit should be merged");
+        // No warnings on the happy path.
+        assert!(rx.try_recv().is_err(), "no warning expected on success");
+    }
+
+    #[tokio::test]
+    async fn kill_remove_worktree_dirty_tree_is_left_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let wt = dir.path().join("wt");
+        let client = TokioTmuxClient::new();
+        client
+            .worktree_add(repo.to_str().unwrap(), "feat", wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Dirty the worktree with an untracked file → is_dirty true.
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_kill_remove_worktree(
+            &client,
+            "nonexistent-sess",
+            wt.to_str().unwrap(),
+            "feat",
+            false,
+            &tx,
+        )
+        .await;
+
+        // Removal refused → worktree dir still exists.
+        assert!(wt.exists(), "dirty worktree must be left intact");
+        // A Warn was surfaced.
+        match rx.try_recv() {
+            Ok(AppMsg::Warn(msg)) => {
+                assert!(
+                    msg.contains("uncommitted"),
+                    "warning should mention uncommitted changes: {msg}"
+                );
+            }
+            other => panic!("expected a Warn, got {other:?}"),
+        }
     }
 }
 
