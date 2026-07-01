@@ -1087,18 +1087,18 @@ async fn create_session(
     // `spec` is taken by value (see the fn signature), so rebinding as
     // mut is valid and later shared reads/clones of `spec` still compile.
     let mut spec = spec;
-    // When we create a worktree below, remember (repo, worktree_path) so
-    // we can roll it back if a later step (the tmux `create_session`)
-    // fails — otherwise the worktree would be orphaned on disk with no
-    // session attached to it.
-    let mut created_worktree: Option<(String, String)> = None;
+    // When we create a worktree below, remember (repo, worktree_path, branch)
+    // so we can roll it back if a later step (the tmux `create_session`)
+    // fails — otherwise the worktree + its new branch would be orphaned with
+    // no session attached to them.
+    let mut created_worktree: Option<(String, String, String)> = None;
     if let Some(wt) = spec.worktree.clone() {
         let repo = client.repo_root(&spec.path).await?; // errors if not a git repo
         let worktree_path = resolve_worktree_path(&repo, &wt.branch, config.worktree_location);
         client
             .worktree_add(&repo, &wt.branch, &worktree_path)
             .await?; // aborts create on failure
-        created_worktree = Some((repo, worktree_path.clone()));
+        created_worktree = Some((repo, worktree_path.clone(), wt.branch));
         spec.path = worktree_path; // spec_to_metadata reads spec.path + spec.worktree below
     }
     // `defer_launch` creates the pane as a bare shell and leaves the
@@ -1124,16 +1124,28 @@ async fn create_session(
         Ok(_) => Ok(internal),
         Err(e) => {
             // Roll back a just-created worktree so a failed tmux create
-            // doesn't leave an orphaned worktree + branch behind. This
-            // is the newly-created branch with no commits of its own, so
-            // force-remove is safe (the tree is pristine).
-            if let Some((repo, worktree_path)) = created_worktree {
+            // doesn't leave an orphaned worktree + branch behind. The
+            // worktree is pristine (no commits of its own), so force-remove
+            // is safe. `git worktree remove` does NOT delete the branch that
+            // `worktree_add -b` created, so delete it explicitly afterwards —
+            // otherwise a retry with the same name hits "branch already
+            // exists". Both steps are best-effort (log on failure).
+            if let Some((repo, worktree_path, branch)) = created_worktree {
                 if let Err(cleanup_err) = client.worktree_remove(&repo, &worktree_path, true).await
                 {
                     tracing::warn!(
                         "failed to roll back worktree {} after create error: {}",
                         worktree_path,
                         cleanup_err
+                    );
+                } else if let Err(branch_err) = client.branch_delete(&repo, &branch).await {
+                    // Only attempt the branch delete once the worktree is
+                    // gone — `branch -d` is refused while the branch is
+                    // checked out in a worktree.
+                    tracing::warn!(
+                        "failed to roll back branch {} after create error: {}",
+                        branch,
+                        branch_err
                     );
                 }
             }
