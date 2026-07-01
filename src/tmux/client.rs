@@ -719,12 +719,12 @@ impl TmuxClient for TokioTmuxClient {
         // literal `/.git`, which would break on non-standard git-dir
         // names or bare repos.
         let parent = std::path::Path::new(common).parent().ok_or_else(|| {
-            BosunError::Git(format!(
-                "git-common-dir {common} has no parent directory"
-            ))
+            BosunError::Git(format!("git-common-dir {common} has no parent directory"))
         })?;
         let parent = parent.to_str().ok_or_else(|| {
-            BosunError::Git(format!("git-common-dir parent {parent:?} is not valid UTF-8"))
+            BosunError::Git(format!(
+                "git-common-dir parent {parent:?} is not valid UTF-8"
+            ))
         })?;
         // Confirm by resolving the toplevel from the parent directory.
         let root = run_git(&["-C", parent, "rev-parse", "--show-toplevel"]).await?;
@@ -811,8 +811,14 @@ fn parse_metadata_line(line: &str, sep: &str) -> Option<SessionMetadata> {
         claude_skip_permissions: parts[5] == "1",
         codex_yolo: parts[6] == "1",
         container_id,
-        worktree_path: parts.get(8).map(|s| s.to_string()).filter(|s| !s.is_empty()),
-        branch: parts.get(9).map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        worktree_path: parts
+            .get(8)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        branch: parts
+            .get(9)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -1001,7 +1007,10 @@ mod git_tests {
         let dir = tempfile::tempdir().unwrap();
         // dir.path() itself is not a git repo.
         let client = TokioTmuxClient::new();
-        assert!(client.repo_root(dir.path().to_str().unwrap()).await.is_err());
+        assert!(client
+            .repo_root(dir.path().to_str().unwrap())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
