@@ -903,7 +903,14 @@ async fn handle_kill_remove_worktree(
     // while the worktree (and branch) survive — surfaced as a Warn, no rollback
     // (rolling back a git merge is riskier than leaving the stray worktree).
     if let Err(e) = client.worktree_remove(&repo, worktree_path, false).await {
-        let _ = evt_tx.send(AppMsg::Warn(format!("worktree remove: {}", e)));
+        // Tell the user if the merge already landed, so they know the branch
+        // was integrated even though the worktree couldn't be removed.
+        let prefix = if merge {
+            "merged, but worktree remove failed"
+        } else {
+            "worktree remove"
+        };
+        let _ = evt_tx.send(AppMsg::Warn(format!("{}: {}", prefix, e)));
         return;
     }
     // 6. Delete the branch only on the merge path. Surface a failure as a Warn
@@ -944,6 +951,10 @@ fn build_internal_name(prefix: &str, display: &str) -> String {
 /// Lowercase slug: alphanumeric and underscores are kept (underscore
 /// is valid in tmux session names); everything else collapses to
 /// single dashes; leading/trailing dashes are trimmed.
+///
+/// Distinct on purpose from `ui::modal::new_session::slug` (which slugs
+/// the git *branch* name and drops `_`). This one feeds the internal
+/// tmux *session* name — don't unify them.
 pub(crate) fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_dash = false;

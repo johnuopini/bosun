@@ -1057,6 +1057,10 @@ fn label_line(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
 /// each run of non-alphanumeric characters collapsed to a single `-`,
 /// with leading/trailing `-` trimmed. Never produces a `/`, so the
 /// auto-derived branch always passes `build_spec` validation.
+///
+/// Distinct on purpose from `tmux_actor::slugify` (which slugs the
+/// internal tmux *session* name and keeps `_`). This one feeds the git
+/// *branch* name — don't unify them.
 fn slug(s: &str) -> String {
     let mut out = String::new();
     let mut pending_dash = false;
