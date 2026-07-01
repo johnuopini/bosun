@@ -675,10 +675,13 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn worktree_remove(&self, repo: &str, worktree_path: &str, force: bool) -> Result<()> {
+        // `--` terminates option parsing so a path that happens to start
+        // with `-` is treated as an operand, not a flag.
         let mut args = vec!["-C", repo, "worktree", "remove"];
         if force {
             args.push("--force");
         }
+        args.push("--");
         args.push(worktree_path);
         run_git(&args).await?;
         Ok(())
@@ -690,12 +693,14 @@ impl TmuxClient for TokioTmuxClient {
     }
 
     async fn branch_merge(&self, repo: &str, branch: &str) -> Result<()> {
-        run_git(&["-C", repo, "merge", branch]).await?;
+        // `--` so a branch name starting with `-` can't be read as a flag.
+        run_git(&["-C", repo, "merge", "--", branch]).await?;
         Ok(())
     }
 
     async fn branch_delete(&self, repo: &str, branch: &str) -> Result<()> {
-        run_git(&["-C", repo, "branch", "-d", branch]).await?;
+        // `--` so a branch name starting with `-` can't be read as a flag.
+        run_git(&["-C", repo, "branch", "-d", "--", branch]).await?;
         Ok(())
     }
 

@@ -114,7 +114,9 @@ impl ConfirmModal {
         self
     }
 
-    /// Number of extra key-bound actions currently registered.
+    /// Number of extra key-bound actions currently registered. Test-only
+    /// accessor — the modal's behavior is otherwise observed through `handle`.
+    #[cfg(test)]
     pub fn alt_count(&self) -> usize {
         self.alts.len()
     }
