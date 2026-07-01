@@ -1244,8 +1244,10 @@ impl AppState {
                             let internal = sel.name().to_string();
                             let display = sel.display().to_string();
                             let title = "Kill worktree session?";
-                            let msg =
-                                format!("'{}' lives in a git worktree (branch {}).", display, branch);
+                            let msg = format!(
+                                "'{}' lives in a git worktree (branch {}).",
+                                display, branch
+                            );
                             // Primary / Enter = keep the worktree (plain kill).
                             let keep = Command::KillSession(internal.clone());
                             self.modals.push(Box::new(

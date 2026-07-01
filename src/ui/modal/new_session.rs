@@ -1411,7 +1411,7 @@ mod tests {
             m.handle(key(KeyCode::Char(c)));
         }
         assert_eq!(m.branch_effective(), "my-feature"); // slug of the name
-        // Manually edit the branch — this sets branch_edited.
+                                                        // Manually edit the branch — this sets branch_edited.
         m.field = Field::Branch;
         for c in "custom".chars() {
             m.handle(key(KeyCode::Char(c)));

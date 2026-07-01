@@ -427,7 +427,11 @@ mod tests {
         // since the footer Paragraph does not wrap and would otherwise clip.
         let m = ConfirmModal::new("Kill?", "msg", Command::KillSession("keep".into()))
             .with_alt('m', "merge & remove", Command::KillSession("merge".into()))
-            .with_alt('x', "remove, keep branch", Command::KillSession("remove".into()));
+            .with_alt(
+                'x',
+                "remove, keep branch",
+                Command::KillSession("remove".into()),
+            );
         assert_eq!(m.width(), MODAL_WIDTH_ALT2);
         assert_eq!(MODAL_WIDTH_ALT2, 90);
         let usable = m.width().saturating_sub(H_PAD) as usize;
