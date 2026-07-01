@@ -215,6 +215,11 @@ pub struct AppState {
     /// the tab strip and OSC title prefix grouped sessions with
     /// `group/`. Read by `ui::preview` and the attach-title path.
     pub show_group_in_title: bool,
+    /// Where `git worktree add` places new worktrees. Snapshot of
+    /// `Config::worktree_location` at startup, passed into the
+    /// new-session modal so its worktree preview line shows the same
+    /// scheme the tmux actor resolves downstream.
+    pub worktree_location: crate::config::WorktreeLocation,
 }
 
 /// What the user has "seen" for one session — the baseline the unread
@@ -2035,6 +2040,7 @@ impl App {
             single_window_mode: config.single_window_mode,
             sidebar_hidden: config.sidebar_hidden,
             show_group_in_title: config.show_group_in_title,
+            worktree_location: config.worktree_location,
             ..Default::default()
         };
 
@@ -2746,9 +2752,10 @@ impl App {
                 match req {
                     ModalRequest::NewSession => {
                         let recents = self.store.list_recents(50).unwrap_or_default();
-                        self.state
-                            .modals
-                            .push(Box::new(NewSessionModal::new(recents)));
+                        self.state.modals.push(Box::new(NewSessionModal::new(
+                            recents,
+                            self.state.worktree_location,
+                        )));
                     }
                     ModalRequest::Theme => {
                         let names = Theme::available(crate::config::user_themes_dir().as_deref());

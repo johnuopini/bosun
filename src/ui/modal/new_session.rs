@@ -135,6 +135,13 @@ pub struct NewSessionModal {
     /// that container as another tab. Tab mode is mutually
     /// exclusive with modify mode.
     add_tab_to: Option<String>,
+    /// Where a created worktree lands, snapshotted from
+    /// `Config::worktree_location`. Drives the read-only preview line
+    /// under the branch field so the shown scheme matches what the
+    /// actor actually does downstream (`resolve_worktree_path`). Only
+    /// meaningful when the worktree UI is shown (never in add-tab or
+    /// modify mode).
+    worktree_location: crate::config::WorktreeLocation,
 }
 
 /// One row in the filesystem dropdown. `name` is the last path
@@ -147,7 +154,7 @@ struct PathEntry {
 }
 
 impl NewSessionModal {
-    pub fn new(recents: Vec<Recent>) -> Self {
+    pub fn new(recents: Vec<Recent>, worktree_location: crate::config::WorktreeLocation) -> Self {
         // Default the path to the most-recently-used session's path so
         // the modal "remembers" where you last worked across restarts.
         // Falls back to cwd (and then to ~) when there are no recents.
@@ -178,6 +185,7 @@ impl NewSessionModal {
             path_dropdown_active: true,
             modify_for: None,
             add_tab_to: None,
+            worktree_location,
         };
         modal.apply_remembered_options();
         modal
@@ -208,6 +216,9 @@ impl NewSessionModal {
             path_dropdown_active: false,
             modify_for: Some(internal),
             add_tab_to: None,
+            // Modify mode never re-creates the worktree, so the value
+            // is irrelevant here — the worktree UI is not shown.
+            worktree_location: crate::config::WorktreeLocation::Subdir,
         };
         modal.fill_from_spec(spec);
         modal
@@ -240,6 +251,9 @@ impl NewSessionModal {
             path_dropdown_active: false,
             modify_for: None,
             add_tab_to: Some(container_id),
+            // Add-tab mode hides the worktree UI (path is locked to
+            // the container), so the value is never read.
+            worktree_location: crate::config::WorktreeLocation::Subdir,
         };
         modal.apply_remembered_options();
         modal
@@ -359,6 +373,31 @@ impl NewSessionModal {
             self.branch.clone()
         } else {
             slug(&self.name)
+        }
+    }
+
+    /// Schematic, read-only preview of where the worktree lands,
+    /// honoring `worktree_location`. The real repo root is resolved
+    /// downstream (`resolve_worktree_path`), not here, so we use the
+    /// last segment of `self.path` as the repo-name stand-in and keep
+    /// the string short enough to fit the modal width. The SCHEME
+    /// shown must match the actor's, so a user on `sibling` sees the
+    /// sibling form instead of a misleading `.worktrees/` path.
+    fn worktree_preview(&self) -> String {
+        use crate::config::WorktreeLocation::*;
+        let branch = self.branch_effective();
+        match self.worktree_location {
+            Subdir => format!(".worktrees/{}", branch),
+            Sibling => {
+                let repo = self
+                    .path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("repo");
+                format!("{}-{}", repo, branch)
+            }
         }
     }
 
@@ -488,6 +527,12 @@ impl NewSessionModal {
             if branch.contains('/') {
                 return Err("branch cannot contain '/'".into());
             }
+            // A space is a valid keystroke on the Branch field but
+            // `git worktree add -b "my branch"` fails downstream with a
+            // raw toast, so reject it here where we can explain why.
+            if branch.chars().any(char::is_whitespace) {
+                return Err("branch cannot contain spaces".into());
+            }
             Some(WorktreeSpec { branch })
         } else {
             None
@@ -511,7 +556,7 @@ impl NewSessionModal {
 
 impl Default for NewSessionModal {
     fn default() -> Self {
-        Self::new(Vec::new())
+        Self::new(Vec::new(), crate::config::WorktreeLocation::default())
     }
 }
 
@@ -666,7 +711,11 @@ impl Modal for NewSessionModal {
                     }
                     Field::Branch => {
                         self.branch.pop();
-                        self.branch_edited = true;
+                        // Clearing the field to empty un-latches the
+                        // manual edit so `branch_effective` re-engages
+                        // the name slug — matches the expectation that
+                        // emptying the branch restores the auto-slug.
+                        self.branch_edited = !self.branch.is_empty();
                     }
                     _ => {}
                 }
@@ -833,12 +882,12 @@ impl Modal for NewSessionModal {
                     inner.width,
                     theme,
                 ));
-                // Read-only preview of where the worktree lands.
-                // Uses the short `.worktrees/<branch>` form (the real
-                // repo root is resolved downstream, not here) so it
-                // always fits the modal width.
+                // Read-only preview of where the worktree lands. Honors
+                // `worktree_location` so the shown scheme matches the
+                // actor's `resolve_worktree_path`. The real repo root is
+                // resolved downstream, so this stays schematic.
                 lines.push(Line::from(Span::styled(
-                    format!("   worktree: .worktrees/{}", branch),
+                    format!("   worktree: {}", self.worktree_preview()),
                     Style::default().fg(theme.text_muted).bg(body_bg),
                 )));
             }
@@ -1268,6 +1317,7 @@ fn agent_line(selected: usize, focused: bool, theme: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WorktreeLocation;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1284,7 +1334,7 @@ mod tests {
     /// past ambiguity). Pin the path to a guaranteed-nonexistent directory so
     /// `read_dir` returns empty and Tab always advances the field.
     fn modal_for_field_tests() -> NewSessionModal {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.path = "/_bosun_unit_test_nonexistent_/".into();
         m
     }
@@ -1354,7 +1404,7 @@ mod tests {
 
     #[test]
     fn branch_slug_tracks_name_until_edited() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.worktree = true;
         // Field starts on Name; type the name.
         for c in "My Feature".chars() {
@@ -1380,7 +1430,7 @@ mod tests {
 
     #[test]
     fn build_spec_carries_worktree() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "feat".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1397,7 +1447,7 @@ mod tests {
 
     #[test]
     fn build_spec_rejects_slash_in_branch() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "feat".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1409,15 +1459,95 @@ mod tests {
         let r = m.handle(key(KeyCode::Enter));
         // Slash in branch must be rejected with an error, not submitted.
         assert!(matches!(r, ModalResult::Consumed));
-        assert!(
-            m.error.as_deref().unwrap().contains('/')
-                || m.error.as_deref().unwrap().to_lowercase().contains("branch")
-        );
+        assert_eq!(m.error.as_deref(), Some("branch cannot contain '/'"));
+    }
+
+    #[test]
+    fn build_spec_rejects_space_in_branch() {
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
+        for c in "feat".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        m.worktree = true;
+        m.field = Field::Branch;
+        for c in "my branch".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        let r = m.handle(key(KeyCode::Enter));
+        // A space breaks `git worktree add -b` downstream, so reject it.
+        assert!(matches!(r, ModalResult::Consumed));
+        assert_eq!(m.error.as_deref(), Some("branch cannot contain spaces"));
+    }
+
+    #[test]
+    fn branch_backspaced_to_empty_re_engages_name_slug() {
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
+        m.worktree = true;
+        // Type a name so the slug has something to fall back to.
+        for c in "My Feature".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        // Manually edit the branch — latches branch_edited.
+        m.field = Field::Branch;
+        for c in "custom".chars() {
+            m.handle(key(KeyCode::Char(c)));
+        }
+        assert!(m.branch_edited);
+        // Backspace the branch all the way to empty.
+        for _ in 0.."custom".len() {
+            m.handle(key(KeyCode::Backspace));
+        }
+        assert!(m.branch.is_empty());
+        assert!(!m.branch_edited, "clearing the branch must un-latch it");
+        // The effective branch falls back to the name slug again.
+        assert_eq!(m.branch_effective(), "my-feature");
+    }
+
+    #[test]
+    fn worktree_preview_honors_location() {
+        let mut sub = NewSessionModal::new(Vec::new(), WorktreeLocation::Subdir);
+        sub.path = "/srv/proj".into();
+        sub.worktree = true;
+        for c in "feat".chars() {
+            sub.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(sub.worktree_preview(), ".worktrees/feat");
+
+        let mut sib = NewSessionModal::new(Vec::new(), WorktreeLocation::Sibling);
+        sib.path = "/srv/proj".into();
+        sib.worktree = true;
+        for c in "feat".chars() {
+            sib.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(sib.worktree_preview(), "proj-feat");
+        // The two schemes must differ so the preview isn't misleading.
+        assert_ne!(sub.worktree_preview(), sib.worktree_preview());
+    }
+
+    #[test]
+    fn add_tab_mode_hides_worktree_fields() {
+        // lock_path = true (add-tab mode) must expose NEITHER the
+        // worktree checkbox nor the branch field: a tab inherits its
+        // container's path, so worktree is mutually exclusive with it.
+        let visible = Field::visible_for("claude", true, true);
+        assert!(!visible.contains(&Field::Worktree));
+        assert!(!visible.contains(&Field::Branch));
+    }
+
+    #[test]
+    fn space_toggles_worktree_when_focused() {
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
+        m.field = Field::Worktree;
+        assert!(!m.worktree);
+        m.handle(key(KeyCode::Char(' ')));
+        assert!(m.worktree);
+        m.handle(key(KeyCode::Char(' ')));
+        assert!(!m.worktree);
     }
 
     #[test]
     fn space_toggles_skip_permissions_when_focused() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.field = Field::ClaudeSkipPerm;
         assert!(!m.claude.skip_permissions);
         m.handle(key(KeyCode::Char(' ')));
@@ -1428,7 +1558,7 @@ mod tests {
 
     #[test]
     fn left_right_cycles_claude_session_mode() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.field = Field::ClaudeSession;
         assert_eq!(m.claude.session_mode, ClaudeSessionMode::New);
         m.handle(key(KeyCode::Right));
@@ -1443,7 +1573,7 @@ mod tests {
 
     #[test]
     fn space_toggles_codex_yolo_when_focused() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.agent_idx = 1;
         m.field = Field::CodexYolo;
         assert!(!m.codex.yolo);
@@ -1453,7 +1583,7 @@ mod tests {
 
     #[test]
     fn submit_spec_carries_claude_options() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "test".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1490,7 +1620,7 @@ mod tests {
 
     #[test]
     fn left_right_on_agent_field_cycles_selection() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         m.field = Field::Agent;
         assert_eq!(m.agent(), "claude");
         m.handle(key(KeyCode::Right));
@@ -1505,7 +1635,7 @@ mod tests {
 
     #[test]
     fn enter_with_empty_name_shows_error() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         let r = m.handle(key(KeyCode::Enter));
         assert!(matches!(r, ModalResult::Consumed));
         assert!(m.error.is_some());
@@ -1513,7 +1643,7 @@ mod tests {
 
     #[test]
     fn enter_with_valid_data_closes_with_command() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "work".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1529,7 +1659,7 @@ mod tests {
 
     #[test]
     fn bosun_prefix_is_stripped_from_name_on_submit() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "bosun-work".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1544,7 +1674,7 @@ mod tests {
 
     #[test]
     fn name_with_spaces_is_accepted() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "My Rocket Fox".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1560,7 +1690,7 @@ mod tests {
 
     #[test]
     fn name_with_only_symbols_is_rejected() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         for c in "!!!".chars() {
             m.handle(key(KeyCode::Char(c)));
         }
@@ -1571,7 +1701,7 @@ mod tests {
 
     #[test]
     fn esc_closes_without_command() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         let r = m.handle(key(KeyCode::Esc));
         assert!(matches!(r, ModalResult::Close(None)));
     }
@@ -1589,7 +1719,7 @@ mod tests {
             last_used_at: 0,
             use_count: 1,
         };
-        let mut m = NewSessionModal::new(vec![recent]);
+        let mut m = NewSessionModal::new(vec![recent], WorktreeLocation::default());
         let k = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         let r = m.handle(k);
         assert!(matches!(r, ModalResult::Push(_)));
@@ -1621,7 +1751,7 @@ mod tests {
 
     #[test]
     fn on_child_closed_fills_all_fields_from_spec() {
-        let mut m = NewSessionModal::new(Vec::new());
+        let mut m = NewSessionModal::new(Vec::new(), WorktreeLocation::default());
         let spec = SessionSpec {
             name: "api".into(),
             path: "/srv/api".into(),
